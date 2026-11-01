@@ -18,6 +18,6 @@ Which games each release has been checked to port: [RELEASE_CHECK.md](RELEASE_CH
 
 | Game | Title ID | Status |
 |---|---|---|
-| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | **work in progress**: 1.9.0 on TB323FU (SM8850P / Adreno 840, Android 16); docked 1920x1080 output, game dynamic internal resolution, 60 fps target, HOLD off. Integrated builds pass 111 unit tests and Vulkan validation with 0 errors; final performance and release-install acceptance in progress. Full gameplay remains unverified. |
+| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | **work in progress**: 1.9.0 on TB323FU (SM8850P / Adreno 840, Android 16); docked 1920x1080 output, dynamic internal resolution, 60 fps target, HOLD off. Final debug averages 58.177 fps fixed / 57.780 moving; 30-minute soak has no restart or RED, last 5 minutes 55.567 fps with thermal/frequency interference. Performance and cold-cache hitch criteria remain unmet; 111 tests, Vulkan validation and release save-load smoke pass. Release `a1178870…` installed; full gameplay unverified. |
 
 Performance results and historical experiments: [perf-log.md](perf-log.md); current acceptance: [perf-plan.md](perf-plan.md).

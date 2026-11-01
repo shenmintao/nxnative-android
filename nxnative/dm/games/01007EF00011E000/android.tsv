@@ -1,10 +1,12 @@
 # TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-01.
 # Owned Great Plateau save, 60 s warmup + 120 s actual-present windows.
 # Docked 1920x1080 output with the game's 1280x720..1600x900 dynamic rendering.
-# Private stack baseline: fixed 57.893/58.127 fps, moving 57.646; final integrated acceptance pending.
+# Final debug: fixed 58.224/58.130 fps, moving 57.867/57.692; 60 fps thresholds not met.
+# 30-minute soak: same PID, no RED, last 5 minutes 55.567 fps with thermal/frequency interference.
+# 1199 graphics keys packaged; cold-cache hitch criterion not met. Release save/load smoke passed.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-01: Chinese menus, save/load, controller/touch, CPU mapping and HOME restoration checked; docked 1080p output private-stack baseline fixed mean 58.010 fps, moving 57.646 fps; long-frame thresholds not met; integrated build acceptance pending; standing lower-leg ground occlusion remains reproducible, full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-01: Chinese menus, save/load, controller/touch, CPU mapping and HOME restoration checked; final debug docked 1080p output at 1600x900 internal in sampled scenes, fixed mean 58.177 fps and moving 57.780 fps; 30-minute soak same PID and no RED, last 5 minutes 55.567 fps with thermal/frequency interference; performance and cold-cache hitch criteria not met; 111 unit tests and Vulkan validation pass, release a1178870 save/load smoke passed; standing lower-leg ground occlusion remains reproducible, full gameplay unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn
