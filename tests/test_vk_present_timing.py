@@ -21,6 +21,7 @@ class PresentTiming(unittest.TestCase):
 #include <pthread.h>
 #include <stdint.h>
 #include <string.h>
+#include "present_history.h"
 ''' + history + r'''
 int main(void) {
     assert(present_time_get(0) == 0);
@@ -42,10 +43,10 @@ int main(void) {
     assert(present_time_get(0) == 0);
 
     present_time_begin(3, 0);
-    present_time_map(42 + PRES_TIMES, 3);
+    present_time_map(42 + VK_PRESENT_REQUESTS, 3);
     present_time_record(42, 9000000000ull);  // overwritten Vulkan ID mapping
     assert(present_time_get(3) == 0);
-    present_time_record(42 + PRES_TIMES, 3000000000ull);
+    present_time_record(42 + VK_PRESENT_REQUESTS, 3000000000ull);
     assert(present_time_get(3) == 3);
     present_time_begin(1 + PRES_TIMES, 0);
     present_time_map(200, 1);  // a delayed result must not overwrite a newer ticket
@@ -55,10 +56,13 @@ int main(void) {
 
     present_time_begin(5, 7000000000ull);  // no display times: the hand-over time stands in at once
     assert(present_time_get(5) == 7);
+    present_time_map(201, 5);
+    present_time_record(201, 8000000000ull);  // actual display feedback supersedes the fallback
+    assert(present_time_get(5) == 8);
     present_time_reset();
     assert(present_time_get(2) == 0);
     present_time_begin(3, 0);
-    present_time_record(42 + PRES_TIMES, 9000000000ull);  // old swapchain feedback
+    present_time_record(42 + VK_PRESENT_REQUESTS, 9000000000ull);  // old swapchain feedback
     assert(present_time_get(3) == 0);
     present_time_map(UINT32_MAX, 3);
     present_time_record(UINT32_MAX, 3000000000ull);
@@ -76,7 +80,7 @@ int main(void) {
             c = Path(tmp) / 'check.c'
             exe = Path(tmp) / 'check'
             c.write_text(harness, encoding='utf-8')
-            result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread', str(c), '-o', str(exe)], capture_output=True, text=True)
+            result = subprocess.run([cc, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread', '-I', str(SOURCE.parent), str(c), '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             result = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

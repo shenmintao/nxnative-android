@@ -56,11 +56,11 @@ static inline void ov_dpad_dir(int k, float *ox, float *oy, float *r) { float s 
 static const uint64_t OV_DPAD_BITS[4] = {DM_BTN_RIGHT, DM_BTN_LEFT, DM_BTN_DOWN, DM_BTN_UP};
 
 // ---- the pause menu: a panel in the middle of the window, a title row and one row per item ----
-enum { OVM_OVERLAY, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_RESUME, OVM_N };   // OVM_FPS: the frame rate counter; OVM_MODE: Performance (handheld) or Resolution (docked)
+enum { OVM_OVERLAY, OVM_RUMBLE, OVM_LAYOUT, OVM_FPS, OVM_MODE, OVM_RESUME, OVM_N };   // OVM_FPS: the frame rate counter; OVM_MODE: Performance (handheld) or Resolution (docked)
 #define OV_MENU_ROW 0.115f   // row height, of the window's height
 #define OV_MENU_W 0.70f      // panel width, of the window's height
 #define OV_MENU_PAD 0.03f
-// what the menu shows (-1 = closed): bit 0 the gamepad is on, bit 1 rumble is on, bit 2 docked, bit 3 the frame rate shown, bits 4..7 the highlighted item + 1 (0 = none)
+// what the menu shows (-1 = closed): bit 0 overlay, bit 1 rumble, bit 2 docked, bit 3 FPS, bits 4..7 highlighted item + 1, bits 8..9 layout preference, bit 10 auto Xbox
 int dm_menu_state(void);
 static inline float ov_menu_scale(void) { float s = dm_overlay_scale(), fit = 0.92f / ((OVM_N + 1) * OV_MENU_ROW + 2 * OV_MENU_PAD); return s < fit ? s : fit; }
 static inline void ov_menu_rect(float W, float H, float r[4]) {   // x, y, width, height in window pixels

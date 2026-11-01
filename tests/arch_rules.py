@@ -3,7 +3,8 @@ import ast, re, subprocess, sys
 from pathlib import Path
 
 R = Path(sys.argv[1] if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent).resolve()
-files = subprocess.run(['git', '-C', str(R), 'ls-files'], capture_output=True, text=True, check=True).stdout.splitlines()
+files = subprocess.run(['git', '-C', str(R), 'ls-files', '--cached', '--others', '--exclude-standard'], capture_output=True, text=True, encoding='utf-8', check=True).stdout.splitlines()
+files = sorted(set(files))
 fails, notes = [], []
 def check(name, ok, detail=''):
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f": {detail}" if detail else ''))
@@ -128,7 +129,7 @@ check('generated profile headers not committed', not gen, ', '.join(gen))
 for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nx2android.spec', 'packaging/nx2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md'):
     if not (R / d).exists(): check(f'layout: {d}', False)
 check('repository layout as documented', all((R / d).exists() for d in ('docs/ARCHITECTURE.md', 'porter', 'gui', 'devtools', 'packaging/build_bundle.py', 'packaging/nx2android.spec', 'packaging/nx2android.py', 'packaging/INSTALL.md', 'tests', 'requirements.txt', 'probes', 'nxnative', 'RESEARCH.md')))
-check('no scripts/ folder left at the root', not any(f.startswith('scripts/') for f in files))
+check('public scripts are the Android conversion entry point', not any(f.startswith('scripts/') and f != 'scripts/build_apk_from_nsp.py' for f in files))
 req = (R / 'requirements.txt').read_text(encoding='utf-8').lower()
 check('requirements.txt has lz4, capstone, pillow, PySide6', all(m in req for m in ('lz4', 'capstone', 'pillow', 'pyside6')))
 

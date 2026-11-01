@@ -1,7 +1,7 @@
 # The tools a port needs on the player's machine, found and checked (`porter doctor`, the GUI's setup screen). Nothing here is shipped with the tool:
 # the player installs the Android NDK (r27c), the .NET SDK (10) and, to install from the tool, platform-tools (adb), or has `porter tools --download` (porter.fetch)
 # fetch them from Google and Microsoft into their nx2android folder (paths.player_tools()), which the finders here also search.
-import glob, importlib.util, os, re, shutil, subprocess, sys
+import glob, importlib.util, os, re, shlex, shutil, subprocess, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -11,7 +11,7 @@ from porter.paths import LOCAL_TOOLS, player_tools
 NDK_REVISION = '27.2.12479018'   # r27c: the NDK the Android host is built and tested with
 NDK_RELEASE = 'r27c'
 DOTNET_MAJOR = 10
-PY_MODULES = {'lz4.block': 'lz4', 'capstone': 'capstone'}   # the rewriter (capstone) and the NSO reader (lz4)
+PY_MODULES = {'lz4.block': 'lz4', 'capstone': 'capstone>=5,<6'}   # the rewriter uses Capstone 5's ARM64 API
 EXE = '.exe' if os.name == 'nt' else ''
 DISK_GB = 20   # the setup check's free space: a NEO-sized port (7 GB of build folder) with room to spare
 
@@ -97,7 +97,20 @@ def checks(cfg=None, keys=None):
     out.append(Check('Python', v >= (3, 11), f'{v.major}.{v.minor}.{v.micro} ({sys.executable})', fix='Python 3.11 or later'))
     miss = [pip for m, pip in PY_MODULES.items() if not _importable(m)]
     if not (_importable('compression.zstd') or _importable('backports.zstd')): miss.append('backports.zstd')   # zstd: in the standard library from Python 3.14
-    out.append(Check('Python modules', not miss, 'missing: ' + ', '.join(miss) if miss else 'lz4, capstone, zstd', fix='pip install ' + ' '.join(miss) if miss else ''))
+    problems = ['missing: ' + ', '.join(miss)] if miss else []
+    if _importable('capstone'):
+        try:
+            import capstone
+            if capstone.cs_version()[0] != 5:
+                problems.append(f'Capstone {capstone.__version__} is unsupported; the rewriter requires Capstone 5.x')
+                miss.append(PY_MODULES['capstone'])
+        except (ImportError, OSError) as e:
+            problems.append(f'cannot load Capstone: {e}')
+            miss.append(PY_MODULES['capstone'])
+    cmd = [sys.executable, '-m', 'pip', 'install']
+    # cmd.exe treats < and > as redirection even inside an otherwise space-free argument.
+    fix = subprocess.list2cmdline(cmd) + ' ' + ' '.join('"' + m + '"' for m in miss) if os.name == 'nt' else shlex.join(cmd + miss)
+    out.append(Check('Python modules', not problems, '; '.join(problems) if problems else 'lz4, capstone 5.x, zstd', fix=fix if problems else ''))
     out.append(Check('Pillow', _importable('PIL'), 'the app icon from the game\'s icon' if _importable('PIL') else 'missing: the app gets no icon', required=False, fix='pip install pillow'))
     out.append(Check('fontTools', _importable('fontTools'), 'the button icons in game text' if _importable('fontTools') else 'missing: button icons in game text draw as "?"', required=False, fix='pip install fonttools'))
     ndk, rev = find_ndk(cfg)

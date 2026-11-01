@@ -1,0 +1,12 @@
+# Android bring-up: Shrine progression and short copied-save Great Plateau tests.
+# Duplicate-MRT materials, the pool-count abort and first-use texture content are corrected; full gameplay is not validated.
+status	wip
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-10-30: Chinese menus, save/load, controller and touch input; growable pool registry and first-use sky/light fix; CPU-access mapping and HOME focus restoration checked; 25.44 s normal handheld 30-target movement averaged 29.87 fps, max 67 ms; standing lower-leg ground occlusion remains reproducible; earlier private native-1080p static probe averaged 53.91 fps over 20.78 s; cinematic playback, sustained native 1080p60 and full gameplay unverified
+package	org.nxnative.zelda.botw
+orientation	landscape
+requires	bcn
+setting	overlay=1
+setting	rumble=1
+setting	docked=0
+# Conservative bring-up target; --fps60 overrides this environment row when packing.
+env	DM_FPS_TARGET=30

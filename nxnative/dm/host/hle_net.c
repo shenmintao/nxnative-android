@@ -8,7 +8,8 @@ HLE_FORCE("_ZN2nn4nifm20SubmitNetworkRequestEv", "offline: the network request i
 HLE_FORCE("_ZN2nn4nifm20CancelNetworkRequestEv", "offline: no request to cancel", void, h_nifm_Cancel, void) {}
 HLE_FORCE("_ZN2nn4nifm22IsNetworkRequestOnHoldEv", "offline: the request is not on hold", int, h_nifm_OnHold, void) { return 0; }
 HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "offline: the network is always unavailable", int, h_nifm_Available, void) { return 0; }
-HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: reports failure, shows no system network screen", Result, h_nifm_HandleErr, void) { return RES_FAIL; }
+// Returns bool: whether the system's network screen resolved the error. The offline host cannot resolve it.
+HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: not resolved, shows no system network screen", unsigned, h_nifm_HandleErr, void) { return 0; }
 HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offline: no IP", Result, h_nifm_GetIp, uint32_t *a) { if (a) *a = 0; return RES_FAIL; }
 HLE_FORCE("_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", "offline: no proxy setting", Result, h_nifm_GetProxy, void *p) { (void)p; return RES_FAIL; }
 HLE_FORCE("nnsslInitialize", "connects to the ssl service; the network library's global init needs it to succeed, offline creates no session (cut)", Result, h_ssl_Initialize, void) { return RES_OK; }

@@ -7,7 +7,7 @@ import os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, datapack, fpslocker, install, paths, profiles, toolchain
+from porter import config, containers, datapack, fpslocker, install, native_tools, paths, profiles, sources, toolchain
 from porter.adb import Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say
@@ -33,6 +33,7 @@ class Options:
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
+    data_mode: str = 'embedded'         # embedded: one APK; external: APK + data directory for large games
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -45,9 +46,11 @@ def version_code(ver):   # the APK's versionCode: the Switch version number (v19
     return nsp.vnum(ver) + 1
 
 
-def inspect(folder):
+def inspect(folder, keys=None):
     """What a game folder holds, without extracting anything: the GUI's game card and `porter inspect`"""
-    try: app, fam = nsp.scan_nsps(Path(folder))
+    selected = Path(folder).expanduser().resolve()
+    folder, title_id = sources.resolve(folder)
+    try: app, fam = containers.scan(folder, title_id=title_id, keys=keys, selected=selected)
     except BuildError:
         if any(Path(folder).glob('*.ns[zZ]')) or any(Path(folder).glob('*.xc[zZ]')):   # how dumps are often shared: zstd-compressed NCAs the extractor does not read
             raise BuildError('this folder has only NSZ / XCZ files: decompress them to NSP / XCI first (nsz -D with your prod.keys), then choose the folder with the NSP files') from None
@@ -79,12 +82,14 @@ class Port:
         self.o = opts
         self.cfg = config.load()
         self.result = {}
+        self.input_title_id = None
+        self.input_source = opts.folder
 
     # ---- the whole port ----
     def run(self):
         o = self.o
-        o.folder = Path(o.folder).expanduser().resolve()
-        if not o.folder.is_dir(): raise BuildError(f'not a folder: {o.folder}')
+        if o.data_mode not in ('embedded', 'external'): raise BuildError('data mode must be embedded or external')
+        o.folder, self.input_title_id = sources.resolve(o.folder)
         keys = o.keys or self.cfg.get('keys')
         if not keys: raise BuildError('no prod.keys: give -k / --keys, or set it once with `porter config keys <path>`')
         o.keys = Path(keys).expanduser().resolve()
@@ -106,13 +111,13 @@ class Port:
         if o.install: self.pull_captures()
         self.shaders()
         self.host()
-        self.apk()
         self.data()
+        self.apk()
         if o.install: self.install()
         nsp.rmtree(self.work / 'tmp')
         self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
                            status=self.ap.status, derived=bool(self.derived), installed=bool(o.install))
-        say(f'done: {self.result["apk"]} and {self.result["data"]}')
+        say(f'done: {self.result["apk"]}' + (f' and {self.result["data"]}' if self.result['data'] else ' (game data included)'))
         if self.derived: say(f'[RED] {self.derived}: the port is built from a derived profile and may not run as the profile\'s tested version does')
         return self.result
 
@@ -120,7 +125,7 @@ class Port:
     def inputs(self):
         o = self.o
         say(f'game folder: {o.folder}')
-        self.app, self.fam = nsp.scan_nsps(o.folder)
+        self.app, self.fam = containers.scan(o.folder, title_id=self.input_title_id, keys=o.keys, cfg=self.cfg, env=self.env, selected=self.input_source)
         tid = f'{self.app:016X}'
         self.work = o.folder / f'{tid}_build'
         g, ap = profiles.by_title(self.app)
@@ -156,9 +161,17 @@ class Port:
     def check_space(self):
         """Stop before extracting when the game folder's drive cannot hold the port: a build folder takes about 1 to 2 times the game files (NEO 7.0 GB of 6.8,
         Viractal 2.7 of 1.4), less what an earlier port left there, plus a margin"""
-        game = sum(f.stat().st_size for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower() in ('.nsp', '.xci'))
+        if hasattr(self, 'fam'):
+            inputs = {self.fam['base'], *(self.have[v] for v in self.versions if self.have[v]), *(p for _, _, p in self.fam['dlc'])}
+        else: inputs = {f for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower() in ('.nsp', '.xci')}
+        game = sum(f.stat().st_size for f in inputs)
         built = sum(f.stat().st_size for f in self.work.rglob('*') if f.is_file()) if self.work.is_dir() else 0
-        need, free = max(0, 2 * game - built) + 2**30, shutil.disk_usage(self.o.folder).free
+        versions = getattr(self, 'versions', ())
+        marker = self.g.get('romfs_marker') if hasattr(self, 'g') else None
+        cached = versions and marker and all((self.work / 'extract' / v / 'ExeFS/main').is_file() and (self.work / 'extract' / v / 'RomFS' / marker).is_file() for v in versions)
+        # Reused extractions need no second full copy. DLC may need an atomic rebuild.
+        remaining = sum(f.stat().st_size for f in (self.work / 'aoc').rglob('*') if f.is_file()) if cached else max(0, 2 * game - built)
+        need, free = remaining + 2**30, shutil.disk_usage(self.o.folder).free
         if free < need: raise BuildError(f'not enough disk space on {self.o.folder.anchor}: the port needs about {need / 2**30:.1f} GB more, {free / 2**30:.1f} GB is free')
 
     def use_profile_dir(self, pdir, first):   # every tool finds the game's profile in pdir (game.py DM_GAMES_DIR; first: before dm/games)
@@ -199,6 +212,7 @@ class Port:
         nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
         PROG.end()
         self.dirs = {ver: nsp.extract(nx, o.keys, ex, ver, *picks[ver], None, self.logs, g) for ver in self.versions}
+        nsp.check_versions_aarch64(self.dirs, self.logs, g, g.get('name', g.id))
         bad = [] if self.derived else [f'{v}: {x}' for v in self.versions for x in nsp.build_mismatch(self.dirs[v], v, g)]
         if bad and self.provisional: raise BuildError(f'not the builds the provisional profile registers: {"; ".join(bad)}')
         if bad:
@@ -274,6 +288,8 @@ class Port:
 
     # ---- shaders: upstream's split, then SPIR-V for the Vulkan backend ----
     def shaders(self):
+        decoder = native_tools.yaz0(self.tools['ndk'], self.logs, self.env)
+        if decoder: self.env['DM_YAZ0_LIB'] = str(decoder)
         sv = self.versions
         pkg = self.work / 'shader' / 'pkg'
         nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
@@ -343,6 +359,7 @@ class Port:
         icon = self.icon()
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(version_code(self.pkg_ver)), '--version-name', self.display]
+                + (['--data', self.data_path] if self.o.data_mode == 'embedded' else [])
                 + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + ([] if self.o.debug else ['--release']),
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
@@ -361,11 +378,11 @@ class Port:
     def data(self):
         PROG.stage('data pack', step='button-icon font')
         font_env, font_files = self.button_font()
-        dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
+        dst = self.aw / 'apk-data' if self.o.data_mode == 'embedded' else self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, files={**self.fps_files, **font_files},
                              progress=lambda what: PROG.set(step=f'linking {what}'))
-        self.data_path = dst; self.result['data'] = str(dst)
+        self.data_path = dst; self.result.update(data=str(dst) if self.o.data_mode == 'external' else None, data_mode=self.o.data_mode)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')
 
     def button_font(self):
@@ -387,7 +404,7 @@ class Port:
 
     # ---- install (optional) ----
     def install(self):
-        install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer)
+        install.install(self.apk_path, self.data_path if self.o.data_mode == 'external' else None, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer)
 
 
 def emit_result(r):   # the last JSON event of a port (the GUI's done screen); a summary line in the other modes

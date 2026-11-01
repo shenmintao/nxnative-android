@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 # mkapk.py: build and sign a code-less NativeActivity APK with the Python standard library only (no JDK, no Android SDK).
 #   binary AndroidManifest.xml (AXML) -> stored ZIP with the .so page-aligned -> APK Signature Scheme v2 (RSA-2048, SHA-256) with a self-signed cert.
-# Usage: mkapk.py <lib.so> <out.apk> [key.json] [--package P] [--label L] [--lib NAME] [--landscape] [--icon icon.png] [--release] [--version-code N] [--version-name V]   (the key is created on first use and reused, so reinstalls keep the same signer)
+# Usage: mkapk.py <lib.so> <out.apk> [key.json] [--package P] [--label L] [--lib NAME] [--landscape] [--icon icon.png] [--release] [--version-code N] [--version-name V] [--query-package P]   (the key is created on first use and reused, so reinstalls keep the same signer)
 import hashlib, json, os, secrets, struct, sys, time, zlib
+from pathlib import Path
+
+from apk_stream import Entry, write_apk
+from game_pack import ASSET, MANIFEST_ASSET, GamePack
 
 import argparse as _ap
 _p = _ap.ArgumentParser(); _p.add_argument('so'); _p.add_argument('out'); _p.add_argument('key', nargs='?'); _p.add_argument('--package', default='org.nx2a.probe')
 _p.add_argument('--label', default='NX2A Probe'); _p.add_argument('--lib', default='probe'); _p.add_argument('--landscape', action='store_true')
 _p.add_argument('--extra-so', action='append', default=[], help='another arm64 library packed beside the main one (a Vulkan validation layer)')
+_p.add_argument('--query-package', action='append', default=[], help='make a named package visible to this app (for example an external GPU debug layer); repeatable')
 _p.add_argument('--icon', help='launcher icon (a PNG, used at its own size: nodpi)')
 _p.add_argument('--release', action='store_true', help='not debuggable')
+_p.add_argument('--data', help='embed a data pack in the APK for automatic first-launch preparation')
+_p.add_argument('--abi', choices=('arm64-v8a', 'x86_64'), default='arm64-v8a', help='native library ABI (the game runtime uses arm64-v8a)')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
 PKG, LIB, LABEL = ARGS.package, ARGS.lib, ARGS.label
@@ -29,16 +36,25 @@ ICON_ID = 0x7f010000   # drawable/icon in resources.arsc (res_table)
 MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.version_code), (True, 'versionName', ARGS.version_name)], [
     ('uses-sdk', [(True, 'minSdkVersion', MIN_SDK), (True, 'targetSdkVersion', TARGET_SDK)], []),
     ('uses-permission', [(True, 'name', 'android.permission.VIBRATE')], []),   # rumble and the touch gamepad's taps (a normal permission: granted at install)
-    ('application', [(True, 'label', LABEL)] + ([(True, 'icon', ('ref', ICON_ID))] if ARGS.icon else []) + [(True, 'hasCode', False), (True, 'debuggable', not ARGS.release), (True, 'isGame', True), (True, 'extractNativeLibs', True),
+    ('application', [(True, 'label', LABEL)] + ([(True, 'icon', ('ref', ICON_ID))] if ARGS.icon else []) + [(True, 'hasCode', True), (True, 'debuggable', not ARGS.release), (True, 'isGame', True), (True, 'extractNativeLibs', True),
         (True, 'appCategory', 0),   # a game (appCategory game = 0, and the older isGame): Android's game mode and game dashboard, and the device maker's game tools, apply to it
         # no predictive back: from target SDK 36 the system takes the back gesture itself and finishes the activity, which ends the game (front_android.c on_destroy), without
         # dispatching KEYCODE_BACK; opted out, the gesture comes as the Back key, which opens the front end's menu
         (True, 'enableOnBackInvokedCallback', False)], [
-        ('activity', [(True, 'name', 'android.app.NativeActivity'), (True, 'exported', True), (True, 'configChanges', ('hex', 0x4a0 | 0x80 | 0x1000))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
+        ('activity', [(True, 'name', 'org.nxnative.GameActivity' if ARGS.data else 'org.nxnative.GameNativeActivity'), (True, 'exported', True), (True, 'configChanges', ('hex', 0x4a0 | 0x80 | 0x1000))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
             ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], []),
             ('intent-filter', [], [
                 ('action', [(True, 'name', 'android.intent.action.MAIN')], []),
                 ('category', [(True, 'name', 'android.intent.category.LAUNCHER')], [])])])])])
+
+if ARGS.data:
+    MANIFEST[2][-1][2].append(('activity', [(True, 'name', 'org.nxnative.GameNativeActivity'), (True, 'exported', False),
+        (True, 'configChanges', ('hex', 0x4a0 | 0x80 | 0x1000))] + ([(True, 'screenOrientation', 6)] if ARGS.landscape else []), [
+        ('meta-data', [(True, 'name', 'android.app.lib_name'), (True, 'value', LIB)], [])]))
+
+if ARGS.query_package:
+    MANIFEST[2].insert(1, ('queries', [], [
+        ('package', [(True, 'name', name)], []) for name in dict.fromkeys(ARGS.query_package)]))
 
 def axml(root):
     # string pool: attribute names that carry resource IDs come first, in resource-map order
@@ -177,16 +193,20 @@ def chunked_sha256(sections):
             digests.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
     return hashlib.sha256(b'\x5a' + struct.pack('<I', len(digests)) + b''.join(digests)).digest()
 def sign_v2(zip_entries, cd, eocd, k, crt):
-    ALG = 0x0103   # RSASSA-PKCS1-v1_5 with SHA2-256
     digest = chunked_sha256([zip_entries, cd, eocd])   # EOCD's CD offset still points at the CD start = where the signing block will begin
+    block = v2_block(digest, k, crt)
+    new_eocd = eocd[:16] + struct.pack('<I', len(zip_entries) + len(block)) + eocd[20:]
+    return zip_entries + block + cd + new_eocd
+
+def v2_block(digest, k, crt):
+    ALG = 0x0103   # RSASSA-PKCS1-v1_5 with SHA2-256
     signed = lp(lp(struct.pack('<I', ALG) + lp(digest))) + lp(lp(crt)) + lp(b'')
     signer = lp(signed) + lp(lp(struct.pack('<I', ALG) + lp(rsa_sign(k, signed)))) + lp(spki(k))
     value = lp(lp(signer))
     pair = struct.pack('<QI', 4 + len(value), 0x7109871a) + value
     size = len(pair) + 8 + 16
     block = struct.pack('<Q', size) + pair + struct.pack('<Q', size) + b'APK Sig Block 42'
-    new_eocd = eocd[:16] + struct.pack('<I', len(zip_entries) + len(block)) + eocd[20:]
-    return zip_entries + block + cd + new_eocd
+    return block
 
 def main():
     so, out = ARGS.so, ARGS.out
@@ -196,12 +216,13 @@ def main():
         t = time.time(); k = gen_key(); crt = cert(k)
         json.dump({**{a: str(v) for a, v in k.items()}, 'cert': crt.hex()}, open(keyf, 'w'))
         print(f'new signing key {keyf} ({time.time() - t:.1f} s)')
-    entries = [('AndroidManifest.xml', axml(MANIFEST), 4), (f'lib/arm64-v8a/lib{LIB}.so', open(so, 'rb').read(), 16384)]
-    entries += [(f'lib/arm64-v8a/{os.path.basename(x)}', open(x, 'rb').read(), 16384) for x in ARGS.extra_so]
-    if ARGS.icon: entries += [('resources.arsc', res_table('res/drawable-nodpi-v4/icon.png'), 4), ('res/drawable-nodpi-v4/icon.png', open(ARGS.icon, 'rb').read(), 4)]
-    z, cd, eocd = build_zip(entries)
-    apk = sign_v2(z, cd, eocd, k, crt)
-    open(out, 'wb').write(apk)
-    print(f'{out}: {len(apk)} bytes, signer SHA-256 {hashlib.sha256(crt).hexdigest()[:16]}...')
+    entries = [Entry('AndroidManifest.xml', axml(MANIFEST)), Entry('classes.dex', Path(__file__).resolve().parent / 'bridge/classes.dex'), Entry(f'lib/{ARGS.abi}/lib{LIB}.so', Path(so), 16384)]
+    entries += [Entry(f'lib/{ARGS.abi}/{os.path.basename(x)}', Path(x), 16384) for x in ARGS.extra_so]
+    if ARGS.icon: entries += [Entry('resources.arsc', res_table('res/drawable-nodpi-v4/icon.png')), Entry('res/drawable-nodpi-v4/icon.png', Path(ARGS.icon))]
+    if ARGS.data:
+        data = GamePack(ARGS.data, PKG)
+        entries += [Entry(ASSET, data), Entry(MANIFEST_ASSET, data.manifest)]
+    size = write_apk(entries, out, lambda digest: v2_block(digest, k, crt))
+    print(f'{out}: {size} bytes, signer SHA-256 {hashlib.sha256(crt).hexdigest()[:16]}...')
 
 if __name__ == '__main__': main()

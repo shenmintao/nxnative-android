@@ -1,6 +1,6 @@
 # Installing a port on a device over adb: the APK, then the data pack into the app's files folder (porter/adb.py pushes it in resumable pieces).
 # The player's own files there are kept: the pause menu's settings.txt, the logs, the Vulkan pipeline caches; saves are in the app's internal storage, which an update keeps.
-import shlex
+import json, shlex, zipfile
 from pathlib import Path
 
 from porter import datapack
@@ -9,9 +9,15 @@ from porter.upstream import BuildError, PROG, say
 
 
 def install(apk, data, adb_exe, serial=None, replace_signer=False):
-    apk, data = Path(apk), Path(data)
-    man = datapack.read_manifest(data)
-    if not man: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {data}')
+    apk, data = Path(apk), Path(data) if data is not None else None
+    if data is not None:
+        man = datapack.read_manifest(data)
+        if not man: raise BuildError(f'not a data pack (no {datapack.MANIFEST}): {data}')
+    else:
+        try:
+            with zipfile.ZipFile(apk) as archive: man = json.loads(archive.read('assets/nxnative/manifest.json'))
+            if not isinstance(man, dict) or not man.get('package') or not isinstance(man.get('bytes'), int): raise ValueError('invalid embedded manifest')
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e: raise BuildError(f'not a standalone game APK: {apk} ({e})') from e
     if not apk.is_file(): raise BuildError(f'no APK: {apk}')
     if not adb_exe: raise BuildError('adb not found: install Android platform-tools, or set its path with `porter config adb <path>`')
     adb = Adb(adb_exe, serial, log=say)
@@ -27,13 +33,19 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False):
             if bc is None: say(f'[RED] {man["name"]} needs BC-compressed textures; whether this GPU ({adb.gpu() or "unknown"}) reads them is not known')
         free = adb.free_bytes()
         files = datapack.files_folder(man['package'])
-        have = adb.remote_sizes(files)
-        need = man['bytes'] - sum(have.values())
+        have = adb.remote_sizes(files) if data is not None else {}
+        need = man['bytes'] - sum(have.values()) + (apk.stat().st_size if data is None else 0)
         if free is not None and need > free: raise BuildError(f'the device has {free / 2**30:.1f} GB free; the game needs {need / 2**30:.1f} GB more')
         PROG.set(step=f'installing {apk.name}')
         adb.install(apk, man['package'], replace_signer=replace_signer)
+        if data is None:
+            PROG.end(f'{man["name"]} on {model or dev}')
+            say(f'installed: open "{man["name"]}"; it prepares the included game data on first launch')
+            return
         PROG.set(step='letting the app create its files folder')
         if adb.prepare_app_files(man['package']): say('started the app once so Android made its files folder (it stops at once without its data)')
+        adb.shell(f'am force-stop {shlex.quote(man["package"])}')
+        adb.shell(f'rm -f {shlex.quote(files + "/" + datapack.MANIFEST)}')   # written last, so incomplete updates cannot start
         PROG.set(step='pushing the game data', done=0, total=man['bytes'], unit='B'); pushing = True
         adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,), verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
                       progress=lambda d, t, note: PROG.set(done=d, total=t, note=note))

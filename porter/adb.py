@@ -2,7 +2,7 @@
 # devices (a 6 GB RomFS), so small files go in batches and big files in 64 MB pieces that the device joins; a rerun resumes (files already at their size are skipped,
 # pieces already in place are kept). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
 # reached the device until they were. Pushes use -Z: compressing them took adbd down.
-import contextlib, hashlib, os, shlex, shutil, subprocess, tempfile, time
+import contextlib, hashlib, os, re, shlex, shutil, subprocess, tempfile, time
 from pathlib import Path
 
 
@@ -111,7 +111,12 @@ class Adb:
         (NEO's port died at its first open, mods/main.fixups.tsv). So the app is started once (it stops at once without its data) and stopped again"""
         files = f'/sdcard/Android/data/{package}/files'
         if self.shell(f'[ -d {shlex.quote(files)} ] && echo yes; true').strip() == 'yes': return False
-        self.shell(f'am start -W -n {package}/android.app.NativeActivity >/dev/null 2>&1; true', timeout=60)
+        # Package-only implicit start requires CATEGORY_DEFAULT on this Android build.
+        # Resolve the launcher with PackageManager, then launch its actual component.
+        resolved = self.shell(f'cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {shlex.quote(package)}')
+        component = next((line.strip() for line in resolved.splitlines() if re.fullmatch(re.escape(package) + r'/[A-Za-z0-9_.$]+', line.strip())), None)
+        if not component: raise AdbError(f'{package} has no resolvable launcher activity')
+        self.shell(f'am start -W -n {shlex.quote(component)} >/dev/null 2>&1; true', timeout=60)
         for _ in range(timeout * 2):
             if self.shell(f'[ -d {shlex.quote(files)} ] && echo yes; true').strip() == 'yes': break
             time.sleep(0.5)

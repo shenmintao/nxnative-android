@@ -45,10 +45,12 @@ class PortTab(QWidget):
         self.porter = Porter(self); self.porter.event.connect(self.on_event); self.porter.finished.connect(self.on_finished)
         v = QVBoxLayout(self)
 
-        self.folder = QLineEdit(); self.folder.setPlaceholderText('the folder with the game\'s NSP / XCI files (base game, update, DLC)')
+        self.folder = QLineEdit(); self.folder.setPlaceholderText('an NSP / XCI file, or the game folder (base game, update, DLC)')
         self.folder.editingFinished.connect(self.inspect)
         g = QGroupBox('Game'); gl = QVBoxLayout(g)
         gl.addWidget(path_row(self.folder, self.pick_folder))
+        import_file = QPushButton('Import NSP / XCI…'); import_file.clicked.connect(self.pick_file)
+        gl.addWidget(import_file)
         self.card = QLabel('Choose a game folder.'); self.card.setWordWrap(True); self.card.setTextFormat(Qt.RichText); self.card.setMinimumHeight(60)
         gl.addWidget(self.card)
         v.addWidget(g)
@@ -58,15 +60,21 @@ class PortTab(QWidget):
         self.language = QComboBox()
         for code, name in LANGUAGES: self.language.addItem(name, code)
         self.out = QLineEdit(); self.out.setPlaceholderText('the game folder')
+        self.data_mode = QComboBox()
+        self.data_mode.addItem('Single APK (prepares game data on first launch)', 'embedded')
+        self.data_mode.addItem('APK + external data (large games)', 'external')
         self.install = QCheckBox('Install on the device when done')
         self.device = QComboBox(); self.device.setMinimumWidth(260)
         refresh = QPushButton('Refresh'); refresh.clicked.connect(self.refresh_devices)
         dev = QWidget(); dh = QHBoxLayout(dev); dh.setContentsMargins(0, 0, 0, 0); dh.addWidget(self.install); dh.addWidget(self.device, 1); dh.addWidget(refresh)
         self.debug = QCheckBox('Development build (debuggable, debug information, DM_CTL key presses)')
+        self.fps60 = QCheckBox('Target 60 FPS (when a matching frame-rate configuration is available)')
+        self.fps60.setToolTip('Uses the game profile or a matching FPSLocker configuration. Actual speed depends on the device and scene.')
         self.experimental = QCheckBox('Experimental: try a game that is not ported to Android yet (it may not start)')
         self.experimental.toggled.connect(lambda _: self.update_port_button())
         f.addRow('App name', self.app_name); f.addRow('Game language', self.language)
-        f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.debug); f.addRow('', self.experimental)
+        f.addRow('Game data', self.data_mode)
+        f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.fps60); f.addRow('', self.debug); f.addRow('', self.experimental)
         v.addWidget(o)
 
         bar = QHBoxLayout()
@@ -93,6 +101,12 @@ class PortTab(QWidget):
         self.refresh_devices()
 
     # ---- the game folder ----
+    def pick_file(self):
+        source = self.folder.text().strip()
+        start = str(Path(source).parent) if Path(source).is_file() else source
+        filename, _ = QFileDialog.getOpenFileName(self, 'Import game', start or str(Path.home()), 'Switch games (*.nsp *.xci *.NSP *.XCI)')
+        if filename: self.folder.setText(filename); self.inspect()
+
     def pick_folder(self):
         d = QFileDialog.getExistingDirectory(self, 'Game folder', self.folder.text() or str(Path.home()))
         if d: self.folder.setText(d); self.inspect()
@@ -105,7 +119,7 @@ class PortTab(QWidget):
         d = self.folder.text().strip()
         self.info = None; self.port_btn.setEnabled(False)
         if not d: return
-        if not Path(d).is_dir(): self.card.setText(f'<span style="color:#c62828">Not a folder: {d}</span>'); return
+        if not Path(d).exists(): self.card.setText(f'<span style="color:#c62828">No such game file or folder: {d}</span>'); return
         self.card.setText('Reading the game folder…')
         call_json(self, ['inspect', d, '--json'], self.on_inspect)
 
@@ -146,7 +160,7 @@ class PortTab(QWidget):
         cfg = config.load()
         if not cfg.get('keys'):
             QMessageBox.warning(self, 'prod.keys', 'Set the path of your prod.keys on the Setup tab first.'); self.win.tabs.setCurrentIndex(1); return
-        args = ['port', self.folder.text().strip(), '--progress', 'json']
+        args = ['port', self.folder.text().strip(), '--progress', 'json', '--data-mode', self.data_mode.currentData()]
         if self.app_name.text().strip(): args += ['--app-name', self.app_name.text().strip()]
         if self.language.currentData(): args += ['--language', self.language.currentData()]
         if self.out.text().strip(): args += ['--out', self.out.text().strip()]
@@ -154,12 +168,14 @@ class PortTab(QWidget):
             args.append('--install')
             if self.device.currentData(): args += ['--device', self.device.currentData()]
         if self.debug.isChecked(): args.append('--debug')
+        if self.fps60.isChecked(): args.append('--fps60')
         if self.experimental.isChecked() and not self.info.get('supported'): args.append('--experimental')
         self.run(args)
 
     def install_now(self):
         if not self.result: return
-        args = ['install', self.result['data'], '--apk', self.result['apk'], '--progress', 'json']
+        args = ['install', self.result['data'], '--apk', self.result['apk']] if self.result.get('data') else ['install', self.result['apk']]
+        args += ['--progress', 'json']
         if self.device.currentData(): args += ['--device', self.device.currentData()]
         self.run(args)
 
@@ -349,7 +365,7 @@ class GamesTab(QWidget):
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('nx2android'); self.resize(980, 820)
+        self.setWindowTitle('nxnative-android · nx2android runtime'); self.resize(980, 820)
         self.tabs = QTabWidget()
         self.port = PortTab(self); self.setup = SetupTab(self); self.games = GamesTab()
         self.tabs.addTab(self.port, 'Port'); self.tabs.addTab(self.setup, 'Setup'); self.tabs.addTab(self.games, 'Games')

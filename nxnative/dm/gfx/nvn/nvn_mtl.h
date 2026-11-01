@@ -45,3 +45,5 @@ void *mtl_device(void);
 uint64_t mtl_ext_tex(void *tex);
 uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]);   // crop: x, y, w, h of the texture to show (NULL = all of it)
 void mtl_present_wait(uint64_t ticket);   // as in nvn_obj.h: wait until that present has been handed to the GPU
+int mtl_snap_on(void);                  // bounded host-image buffering is active on a real display
+uint64_t mtl_snap_acquire_wait(void);   // capacity wait at acquire, counted as pacing (nanoseconds)

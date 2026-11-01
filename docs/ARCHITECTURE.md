@@ -1,13 +1,13 @@
 # Architecture
 
-nx2android turns a player's own Switch game files into an Android app. The player picks the game's folder, clicks **Port**, and gets an APK plus the game's data, which the tool can install on a connected device. Every game the tool supports is a **game profile**; everything all games share is the **core**.
+nxnative-android extends nx2android's Android port of nxnative. A player imports an NSP, XCI, or game folder and gets an APK, which the tool can install on a connected device. Embedded data is the default; large games use `--data-mode external` and get an APK plus a data directory. Every game the tool supports is a **game profile**; everything all games share is the **core**.
 
 ```
 gui/  (PySide6 desktop app)
   │  runs `python -m porter port … --progress json`, draws the JSON events
   ▼
 porter/  (headless port pipeline, also a CLI)
-  │  inputs → extract → rewrite → shaders → host → apk → data pack → [install]
+  │  inputs → extract → rewrite → shaders → host → data pack → apk → [install]
   │  reuses nxnative/scripts/build_ipa_from_nsp.py's steps (imported, not copied)
   ▼
 nxnative/  (git subtree of seedds/nxnative + the Android port)
@@ -59,11 +59,19 @@ Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patch
 | rewrite | `patch_nso.py` with `DM_TARGET=android` | `android/patched_<version>/` |
 | shaders | `shader_split.py` (the DLC's own shaders too, `aoc/` given as `DM_SPLIT_AOC`), then `shader_vk.py` (SPIR-V) with the translator built from the repository's source (`dm/gfx/tools/dmsh_xlate` over `dm/third_party/ryujinx`, once per player in their nx2android folder), plus the shaders captured on the device (below) | `shader/pkg`, `android/shaders.dmsv`, `android/captured_shaders/` |
 | host | `dm/android/build.py --release` with the player's NDK (`--debug`: a development build, debug information and `DM_CTL`) | `android/host/libdmhost.so` (`android/host-debug/`) |
-| apk | `dm/android/apk/mkapk.py`, signed with the player's own key | `<out>/<App>.apk` |
-| data | The files the app reads from `/sdcard/Android/data/<package>/files` | `<out>/<App>-data/{mods,RomFS,aoc,shaders.dmsv,nintendo_ext.ttf,env.txt,settings.txt,nx2a-data.json}` (+ `fpslock.tsv` with `--fps60`); the button-icon font is made in `android/font/` |
+| data | Stage the files the app needs; external mode writes the output directory, embedded mode stages under the build directory | `{mods,RomFS,aoc,shaders.dmsv,nintendo_ext.ttf,env.txt,settings.txt,nx2a-data.json}` (+ `fpslock.tsv` with `--fps60`); the button-icon font is made in `android/font/` |
+| apk | `dm/android/apk/mkapk.py`, signed with the player's own key; embedded mode streams the staged data into the APK | `<out>/<App>.apk` |
 | install | `adb install`, the profile's `requires` checked against the device, the data pack pushed (optional) | |
 
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
+
+The importer reads CNMT metadata with LibHac to distinguish an Application from its Patch and AddOnContent, including combined XCI/NSP containers. Selecting a file limits sibling discovery to its game family. Cached metadata is keyed by the container, keys-file metadata and extractor sources.
+
+Embedded APKs contain one indexed `assets/nxnative/game.pack`, avoiding the ZIP entry limit for games with many files. The ZIP32 writer streams bounded chunks, aligns native libraries to 16 KiB and signs with APK Signature Scheme v2. It rejects a complete APK of 4 GiB or more with an external-data alternative. On first launch, the Java `GameActivity` displays progress while the native reader validates paths, sizes and CRCs and expands a content-keyed data directory. Preparation can resume after interruption. A successful version removes obsolete managed data directories; settings and saves remain outside them. Only then does the preparation activity open `GameNativeActivity`, keeping the preparation window separate from Vulkan's surface. External mode launches `GameNativeActivity` directly and checks the data manifest before starting the guest. The installer invalidates that manifest before transfer and writes it last.
+
+The native front end supplies the touch gamepad. Physical gamepad/joystick detection hides it while a controller is attached and restores the user's preference after disconnection; input state resets run on the input looper. The pause menu persists Auto/Xbox/Nintendo mapping: Auto uses Nintendo vendor/name identity where available and Android's standard Xbox-labelled keys otherwise. Guest text entry calls a Java dialog with the Android IME through a UTF-8 byte-array bridge, using that same mapping independently of the gamepad overlay. Rebuilding its checked-in `classes.dex` needs a JDK and Android SDK (`devtools/build_android_bridge.py`); converting a game uses the prebuilt DEX and needs neither.
+
+Shader extraction and translation to SPIR-V run on the computer. Vulkan pipeline creation and GPU-specific driver compilation/cache use the tablet. An optional bounds-checked native Yaz0 decoder accelerates archive extraction on the computer, with the Python decoder retained as a fallback.
 
 Shaders captured on the device: a game can set shaders whose code is in no game file (Xenoblade Chronicles 3, hundreds: effects and model materials), which the split cannot find. When a draw needs a shader the bundle lacks, the app saves it to `captured_shaders/<key>.bin` in its files folder (`gfx_vk_shader.c` `vk_shader_missing`; the draw is skipped this time). A port with `--install` first pulls that folder into `<build folder>/android/captured_shaders/`, which is kept from port to port, and `shader_vk.py --capture` translates it into the bundle. These shaders are not in the profile's tables: the tables stay what the game files give. So such a game draws everything only after it has been played that far once and ported again.
 

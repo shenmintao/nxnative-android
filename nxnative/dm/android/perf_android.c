@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -106,6 +107,17 @@ void dm_perf_replay_thread(void) {
 }
 
 static int64_t g_work_start;
+static _Atomic uint64_t g_frame_deadline;
+static _Atomic int g_step_owns_pacing;
+void dm_perf_deadline(uint64_t target_ns, int frame_step) {
+    static _Atomic unsigned calls; static _Atomic int enabled = 1;
+    if (!(atomic_fetch_add_explicit(&calls, 1, memory_order_relaxed) & 63)) {
+        const char *e = getenv("DM_FRAME_STEP_PACING"); atomic_store(&enabled, !(e && !atoi(e)));   // =0: live A/B against the former independent governors
+    }
+    int on = atomic_load(&enabled);
+    atomic_store(&g_frame_deadline, on ? target_ns : 0);
+    atomic_store(&g_step_owns_pacing, on && frame_step);
+}
 // ---- adaptive frame rate: when the frames do not fit the period the game asks for, presentation steps to a longer one the display divides evenly
 // (60 → 40 → 30 fps; 40 asks the display for 120 Hz), and back when they fit the shorter one with room; a steady rate instead of alternating
 // one-vsync and two-vsync frames. DM_ADAPTIVE_FPS=0 keeps the game's own period.
@@ -123,6 +135,13 @@ uint64_t dm_present_period_adapt(uint64_t period) {
     if (g_adapt < 0) { const char *e = getenv("DM_ADAPTIVE_FPS"); g_adapt = !(e && !atoi(e)); }
     if (!g_adapt || !period) return period;
     g_game_period = period;
+    // A frame-step adapter already chooses a hold and advances game time by it.
+    // A second governor can hold its trials back and make them appear late.
+    if (atomic_load(&g_step_owns_pacing)) {
+        static uint64_t last; static int logs;
+        if (last != period && logs++ < 24) LOG("[perf] frame-step pacing: present %.2f ms, CPU deadline %.2f ms", period / 1e6, atomic_load(&g_frame_deadline) / 1e6);
+        last = period; return period;
+    }
     int64_t want = STEPS[g_step];
     return (uint64_t)want > period ? (uint64_t)want : period;   // never faster than the game asks
 }
@@ -146,9 +165,13 @@ static uint8_t g_late[64]; static int g_nshown; static unsigned g_held_back;
 // moves a quarter refresh past it, so the same frames count as with the hand-over times before. A stricter period + half a refresh counted every one-vsync miss:
 // Unicorn Overlord's opening then showed 70-157 of 300 frames at 25 ms and stepped to 40 fps, where it had held 60 (about 50-54 fps on screen)
 __attribute__((weak)) double vk_refresh_ms(void) { return 0; }
+// A frame the game itself asked to hold longer (its present interval) is judged against that hold. Super Mario Bros. Wonder sets interval 2 for the frame after one
+// that ran long (its own controller, main+0xcfd24) and 1 again: 133 times in 50 s of its first level, and those 33.3 ms frames counted as late (29-36 of 64) stepped
+// the rate down to 40 fps, where the paced frames ran longer still in the game's own measure and it asked for interval 2 more often
+__attribute__((weak)) double dm_nvn_present_hold_ms(void) { return 0; }
 void dm_perf_present(double iv_ms) {
     if (iv_ms == 0) return;
-    double r = vk_refresh_ms(), lim = STEPS[g_step] / 1e6 * 1.5 + r / 4;
+    double r = vk_refresh_ms(), hold = dm_nvn_present_hold_ms(), per = STEPS[g_step] / 1e6, lim = (hold > per ? hold : per) * 1.5 + r / 4;
     g_late[g_nshown++ % 64] = iv_ms < 0 || iv_ms > lim;
 }
 static int shown_late(void) {   // of the last 64 frames on screen, how many missed the display; -1 without readings (a device that gives no present times)
@@ -162,7 +185,7 @@ static void adapt_frame(int64_t work, int64_t now) {
     // and each fight began at 40 until it climbed back 4 s later
     if (g_frame_cost > 0 && g_frame_cost < 1500000 && work > STEPS[g_step]) return;
     if (g_frame_cost > work) work = g_frame_cost;
-    if (!g_adapt) return;
+    if (!g_adapt || atomic_load(&g_step_owns_pacing)) return;
     g_work_hist[g_nwork++ % 64] = work;
     { static unsigned k; if (++k % 600 == 0) LOG("[perf] adaptive frame rate: %.0f fps, frame work p50 %.1f / p90 %.1f / p95 %.1f ms (last %.1f ms); late on screen %d of 64, step-downs held back %u", 1e9 / STEPS[g_step], work_pct(50) / 1e6, work_pct(90) / 1e6, work_p95() / 1e6, work / 1e6, shown_late(), g_held_back); }
     int pin = fps_pin(); if (pin >= 0) { if (g_step != pin) { g_step = pin; g_last_change = now; g_nshown = 0; } return; }
@@ -200,6 +223,11 @@ void dm_perf_frame(double period) {
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
     // and the work then never shows the room to step back up (NEO stayed at 30 fps with frames of 31 to 48 ms)
     if (g_game_period && (int64_t)g_game_period < p) p = (int64_t)g_game_period;
+    // A longer adaptive hold must retain the shorter scheduler deadline. The NVN
+    // layer already computes it for frame-step probes; using the hold here let
+    // ADPF lower clocks precisely when the game was trying to recover its target.
+    uint64_t deadline = atomic_load(&g_frame_deadline);
+    if (deadline && deadline < 1000000000ull) p = (int64_t)deadline;
     hint_init(p);
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;

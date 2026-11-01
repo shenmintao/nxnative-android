@@ -2,7 +2,7 @@
 //   A texture object's image is found by its storage: textures over the same pool, offset and description share one image (as nvn_mtl.m's storage-sharing
 //   table), which is how a render target and the texture a later pass samples it through meet. A packaged texture (packaged layout, CPU-written) is filled
 //   from the guest's block-linear bytes (nvn_deswizzle on the CPU into scratch memory, copied in by the upload command buffer) and filled again when the
-//   dirty-page tracker saw a write to its pages; any other texture is the GPU's (render targets, images), filled only by GPU work.
+//   dirty-page tracker saw a write to its pages. Other textures retain GPU ownership after their first use; initial pool content that the CPU published is uploaded once.
 //   Version 1 keeps every image in VK_IMAGE_LAYOUT_GENERAL after its first use, ordered by whole-pipeline barriers.
 #include "gfx_vk.h"
 #include "nvn_tex.h"
@@ -116,10 +116,27 @@ static VkFormat srgb_twin(VkFormat f) {
     default: return VK_FORMAT_UNDEFINED;
     }
 }
+static uint64_t linear_pitch(const tex_t *t, const vkfmt_t *f) {
+    if (t->d.stride) return t->d.stride;
+    uint64_t width = t->d.width ? t->d.width : 1, bw = f->bw ? f->bw : 1;
+    uint64_t row = ((width + bw - 1) / bw) * f->bpb;
+    uint64_t alignment = t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? 128 : 32;
+    return (row + alignment - 1) & ~(alignment - 1); // nvn_layout and DeviceGetInteger's linear row alignments
+}
 // DM_VK_UBWC (start-up, bits): 1, uncompressed colour images get a format list (their format and its sRGB twin) instead of a free MUTABLE_FORMAT, which Adreno
-// needs to keep UBWC framebuffer compression; views in another format then use the image's own (vk_tex_view). 2, depth / stencil images are made without
-// MUTABLE_FORMAT and EXTENDED_USAGE (their views always take the image's own format). Unicorn Overlord on an Adreno 730: 1 cut GPU time by 35-40%
-static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 0; } return v; }
+// needs to keep UBWC framebuffer compression; another compatible view promotes the image to unrestricted mutable storage. 2, depth / stencil images are made without
+// MUTABLE_FORMAT and EXTENDED_USAGE (their views always take the image's own format). Both are enabled by default (3); =2 retains unrestricted colour views,
+// and =0 retains all former flags. Unsupported format lists fall back at creation; reinterpretation views widen the storage without replacing the requested format.
+static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
+static int image_format_policy(VkImageCreateInfo *ci, int compressed, int color, int mode, VkImageFormatListCreateInfo *list) {
+    if (compressed || !(mode & (color ? 1 : 2))) return 0;
+    ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    if (!color || list->viewFormatCount == 1) ci->flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // A non-mutable depth image needs no format list, including on Vulkan 1.1.
+    // Preserve any other creation chain; narrowed colour declares its exact list.
+    if (color) { list->pNext = ci->pNext; ci->pNext = list; }
+    return 1;
+}
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     vkimg_t *im = calloc(1, sizeof *im);
     const nvn_texdesc *d = &t->d;
@@ -127,6 +144,11 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     im->d = d->target == 2 ? (d->depth ? d->depth : 1) : 1; im->layers = layers_of(d);
     im->levels = d->levels ? d->levels : 1; im->samples = d->samples > 1 ? d->samples : 1; im->target = d->target; im->nvn_format = d->format;
     im->fmt = f->vk; im->vtype = vtype_of(d->target); im->aspect = aspect_of(f);
+    if (t->pool && t->mem && (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) &&
+        im->target == NVN_TEXTURE_TARGET_2D && im->levels == 1 && im->layers == 1 && im->samples == 1 &&
+        im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && f->bpb && f->bw <= 1 && f->bh <= 1) {
+        im->linear_addr = (uint64_t)(uintptr_t)t->mem; im->linear_pitch = linear_pitch(t, f); im->linear_bpb = f->bpb;
+    }
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, f->vk, &fp);
     VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -139,16 +161,23 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
         {im->w, im->h, im->d}, im->levels, im->layers, (VkSampleCountFlagBits)im->samples, VK_IMAGE_TILING_OPTIMAL, u, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
     if (im->samples > 1) ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     VkFormat fl[2] = {f->vk, srgb_twin(f->vk)}; VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, NULL, fl[1] ? 2u : 1u, fl};
-    if (!f->compressed && (ubwc_mode() & (im->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? 1 : 2))) {   // (a depth format has no twin: a list of itself, no MUTABLE_FORMAT)
-        im->fixed_fmt = 1; im->fmt2 = fl[1]; ci.pNext = &fli;
-        ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_EXTENDED_USAGE_BIT; if (!fl[1]) ci.flags &= ~(VkImageCreateFlags)VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    VkImageCreateInfo unrestricted = ci;
+    int mode = ubwc_mode(); if (!V.has_format_list) mode &= ~1;   // Vulkan 1.1 without the format-list extension keeps compatible mutable views
+    if (image_format_policy(&ci, f->compressed, im->aspect == VK_IMAGE_ASPECT_COLOR_BIT, mode, &fli)) {
+        im->fixed_fmt = 1; im->fmt2 = fl[1];
     }
     im->usage = ci.usage; im->cflags = ci.flags;
     VkResult r = vkCreateImage(V.dev, &ci, NULL, &im->img);
+    if (r && im->fixed_fmt && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+        ci = unrestricted; im->fixed_fmt = 0; im->fmt2 = VK_FORMAT_UNDEFINED;
+        im->usage = ci.usage; im->cflags = ci.flags;
+        r = vkCreateImage(V.dev, &ci, NULL, &im->img);
+        if (!r) { static int n; if (n++ < 8) VKLOG("color format list unavailable: unrestricted mutable image used"); }
+    }
     if (r) { VKRED_ONCE(10, "vkCreateImage failed (%d): %ux%ux%u format %#x (vk %d) target %d levels %u layers %u samples %u", r, im->w, im->h, im->d, d->format, f->vk, d->target, im->levels, im->layers, im->samples); free(im); return NULL; }
     VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im->img, &req);
     if ((ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) && im->w >= 256) { static int n; if (n++ < 16)   // UBWC check: a compressed target takes room for its metadata
-        VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (format-listed)" : "", (unsigned long long)req.size); }
+        VKLOG("target %ux%u format %d%s: %llu bytes", im->w, im->h, f->vk, im->fixed_fmt ? " (fixed-format)" : "", (unsigned long long)req.size); }
     VkDeviceSize moff;
     if (!(im->mem = vk_image_memory(&req, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT), &moff, &im->sub))) {
         VKRED_ONCE(11, "image memory allocation failed (%llu bytes)", (unsigned long long)req.size); vkDestroyImage(V.dev, im->img, NULL); free(im); return NULL; }
@@ -165,43 +194,79 @@ void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
 }
 // Upload a packaged texture from guest memory: each level and layer deswizzled into scratch memory, copied in by the upload command buffer
 uint64_t g_pkg_n, g_pkg_bytes, g_pkg_ns;   // packaged texture uploads: count, bytes, CPU time (the replay's per-frame line)
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
-static void pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+static int pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracked);
+static int pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracked) {
     struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
-    pkg_upload_(im, t, f);
+    int ok = pkg_upload_(im, t, f, tracked);
     clock_gettime(CLOCK_MONOTONIC, &b); g_pkg_ns += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); g_pkg_n++; g_pkg_bytes += t->L.size;
+    return ok;
 }
-static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+static int pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracked) {
     { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
         VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
-    if (im->packaged < 100) im->packaged++;
+    if (tracked && im->packaged < 100) im->packaged++;
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
-    nvn_dirty_protect(t->mem, t->L.size);
-    im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
-    im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0;
+    if (tracked) {
+        nvn_dirty_protect(t->mem, t->L.size);
+        im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
+        im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0;
+    }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
-    if (!bpb) { VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return; }
+    if (!bpb) { VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return 0; }
     for (unsigned lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = im->d >> lv ? im->d >> lv : 1;
         uint32_t bx = (w + bw - 1) / bw, by = (h + bh - 1) / bh; size_t pitch = (size_t)bx * bpb, slab = pitch * by * z;
         for (unsigned ly = 0; ly < im->layers; ly++) {
             VkBuffer sb; VkDeviceSize so; uint8_t *dst = vk_scratch(slab, 16, &sb, &so);
             if (linear) {   // linear storage: rows of the texture's stride, one level, one layer
-                size_t stride = t->d.stride ? t->d.stride : pitch;
+                size_t stride = (size_t)linear_pitch(t, f);
                 for (uint32_t y = 0; y < by * z; y++) memcpy(dst + y * pitch, t->mem + (size_t)y * stride, pitch);
-            } else if (nvn_deswizzle(&t->d, lv, ly, t->mem, dst, pitch)) { VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return; }
+            } else if (nvn_deswizzle(&t->d, lv, ly, t->mem, dst, pitch)) { VKRED_ONCE(13, "deswizzle refused texture format %#x target %d", t->d.format, t->d.target); return 0; }
             VkBufferImageCopy r = {so, 0, 0, {im->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+            vk_tex_written(im);
         }
     }
+    return 1;
+}
+// A newly used private image must see content already published in its NVN pool.
+// Packaged and linear textures have their own paths. Uncached/no-access storage
+// may be prepopulated; cached storage is eligible only after an explicit flush.
+// This is a one-time upload, without dirty-page tracking: later GPU writes stay.
+int nvn_flushed(const void *p, uint64_t n);
+static int initial_content(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+    if (im->layout != VK_IMAGE_LAYOUT_UNDEFINED || im->gpu_w || !t->mem || !t->pool || !t->pool->mem || t->has_layout) return 0;
+    if (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ||
+        (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+    if (t->off < 0 || (uint64_t)t->off > t->pool->size || !t->L.size || t->L.size > t->pool->size - (uint64_t)t->off || t->mem != t->pool->mem + t->off) return 0;
+    int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
+    int uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
+    const char *e = getenv("DM_NVN_FLUSH_FILL");
+    int flushed = (!e || atoi(e)) && nvn_flushed(t->mem, t->L.size);
+    if (!no_cpu && !uncached && !flushed) return 0;
+    if (!flushed) {
+        uint64_t i = 0, word; int any = 0;
+        for (; i + sizeof word <= t->L.size; i += sizeof word) { memcpy(&word, t->mem + i, sizeof word); if (word) { any = 1; break; } }
+        for (; !any && i < t->L.size; i++) if (t->mem[i]) any = 1;
+        if (!any) return 0;   // untouched storage; an explicit all-zero flush is still uploaded
+    }
+    if (!pkg_upload(im, t, f, 0)) return 0;
+    static uint64_t count[3]; int why = no_cpu ? 0 : uncached ? 1 : 2;
+    if (count[why]++ < 4) VKLOG("initial content: serial %llu %ux%ux%u format %#x filled from %s storage (%llu so far)",
+        (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format,
+        (const char *[]){"CPU_NO_ACCESS", "CPU_UNCACHED", "CPU-flushed"}[why], (unsigned long long)count[why]);
+    return 1;
 }
 static int packaged_tex(const tex_t *t);
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f);
 static void vk_tex_view_drop_all(vkimg_t *im);
+static void compare_drop(vkimg_t *im);
+static void compare_report(void);
 // Images over the same memory with different descriptions (the storage key differs) are separate Vulkan images: on the Switch a texture sees what another
 // one over its memory rendered, here it does not. They are linked both ways at creation (up to 8 each), and a sampled image older than an overlapping
 // image's last rendering is logged ([alias] stale read), to find what a game reinterprets
@@ -231,7 +296,7 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); compare_drop(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -268,13 +333,13 @@ vkimg_t *vk_tex(const tex_t *t) {
     if (t->mem && lin_copy(im, t, f)) {}
     else if (t->mem && packaged_tex(t)) {
         im->pkg_used = g_tex_frame;
-        if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f); }
+        if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f, 1); }
         else {
             uint64_t now = nvn_dirty_now();
-            if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) pkg_upload(im, t, f);   // pages written since the upload
+            if (now != im->pkg_seen && nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp)) pkg_upload(im, t, f, 1);   // pages written since the upload
             im->pkg_seen = now;
         }
-    } else if (fresh) vk_tex_prepare(vk_upload_cmd(), im);
+    } else if (im->layout != VK_IMAGE_LAYOUT_GENERAL && !initial_content(im, t, f)) vk_tex_prepare(vk_upload_cmd(), im);
     return im;
 }
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the
@@ -288,6 +353,7 @@ typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
 void vk_tex_sweep(void) {
     if (++g_tex_frame % 300) return;
+    compare_report();
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
     pkg_age *v = NULL; size_t nv = 0, cap = 0;
@@ -347,7 +413,7 @@ static int linear_storage(const tex_t *t) { return t->pool && (t->d.flags & (NVN
 extern uint64_t g_up_gen;
 static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = the image holds its storage as of this upload buffer
     if (!linear_storage(t) || im->levels != 1 || im->d != 1 || im->layers != 1 || f->bw > 1 || f->bh > 1 || !f->bpb || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
-    size_t stride = t->d.stride ? t->d.stride : (size_t)im->w * f->bpb; VkBuffer b; VkDeviceSize o;
+    size_t stride = (size_t)linear_pitch(t, f); VkBuffer b; VkDeviceSize o;
     if (stride % f->bpb || stride < (size_t)im->w * f->bpb || !vk_buf_at((uint64_t)(uintptr_t)t->mem, (uint64_t)stride * (im->h - 1) + (uint64_t)im->w * f->bpb, &b, &o) || o % f->bpb) return 0;
     // the GPU wrote it (a clear, a copy, a storage write): it holds that until the CPU writes its storage again, which its pages, set read-only, tell
     size_t len = stride * (im->h - 1) + (size_t)im->w * f->bpb;
@@ -360,7 +426,42 @@ static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = th
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     VkBufferImageCopy r = {o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
     vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    vk_tex_written(im);
     return 1;
+}
+// Metal's buffer-backed linear textures already share their texels with the
+// pool. An optimal Vulkan image does not. Publish render/transfer results to
+// that same backing buffer in GPU order, before the submission's CPU fence.
+// BotW's CPU foot placement reads GPU-rendered height tiles through this path;
+// this rule uses only the NVN layout, with no title/format/position exception.
+void vk_linear_writeback(VkCommandBuffer cb, vkimg_t *im) {
+    if (!im || !im->linear_addr) return;
+    const char *e = getenv("DM_VK_LINEAR_WRITEBACK"); if (e && !atoi(e)) return;
+    uint64_t row = (uint64_t)im->w * im->linear_bpb, pitch = im->linear_pitch;
+    if (!im->h || !row || pitch < row || pitch % im->linear_bpb || pitch / im->linear_bpb > UINT32_MAX ||
+        (im->h > 1 && pitch > (UINT64_MAX - row) / (im->h - 1))) {
+        VKRED_ONCE(97, "linear image writeback has an invalid row layout"); return;
+    }
+    uint64_t length = pitch * (im->h - 1) + row; VkBuffer buffer; VkDeviceSize offset;
+    if (!vk_buf_at(im->linear_addr, length, &buffer, &offset) || offset % 4 || offset % im->linear_bpb) {
+        VKRED_ONCE(98, "linear image writeback storage is outside a pool or misaligned"); return;
+    }
+    vk_img_barrier_all(cb);
+    VkBufferImageCopy copy = {offset, (uint32_t)(pitch / im->linear_bpb), 0,
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
+    vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
+    VkMemoryBarrier visible = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_HOST_READ_BIT};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &visible, 0, NULL, 0, NULL);
+    // Copied pools copy back only texel rows after the GPU fence. Padding may
+    // contain unrelated CPU writes and must never be copied back from a shadow.
+    void vk_gpu_wrote(uint64_t a, uint64_t n);
+    if (pitch == row) vk_gpu_wrote(im->linear_addr, length);
+    else for (uint32_t y = 0; y < im->h; y++) vk_gpu_wrote(im->linear_addr + y * pitch, row);
+    static unsigned logged;
+    if (logged++ < 12) VKLOG("linear image writeback: %ux%u format %#x pitch %llu, %llu texel bytes at %#llx",
+        im->w, im->h, im->nvn_format, (unsigned long long)pitch, (unsigned long long)(row * im->h), (unsigned long long)im->linear_addr);
 }
 static int packaged_tex(const tex_t *t) {
     if (t->has_layout || linear_tex(t)) return 1;
@@ -372,7 +473,7 @@ void mtl_tex_release(tex_t *t) { (void)t; }   // images belong to their storage 
 int mtl_tex_gpu_owned(uint64_t serial) { (void)serial; return 0; }
 
 // ---------------- views ----------------
-typedef struct vview { VkImageView v; VkImageViewType type; VkFormat fmt; uint32_t lv0, nlv, ly0, nly; VkComponentMapping swz; VkImageAspectFlags aspect; int attach; struct vview *next; } vview;   // attach: an attachment view (its usage differs from a sampling view's)
+typedef struct vview { VkImageView v; VkImageViewType type; VkFormat fmt; uint32_t lv0, nlv, ly0, nly; VkComponentMapping swz; VkImageAspectFlags aspect; int attach; VkImageUsageFlags usage; struct vview *next; } vview;   // attach: an attachment view (its usage differs from a sampling view's)
 static nvn_hmap g_views = {.klen = sizeof(vkimg_t *)};   // vkimg_t* → vview list
 static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
@@ -382,6 +483,78 @@ static void vk_tex_view_drop_all(vkimg_t *im) {
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
+}
+uint64_t g_vk_image_gen, g_color_promotions, g_color_promotion_failures;
+// Allocate the legacy compatible image without changing its logical texture.
+// The complete old contents are copied before this replacement is published.
+static int color_image_make_wide(const vkimg_t *src, vkimg_t *out) {
+    if (src->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !src->w || !src->h || !src->d ||
+        !src->layers || !src->levels || src->levels > 32 || !src->samples ||
+        (src->cflags & VK_IMAGE_CREATE_PROTECTED_BIT) ||
+        !(src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) || !(src->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return 0;
+    vkimg_t im = {0};
+    VkImageType type = src->vtype == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D :
+        (src->vtype == VK_IMAGE_VIEW_TYPE_1D || src->vtype == VK_IMAGE_VIEW_TYPE_1D_ARRAY) ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+    im.usage = src->usage; im.cflags = src->cflags | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, im.cflags, type, src->fmt,
+        {src->w, src->h, src->d}, src->levels, src->layers, (VkSampleCountFlagBits)src->samples, VK_IMAGE_TILING_OPTIMAL,
+        im.usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(V.dev, &ci, NULL, &im.img)) return 0;
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im.img, &req);
+    uint32_t mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    VkDeviceSize offset = 0;
+    if (mt != UINT32_MAX) im.mem = vk_image_memory(&req, mt, &offset, &im.sub);
+    if (!im.mem) { vkDestroyImage(V.dev, im.img, NULL); return 0; }
+    if (vkBindImageMemory(V.dev, im.img, im.mem, offset)) {
+        if (im.sub) vk_defer_free_image_sub(im.img, im.sub); else vk_defer_free_image(im.img, im.mem);
+        return 0;
+    }
+    im.fmt = src->fmt; im.aspect = src->aspect; im.vtype = src->vtype;
+    im.w = src->w; im.h = src->h; im.d = src->d; im.layers = src->layers; im.levels = src->levels; im.samples = src->samples;
+    im.layout = VK_IMAGE_LAYOUT_UNDEFINED; *out = im; return 1;
+}
+static void color_image_copy(VkCommandBuffer cb, vkimg_t *src, vkimg_t *dst) {
+    vk_tex_prepare(cb, src); vk_tex_prepare(cb, dst); vk_img_barrier_all(cb);
+    for (uint32_t lv = 0; lv < src->levels; lv++) {
+        uint32_t w = src->w >> lv, h = src->h >> lv, d = src->d >> lv;
+        VkImageCopy c = {{VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, src->layers}, {0, 0, 0},
+            {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, src->layers}, {0, 0, 0}, {w ? w : 1, h ? h : 1, d ? d : 1}};
+        vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    vk_img_barrier_all(cb);
+}
+static int color_image_require(vkimg_t *im, VkImageUsageFlags required) {
+    if (!im->fixed_fmt && (im->usage & required) == required) return 1;
+    if (im->wide_fail_frame == g_tex_frame + 1) return 0;
+    vkimg_t wide, desc = *im; desc.usage |= required;
+    if (!vk_sub_open() || !color_image_make_wide(&desc, &wide)) {
+        im->wide_fail_frame = g_tex_frame + 1; g_color_promotion_failures++;
+        VKRED_ONCE(19, "compatible color image allocation failed: format %d %ux%u", im->fmt, im->w, im->h); return 0;
+    }
+    // Separate old uploads/writes, the copy, and later uploads. Putting this copy
+    // in a buffer that runs before old writes or after later uploads loses data.
+    vk_end_pass_land(); vk_sub_restart();
+    color_image_copy(vk_cmd(), im, &wide); vk_sub_restart();
+    // The copy is queued before a present worker can observe the new handle.
+    // This short critical section performs no GPU wait or submission restart.
+    extern pthread_mutex_t g_present_mu;
+    pthread_mutex_lock(&g_present_mu);
+    vk_tex_view_drop_all(im);
+    if (im->full) vk_defer_free_view(im->full);
+    if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem);
+    im->img = wide.img; im->mem = wide.mem; im->sub = wide.sub; im->full = VK_NULL_HANDLE;
+    im->usage = wide.usage; im->cflags = wide.cflags; im->layout = wide.layout;
+    im->fixed_fmt = 0; im->fmt2 = VK_FORMAT_UNDEFINED; im->wide_fail_frame = 0;
+    uint64_t fence = mtl_last_fence() + 1; if (im->last_use < fence) im->last_use = fence;
+    g_vk_image_gen++; g_color_promotions++;
+    pthread_mutex_unlock(&g_present_mu);
+    return 1;
+}
+static int color_image_widen(vkimg_t *im) {
+    return color_image_require(im, 0);
+}
+static int color_wide_forced(void) {   // diagnostic: exercise widening before any real reinterpretation view is needed
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_FORCE_COLOR_WIDE"); on = e && atoi(e); } return on;
 }
 static VkComponentSwizzle swz_comp(int nvn) {   // NVN swizzle enum: 0 zero 1 one 2 R 3 G 4 B 5 A
     switch (nvn) { case 0: return VK_COMPONENT_SWIZZLE_ZERO; case 1: return VK_COMPONENT_SWIZZLE_ONE; case 2: return VK_COMPONENT_SWIZZLE_R; case 3: return VK_COMPONENT_SWIZZLE_G; case 4: return VK_COMPONENT_SWIZZLE_B; default: return VK_COMPONENT_SWIZZLE_A; }
@@ -396,7 +569,16 @@ static VkComponentSwizzle apply(VkComponentSwizzle outer, const VkComponentMappi
     default: return outer;
     }
 }
-__thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers;
+__thread VkFormat vk_view_fmt; __thread uint32_t vk_view_layers, vk_view_width, vk_view_height;
+__thread VkImageUsageFlags vk_view_usage;
+static VkImageUsageFlags image_view_usage(const tex_t *t, VkFormat fmt, int attachment) {
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
+    if (attachment) return (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) |
+        (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
+    VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    return usage;
+}
 VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out) {
     vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
@@ -437,25 +619,167 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
                                      swz.b = apply(swz_comp(vw->swz[2]), &o, VK_COMPONENT_SWIZZLE_B); swz.a = apply(swz_comp(vw->swz[3]), &o, VK_COMPONENT_SWIZZLE_A); }
     } else swz = (VkComponentMapping){0};
     VkFormat fmt = f->vk;
-    if ((im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || f->compressed != vk_fmt(im->nvn_format)->compressed) fmt = im->fmt;   // depth views and block-size changes keep the image's format
-    if (im->fixed_fmt && fmt != im->fmt && fmt != srgb_twin(im->fmt)) { fmt = im->fmt; static int n; if (n++ < 8) VKLOG("view format %d of a format-listed image (%d): the image's own used", f->vk, im->fmt); }
+    const vkfmt_t *base = vk_fmt(im->nvn_format);
+    const VkImageCreateFlags block_flags = VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    int block_view = base && base->compressed && !f->compressed && !f->depth && f->bpb == base->bpb &&
+        (im->cflags & block_flags) == block_flags && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT;
+    if (block_view && (nlv != 1 || nly != 1)) {
+        VKRED_ONCE(94, "uncompressed block view needs one mip and one layer: requested %u levels, %u layers", nlv, nly); return VK_NULL_HANDLE;
+    }
+    if (base && f->compressed != base->compressed && !block_view) {
+        VKRED_ONCE(95, "unsupported compressed/uncompressed view: format %d as %d", im->fmt, f->vk); return VK_NULL_HANDLE;
+    }
+    if (im->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) fmt = im->fmt;
+    vk_view_width = im->w >> lv0 ? im->w >> lv0 : 1; vk_view_height = im->h >> lv0 ? im->h >> lv0 : 1;
+    if (block_view) { vk_view_width = 1 + (vk_view_width - 1) / base->bw; vk_view_height = 1 + (vk_view_height - 1) / base->bh; }
+    // Ordinary cached views retain the query-free path. Block views may need
+    // additional parent usage before a view can legally expose that role.
+    VkImageUsageFlags block_usage = block_view ? image_view_usage(t, fmt, as_attachment) : 0;
+    if (block_view && !block_usage) { VKRED_ONCE(96, "block view format %d does not support its requested role", fmt); return VK_NULL_HANDLE; }
+    if (im->fixed_fmt && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+        ((fmt != im->fmt && fmt != im->fmt2) || color_wide_forced()) && !color_image_widen(im)) return VK_NULL_HANDLE;
+    if (block_view && (block_usage & ~im->usage) && !color_image_require(im, block_usage)) return VK_NULL_HANDLE;
     pthread_mutex_lock(&g_view_mu);
     vview *head = nvn_hm_get(&g_views, &im);
     for (vview *v = head; v; v = v->next)
-        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == (as_attachment != 0) && !memcmp(&v->swz, &swz, sizeof swz)) { pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; return v->v; }
-    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, 0};
-    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
-    uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
-    else if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        if (v->type == type && v->fmt == fmt && v->lv0 == lv0 && v->nlv == nlv && v->ly0 == ly0 && v->nly == nly && v->aspect == aspect && v->attach == (as_attachment != 0) && !memcmp(&v->swz, &swz, sizeof swz)) {
+            VkImageView view = v->v; VkImageUsageFlags usage = v->usage;
+            pthread_mutex_unlock(&g_view_mu); vk_view_fmt = fmt; vk_view_layers = nly; vk_view_usage = usage; return view; }
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL,
+        block_view ? block_usage : image_view_usage(t, fmt, as_attachment)};
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
-    vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, as_attachment != 0, head};
+    vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, as_attachment != 0, uci.usage, head};
     nvn_hm_put(&g_views, &im, nv);
     pthread_mutex_unlock(&g_view_mu);
-    vk_view_fmt = fmt; vk_view_layers = nly;
+    vk_view_fmt = fmt; vk_view_layers = nly; vk_view_usage = uci.usage;
     return view;
+}
+
+// A colour texture can be used by an NVN comparison lookup. Vulkan drivers
+// need an actual depth format for that operation. Preserve the original image
+// and copy its bits through a device buffer into a matching depth image. This
+// also works without maintenance8's colour/depth image-copy relaxation.
+struct vkcompare { vkimg_t depth; VkBuffer buffer; VkDeviceMemory memory; VkDeviceSize size; int valid; };
+uint64_t g_compare_copies, g_compare_bytes, g_compare_hits, g_compare_failures;
+static void compare_report(void) {
+    if (g_compare_copies || g_compare_failures) VKLOG("comparison snapshots at present %llu: %llu copies, %.2f MB copied, %llu reuse checks, %llu failures (cumulative)",
+        (unsigned long long)g_tex_frame, (unsigned long long)g_compare_copies, g_compare_bytes / 1048576.0,
+        (unsigned long long)g_compare_hits, (unsigned long long)g_compare_failures);
+}
+void vk_tex_written(vkimg_t *im) {
+    if (im && im->compare && im->compare->valid) {
+        im->compare->valid = 0;
+        g_tex_gen++; // a memoized descriptor must first refresh its snapshot
+    }
+}
+static void compare_drop(vkimg_t *im) {
+    struct vkcompare *c = im->compare; if (!c) return;
+    vk_tex_view_drop_all(&c->depth);
+    if (c->depth.sub) vk_defer_free_image_sub(c->depth.img, c->depth.sub);
+    else if (c->depth.img || c->depth.mem) vk_defer_free_image(c->depth.img, c->depth.mem);
+    if (c->buffer || c->memory) vk_defer_free_buffer(c->buffer, c->memory);
+    free(c); im->compare = NULL;
+}
+static VkDeviceSize compare_regions(const vkimg_t *im, unsigned bpp, VkBufferImageCopy regions[32]) {
+    if (!im->w || !im->h || im->d != 1 || !im->layers || !im->levels || im->levels > 32 ||
+        im->samples != 1 || im->vtype == VK_IMAGE_VIEW_TYPE_3D || (bpp != 2 && bpp != 4)) return 0;
+    VkDeviceSize size = 0;
+    for (unsigned lv = 0; lv < im->levels; lv++) {
+        uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1;
+        uint64_t row = (uint64_t)w * bpp;
+        if (row > UINT64_MAX / h || row * h > UINT64_MAX / im->layers || size > UINT64_MAX - 3) return 0;
+        uint64_t bytes = row * h * im->layers; size = (size + 3) & ~(VkDeviceSize)3;
+        if (bytes > UINT64_MAX - size) return 0;
+        regions[lv] = (VkBufferImageCopy){size, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, 0, im->layers}, {0, 0, 0}, {w, h, 1}};
+        size += bytes;
+    }
+    return size;
+}
+static int compare_make(vkimg_t *src, VkFormat format, unsigned bpp) {
+    VkBufferImageCopy regions[32]; VkDeviceSize bytes = compare_regions(src, bpp, regions);
+    if (!bytes || !(src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) return 0;
+    struct vkcompare *c = calloc(1, sizeof *c); if (!c) return 0;
+    vkimg_t *d = &c->depth;
+    d->w = src->w; d->h = src->h; d->d = 1; d->levels = src->levels; d->layers = src->layers; d->samples = 1;
+    d->fmt = format; d->aspect = VK_IMAGE_ASPECT_DEPTH_BIT; d->vtype = src->vtype;
+    d->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    d->cflags = src->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    VkImageType type = src->vtype == VK_IMAGE_VIEW_TYPE_1D || src->vtype == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, d->cflags, type, format,
+        {d->w, d->h, 1}, d->levels, d->layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, d->usage,
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(V.dev, &ci, NULL, &d->img)) goto failed;
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, d->img, &req);
+    uint32_t mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0); VkDeviceSize offset = 0;
+    if (mt == UINT32_MAX || !(d->mem = vk_image_memory(&req, mt, &offset, &d->sub)) || vkBindImageMemory(V.dev, d->img, d->mem, offset)) goto failed;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, bytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(V.dev, &bi, NULL, &c->buffer)) goto failed;
+    vkGetBufferMemoryRequirements(V.dev, c->buffer, &req);
+    mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, mt};
+    if (mt == UINT32_MAX || vk_buffer_memory_allocate(&ai, &c->memory) || vkBindBufferMemory(V.dev, c->buffer, c->memory, 0)) goto failed;
+    c->size = bytes; src->compare = c; return 1;
+failed:
+    src->compare = c; compare_drop(src); return 0;
+}
+static void compare_refresh(vkimg_t *src) {
+    struct vkcompare *c = src->compare;
+    if (c->valid) { g_compare_hits++; return; }
+    // Descriptor collection can happen in a render pass. Complete its writes,
+    // then freeze this copy before a later upload buffer can overwrite data.
+    vk_end_pass_land(); VkCommandBuffer cb = vk_cmd();
+    vk_tex_prepare(cb, src); vk_tex_prepare(cb, &c->depth); vk_img_barrier_all(cb);
+    VkBufferImageCopy regions[32]; unsigned bpp = c->depth.fmt == VK_FORMAT_D16_UNORM ? 2 : 4;
+    (void)compare_regions(src, bpp, regions);
+    vkCmdCopyImageToBuffer(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, c->buffer, src->levels, regions);
+    vk_img_barrier_all(cb);
+    for (unsigned lv = 0; lv < src->levels; lv++) regions[lv].imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vkCmdCopyBufferToImage(cb, c->buffer, c->depth.img, VK_IMAGE_LAYOUT_GENERAL, src->levels, regions);
+    vk_img_barrier_all(cb); c->valid = 1; g_compare_copies++; g_compare_bytes += c->size;
+    vk_sub_restart(); g_vk_image_gen++;
+}
+VkImageView vk_tex_compare_view(const tex_t *t, const view_t *vw, int dim, int arrayed, vkimg_t **out) {
+    vkimg_t *src = NULL; VkImageView ordinary = vk_tex_view(t, vw, dim, arrayed, 0, &src);
+    if (out) *out = src;
+    if (!ordinary || !src || src->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return ordinary;
+    VkFormat format = vk_view_fmt == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM :
+                      vk_view_fmt == VK_FORMAT_R32_SFLOAT && V.has_depth_range_unrestricted ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+    const vkfmt_t *base = vk_fmt(src->nvn_format);
+    unsigned bpp = format == VK_FORMAT_D16_UNORM ? 2 : 4;
+    if (!format || !base || base->compressed || base->bpb != bpp || src->d != 1 || src->samples != 1 || src->vtype == VK_IMAGE_VIEW_TYPE_3D) {
+        VKRED_ONCE(97, "comparison sampling has no compatible depth representation: view format %d, parent %d", vk_view_fmt, src->fmt);
+        g_compare_failures++; return VK_NULL_HANDLE;
+    }
+    vview source = {0};
+    pthread_mutex_lock(&g_view_mu);
+    for (vview *v = nvn_hm_get(&g_views, &src); v; v = v->next) if (v->v == ordinary) { source = *v; break; }
+    pthread_mutex_unlock(&g_view_mu);
+    if (!source.v) return VK_NULL_HANDLE;
+    if (!src->compare && !compare_make(src, format, bpp)) {
+        VKRED_ONCE(98, "comparison snapshot allocation failed: format %d %ux%u layers %u", format, src->w, src->h, src->layers);
+        g_compare_failures++; return VK_NULL_HANDLE;
+    }
+    if (src->compare->depth.fmt != format) return VK_NULL_HANDLE;
+    compare_refresh(src);
+    vkimg_t *depth = &src->compare->depth;
+    pthread_mutex_lock(&g_view_mu);
+    vview *head = nvn_hm_get(&g_views, &depth);
+    for (vview *v = head; v; v = v->next) if (v->type == source.type && v->lv0 == source.lv0 && v->nlv == source.nlv &&
+        v->ly0 == source.ly0 && v->nly == source.nly && !memcmp(&v->swz, &source.swz, sizeof v->swz)) {
+        VkImageView view = v->v; pthread_mutex_unlock(&g_view_mu); vk_view_fmt = format; return view;
+    }
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, depth->img, source.type, format,
+        source.swz, {VK_IMAGE_ASPECT_DEPTH_BIT, source.lv0, source.nlv, source.ly0, source.nly}};
+    VkImageView view; VkResult result = vkCreateImageView(V.dev, &ci, NULL, &view);
+    if (result) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(99, "comparison snapshot view failed: %d", result); return VK_NULL_HANDLE; }
+    vview *v = calloc(1, sizeof *v);
+    if (!v) { vk_defer_free_view(view); pthread_mutex_unlock(&g_view_mu); return VK_NULL_HANDLE; }
+    *v = source; v->v = view; v->fmt = format; v->aspect = VK_IMAGE_ASPECT_DEPTH_BIT; v->next = head;
+    nvn_hm_put(&g_views, &depth, v); pthread_mutex_unlock(&g_view_mu);
+    vk_view_fmt = format; return view;
 }
 
 // ---------------- texture / sampler ID tables ----------------
@@ -470,7 +794,7 @@ typedef struct { treg_ver cur; treg_ver *old; } treg_t;   // old: TREG_OLD earli
 static treg_t *g_treg; static int g_ntreg;
 uint64_t g_tex_gen = 1;   // changes whenever a texture ID is registered again or views go (gfx_vk_exec.c's per-submission view cache)
 uint64_t g_samp_gen = 1;  // changes whenever a sampler ID is registered with other parameters (gfx_vk_exec.c samp_cached and the descriptor set memo)
-static samp_par *g_sreg; static uint8_t *g_sreg_ok; static VkSampler *g_samp; static int g_nsreg;
+static samp_par *g_sreg; static uint8_t *g_sreg_ok; static VkSampler (*g_samp)[2]; static int g_nsreg;
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 __attribute__((weak)) uint64_t nvn_jobs_queued(void) { return 0; }
 __attribute__((weak)) uint64_t nvn_replaying_job(void) { return 0; }
@@ -517,7 +841,9 @@ static VkSampler make_sampler(const samp_par *p) {
     ci.mipLodBias = p->lod_bias;
     ci.anisotropyEnable = p->aniso > 1.0f; ci.maxAnisotropy = p->aniso > V.max_aniso ? V.max_aniso : p->aniso;
     ci.compareEnable = p->cmp_mode == 1; ci.compareOp = cmp_op(p->cmp_func);
-    ci.minLod = p->lod_min; ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;   // no mipmap filter: level 0 only (GL's rule)
+    // Non-mipmapped filtering ignores the guest LOD clamps. Keep a positive
+    // maximum below half a level so minification still uses minFilter.
+    ci.minLod = p->minf <= 1 ? 0.0f : p->lod_min; ci.maxLod = p->minf <= 1 ? 0.25f : p->lod_max;
     int border = ci.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || ci.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || ci.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (border) {
@@ -537,7 +863,7 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     pthread_mutex_lock(&g_rmu);
     if (sid >= g_nsreg) { int n = sid + 256; g_sreg = realloc(g_sreg, n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, n); g_samp = realloc(g_samp, n * sizeof *g_samp);
         memset(g_sreg_ok + g_nsreg, 0, n - g_nsreg); memset(g_samp + g_nsreg, 0, (n - g_nsreg) * sizeof *g_samp); g_nsreg = n; }
-    if (!g_sreg_ok[sid] || memcmp(&g_sreg[sid], sp, sizeof *sp)) { g_sreg[sid] = *sp; g_sreg_ok[sid] = 1; g_samp[sid] = VK_NULL_HANDLE; __atomic_fetch_add(&g_samp_gen, 1, __ATOMIC_RELEASE); }   // samplers are cached by parameters below
+    if (!g_sreg_ok[sid] || memcmp(&g_sreg[sid], sp, sizeof *sp)) { g_sreg[sid] = *sp; g_sreg_ok[sid] = 1; memset(g_samp[sid], 0, sizeof g_samp[sid]); __atomic_fetch_add(&g_samp_gen, 1, __ATOMIC_RELEASE); }   // samplers are cached by parameters below
     pthread_mutex_unlock(&g_rmu);
 }
 static nvn_hmap g_samp_cache = {.klen = sizeof(samp_par)};   // samp_par → VkSampler (VkSamplers are never destroyed: few distinct parameter sets)
@@ -548,16 +874,19 @@ void vk_samp_describe(int sid, char *out, size_t n) {   // the registered parame
     else snprintf(out, n, "sampler %d: not registered (dummy)", sid);
     pthread_mutex_unlock(&g_rmu);
 }
-VkSampler vk_samp_by_id(int sid) {
+VkSampler vk_samp_by_id_mode(int sid, int plain) {
     pthread_mutex_lock(&g_rmu);
     VkSampler s = VK_NULL_HANDLE;
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
-        s = g_samp[sid];
-        if (!s) { s = nvn_hm_get(&g_samp_cache, &g_sreg[sid]); if (!s) { s = make_sampler(&g_sreg[sid]); if (s) nvn_hm_put(&g_samp_cache, &g_sreg[sid], s); } g_samp[sid] = s; }
+        plain = plain && g_sreg[sid].cmp_mode == 1;
+        s = g_samp[sid][plain];
+        if (!s) { samp_par p = g_sreg[sid]; if (plain) p.cmp_mode = 0;
+            s = nvn_hm_get(&g_samp_cache, &p); if (!s) { s = make_sampler(&p); if (s) nvn_hm_put(&g_samp_cache, &p, s); } g_samp[sid][plain] = s; }
     }
     pthread_mutex_unlock(&g_rmu);
     return s;
 }
+VkSampler vk_samp_by_id(int sid) { return vk_samp_by_id_mode(sid, 0); }
 VkSampler vk_dummy_sampler(void) {
     static VkSampler s; if (s) return s;
     samp_par p = {0}; p.magf = 1; p.minf = 1; p.lod_max = 1000; p.aniso = 1; s = make_sampler(&p); return s;
@@ -596,7 +925,7 @@ VkBufferView vk_dummy_tbuf(int storage) {
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, 65536, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
         VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b)); VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b, &req);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-        VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0));
+        VKCHK(vk_buffer_memory_allocate(&ai, &m)); VKCHK(vkBindBufferMemory(V.dev, b, m, 0));
         void *p; VKCHK(vkMapMemory(V.dev, m, 0, VK_WHOLE_SIZE, 0, &p)); memset(p, 0, 65536);
     }
     VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, NULL, 0, b, VK_FORMAT_R32_UINT, 0, 65536};

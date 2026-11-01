@@ -101,6 +101,36 @@ class DataPack(unittest.TestCase):
         finally:
             shutil.rmtree(t, ignore_errors=True)
 
+    def test_font_and_fps_files_survive_both_data_modes(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='nx2a_test_data_modes_') as temp:
+            t = Path(temp)
+            (t / 'game/RomFS').mkdir(parents=True)
+            (t / 'patched').mkdir()
+            (t / 'patched/main.patched.bin').write_bytes(b'module')
+            (t / 'game/RomFS/example').write_bytes(b'romfs')
+            font = t / 'font.ttf'; font.write_bytes(b'generated font')
+            fps = t / 'fpslock.tsv'; fps.write_bytes(b'fps writes')
+            shaders = t / 'shaders.dmsv'; shaders.write_bytes(b'DMSV')
+            font_env = ['DM_SHARED_FONT_EXT=/sdcard/Android/data/org.nx2a.test/files/nintendo_ext.ttf']
+            port = SimpleNamespace(aw=t / 'android', game=t / 'game', patched=t / 'patched',
+                ap=profiles.load(NEO), g={'ipa': 'Test.ipa'}, app_name='Test', pkg_ver='v0', display='1.0',
+                aoc=None, lang='en-US', package='org.nx2a.test', dmsv=shaders,
+                fps_env=['DM_FPSLOCK=/example/fpslock.tsv'], fps_files={'fpslock.tsv': fps}, result={},
+                button_font=lambda: (font_env, {'nintendo_ext.ttf': font}))
+            for mode in ('embedded', 'external'):
+                with self.subTest(mode=mode), patch.object(pipeline, 'PROG'):
+                    port.o = SimpleNamespace(out=t / 'output', data_mode=mode)
+                    pipeline.Port.data(port)
+                    self.assertEqual((port.data_path / 'nintendo_ext.ttf').read_bytes(), font.read_bytes())
+                    self.assertEqual((port.data_path / 'fpslock.tsv').read_bytes(), fps.read_bytes())
+                    env = (port.data_path / 'env.txt').read_text(encoding='utf-8')
+                    self.assertIn(font_env[0], env)
+                    self.assertIn(port.fps_env[0], env)
+                    self.assertEqual(port.result['data_mode'], mode)
+                    self.assertEqual(port.result['data'], str(port.data_path) if mode == 'external' else None)
+
 
 class Experimental(unittest.TestCase):
     def test_ios_profile_copied_with_experimental_android_tsv(self):   # an iOS-only profile is copied out of the repository, never edited in place
@@ -139,6 +169,18 @@ class Misc(unittest.TestCase):
             with self.assertRaises(pipeline.BuildError): pipeline.Port.check_space(p)
             work.mkdir(); (work / 'x').write_bytes(b'\0' * 2**20); pipeline.Port.check_space(p)   # a build folder already there counts
         finally: shutil.disk_usage = real
+
+    def test_cached_extraction_does_not_reserve_a_second_copy(self):
+        from types import SimpleNamespace as NS
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory(prefix='nx2a_cached_') as root:
+            d = Path(root); base = d / 'base.nsp'; base.write_bytes(b'x' * 100)
+            work = d / 'build'
+            for path in ('extract/v0/ExeFS/main', 'extract/v0/RomFS/marker', 'aoc/1/file'):
+                file = work / path; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(b'x')
+            p = NS(o=NS(folder=d), work=work, fam={'base': base, 'dlc': []}, have={'v0': None}, versions=['v0'], g={'romfs_marker': 'marker'})
+            with patch('porter.pipeline.shutil.disk_usage', return_value=NS(free=2**30 + 1)):
+                pipeline.Port.check_space(p)
 
 
 class FpsLocker(unittest.TestCase):   # porter/fpslocker.py: FPSLocker-Warehouse configs → the host's rows (hle_fpslock.c DM_FPS_LOCKS) and the rewriter's cuts

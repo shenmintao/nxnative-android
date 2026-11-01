@@ -9,43 +9,39 @@
 #include <time.h>
 #include "overlay_layout.h"
 #include "font5x7.h"
+#include "present_history.h"
 #include "overlay_vert.spv.h"
 #include "overlay_frag.spv.h"
 
 __attribute__((weak)) ANativeWindow *dm_front_window(void) { return NULL; }
 static uint64_t g_presents;
-// Vulkan present IDs include overlay redraws; only the game's tickets have a time for the NVN frame statistics.
+// Vulkan IDs include host redraws; fallback hand-over times are kept separately
+// from real display feedback so late driver results can replace a fallback.
 enum { PRES_TIMES = 64 };
-static struct { uint64_t ticket, ns; } g_pres_t[PRES_TIMES];
-static struct { uint32_t id; uint64_t ticket; } g_pres_ids[PRES_TIMES];
+static vk_present_history g_present_history;
+static struct { uint64_t ticket, ns; } g_pres_fallback[PRES_TIMES];
 static pthread_mutex_t g_pres_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_pres_recorded;   // display times recorded so far (present_time_record): none after 240 presents with display timing on, the hand-over time stands in
-static void present_time_begin(uint64_t ticket, uint64_t ns) {   // ns: the time to report now (no display times on this device), or 0 for the display's
+static _Atomic uint64_t g_pres_recorded;
+static void present_time_begin(uint64_t ticket, uint64_t ns) {
     pthread_mutex_lock(&g_pres_mu);
-    g_pres_t[ticket % PRES_TIMES] = (typeof(g_pres_t[0])){ticket, ns};
+    vk_present_begin(&g_present_history, ticket);
+    g_pres_fallback[ticket % PRES_TIMES] = (typeof(g_pres_fallback[0])){ticket, ns};
     pthread_mutex_unlock(&g_pres_mu);
 }
-static void present_time_map(uint32_t id, uint64_t ticket) {   // the present thread, under g_present_mu
-    g_pres_ids[id % PRES_TIMES] = (typeof(g_pres_ids[0])){id, ticket};
+static void present_time_map(uint32_t id, uint64_t ticket) {
+    pthread_mutex_lock(&g_pres_mu); vk_present_map(&g_present_history, id, ticket); pthread_mutex_unlock(&g_pres_mu);
 }
-static void present_time_record(uint32_t id, uint64_t ns) {   // the present thread, under g_present_mu
-    typeof(g_pres_ids[0]) *m = &g_pres_ids[id % PRES_TIMES];
-    if (m->id != id || !m->ticket || !ns) return;
-    pthread_mutex_lock(&g_pres_mu);
-    typeof(g_pres_t[0]) *p = &g_pres_t[m->ticket % PRES_TIMES];
-    if (p->ticket == m->ticket) p->ns = ns;
-    pthread_mutex_unlock(&g_pres_mu); g_pres_recorded++;
+static void present_time_record(uint32_t id, uint64_t ns) {
+    pthread_mutex_lock(&g_pres_mu); g_pres_recorded += vk_present_record(&g_present_history, id, ns); pthread_mutex_unlock(&g_pres_mu);
 }
-static void present_time_reset(void) {   // the old swapchain's pending results cannot describe the new one
-    memset(g_pres_ids, 0, sizeof g_pres_ids);
-    pthread_mutex_lock(&g_pres_mu); memset(g_pres_t, 0, sizeof g_pres_t); pthread_mutex_unlock(&g_pres_mu);
+static void present_time_reset(void) {
+    pthread_mutex_lock(&g_pres_mu); vk_present_clear(&g_present_history); memset(g_pres_fallback, 0, sizeof g_pres_fallback); pthread_mutex_unlock(&g_pres_mu);
 }
 static double present_time_get(uint64_t ticket) {
     pthread_mutex_lock(&g_pres_mu);
-    typeof(g_pres_t[0]) *p = &g_pres_t[ticket % PRES_TIMES];
-    double t = ticket && p->ticket == ticket ? p->ns / 1e9 : 0;
-    pthread_mutex_unlock(&g_pres_mu);
-    return t;
+    uint64_t ns = vk_present_actual(&g_present_history, ticket);
+    if (!ns && ticket && g_pres_fallback[ticket % PRES_TIMES].ticket == ticket) ns = g_pres_fallback[ticket % PRES_TIMES].ns;
+    pthread_mutex_unlock(&g_pres_mu); return ns == UINT64_MAX ? -1 : ns / 1e9;
 }
 static VkSurfaceKHR g_surf; static VkSwapchainKHR g_swap; static VkImage g_simg[8]; static uint32_t g_nsimg; static VkExtent2D g_sext; static VkFormat g_sfmt;
 // The swapchain's format follows the window texture's sRGB-ness: a blit from an sRGB image into a UNORM one decodes to linear and stores that unencoded, which darkened the whole
@@ -55,6 +51,79 @@ static VkFormat g_want = VK_FORMAT_R8G8B8A8_UNORM;
 static VkSemaphore g_acq[8], g_done_sem[8]; static VkFence g_pfence[8]; static VkCommandPool g_ppool; static VkCommandBuffer g_pcb[8]; static uint32_t g_pi;
 static ANativeWindow *g_win;
 static VkImageView g_sview[8];
+// Optional final-presentation attribution. Main-command timestamps exclude this
+// command buffer. The first interval includes dependency stalls; subsequent
+// intervals cover clear/blit, overlay, and the final layout transition.
+enum { PRES_PROBE_POINTS = 5 };
+static int g_pres_probe_on = -1;
+static VkQueryPool g_pres_probe_pool;
+static uint32_t g_pres_probe_bits;
+static uint8_t g_pres_probe_pending[8];
+static double g_pres_probe_gpu[4], g_pres_probe_cpu[7];
+static unsigned g_pres_probe_gn, g_pres_probe_cn, g_pres_probe_bad;
+static uint64_t mono_ns(void);
+static int pres_probe_durations(const uint64_t q[PRES_PROBE_POINTS][2], double period, uint32_t bits, double ms[4]) {
+    if (!bits || bits > 64 || !isfinite(period) || period <= 0) return 0;
+    for (int i = 0; i < PRES_PROBE_POINTS; i++) if (!q[i][1]) return 0;
+    uint64_t mask = bits == 64 ? UINT64_MAX : (1ull << bits) - 1;
+    double values[4];
+    for (int i = 0; i < 4; i++) {
+        values[i] = (double)((q[i+1][0] - q[i][0]) & mask) * period / 1e6;
+        if (!isfinite(values[i]) || values[i] > 1000) return 0;
+    }
+    memcpy(ms, values, sizeof values); return 1;
+}
+static void pres_probe_read(unsigned slot) {   // only after this slot's fence has completed
+    if (!g_pres_probe_pool || !g_pres_probe_pending[slot]) return;
+    g_pres_probe_pending[slot] = 0;
+    uint64_t q[PRES_PROBE_POINTS][2]; double ms[4];
+    VkResult r = vkGetQueryPoolResults(V.dev, g_pres_probe_pool, slot * PRES_PROBE_POINTS, PRES_PROBE_POINTS,
+        sizeof q, q, sizeof q[0], VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if (r != VK_SUCCESS || !pres_probe_durations(q, V.props.limits.timestampPeriod, g_pres_probe_bits, ms)) { g_pres_probe_bad++; return; }
+    for (int i = 0; i < 4; i++) g_pres_probe_gpu[i] += ms[i];
+    if (++g_pres_probe_gn == 600) {
+        VKLOG("final present GPU (600 completed): dependency %.3f ms, clear+blit %.3f, overlay %.3f, final layout %.3f; %u invalid samples; %ux%u output",
+            g_pres_probe_gpu[0]/600, g_pres_probe_gpu[1]/600, g_pres_probe_gpu[2]/600, g_pres_probe_gpu[3]/600, g_pres_probe_bad, g_sext.width, g_sext.height);
+        memset(g_pres_probe_gpu, 0, sizeof g_pres_probe_gpu); g_pres_probe_gn = g_pres_probe_bad = 0;
+    }
+}
+static void pres_probe_init(void) {
+    if (g_pres_probe_on < 0) { const char *e = getenv("DM_VK_PRESENT_TIMES"); g_pres_probe_on = e && atoi(e); }
+    if (!g_pres_probe_on || g_pres_probe_pool || !V.props.limits.timestampComputeAndGraphics) return;
+    uint32_t n = 0; vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &n, NULL);
+    VkQueueFamilyProperties *p = calloc(n ? n : 1, sizeof *p);
+    if (!p) return;
+    vkGetPhysicalDeviceQueueFamilyProperties(V.pd, &n, p);
+    g_pres_probe_bits = V.qf < n ? p[V.qf].timestampValidBits : 0; free(p);
+    if (!g_pres_probe_bits) return;
+    VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 8 * PRES_PROBE_POINTS, 0};
+    if (vkCreateQueryPool(V.dev, &qi, NULL, &g_pres_probe_pool)) { g_pres_probe_pool = VK_NULL_HANDLE; VKLOG("optional final-present timestamps unavailable"); }
+}
+static void pres_probe_drop(void) {   // device idle, under g_present_mu
+    if (g_pres_probe_pool) {
+        for (unsigned i = 0; i < 8; i++) pres_probe_read(i);
+        vkDestroyQueryPool(V.dev, g_pres_probe_pool, NULL); g_pres_probe_pool = VK_NULL_HANDLE;
+    }
+    memset(g_pres_probe_pending, 0, sizeof g_pres_probe_pending);
+    memset(g_pres_probe_gpu, 0, sizeof g_pres_probe_gpu);
+    memset(g_pres_probe_cpu, 0, sizeof g_pres_probe_cpu);
+    g_pres_probe_gn = g_pres_probe_cn = g_pres_probe_bad = 0;
+}
+static void pres_probe_mark(VkCommandBuffer cb, unsigned slot, unsigned point, uint64_t ticket) {
+    if (!g_pres_probe_pool || !ticket) return;   // host-menu redraws are not game frames
+    if (!point) vkCmdResetQueryPool(cb, g_pres_probe_pool, slot * PRES_PROBE_POINTS, PRES_PROBE_POINTS);
+    vkCmdWriteTimestamp(cb, point ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        g_pres_probe_pool, slot * PRES_PROBE_POINTS + point);
+}
+static void pres_probe_cpu(const uint64_t ns[8], uint64_t ticket) {
+    if (!g_pres_probe_on || !ticket) return;
+    for (int i = 0; i < 7; i++) g_pres_probe_cpu[i] += (double)(ns[i+1] - ns[i]) / 1e6;
+    if (++g_pres_probe_cn == 600) {
+        VKLOG("final present CPU (600 queued): slot+query %.3f ms, acquire+format %.3f, record %.3f, queue lock %.3f, submit %.3f, feedback %.3f, queue present %.3f",
+            g_pres_probe_cpu[0]/600, g_pres_probe_cpu[1]/600, g_pres_probe_cpu[2]/600, g_pres_probe_cpu[3]/600, g_pres_probe_cpu[4]/600, g_pres_probe_cpu[5]/600, g_pres_probe_cpu[6]/600);
+        memset(g_pres_probe_cpu, 0, sizeof g_pres_probe_cpu); g_pres_probe_cn = 0;
+    }
+}
 // Where the game's picture lies in the window (fractions: x, y, width, height; aspect kept, black borders around it), for the front end's touch points, which hle_touch.c
 // takes relative to the picture: normalized by the whole window, a tap in Unpacking's 3040x1904 window (97 px borders) was off by up to 5% of the height
 static _Atomic uint32_t g_pic[4] = {0, 0, 1u << 20, 1u << 20};
@@ -72,7 +141,7 @@ static void pace_reset(void); static void ov_fb_drop(void);
 static void swap_destroy(void) {
     pace_reset();
     present_time_reset();
-    if (g_swap) { vkDeviceWaitIdle(V.dev); ov_fb_drop(); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
+    if (g_swap) { vkDeviceWaitIdle(V.dev); pres_probe_drop(); ov_fb_drop(); for (uint32_t i = 0; i < g_nsimg; i++) if (g_sview[i]) { vkDestroyImageView(V.dev, g_sview[i], NULL); g_sview[i] = VK_NULL_HANDLE; }
                   vkDestroySwapchainKHR(V.dev, g_swap, NULL); g_swap = VK_NULL_HANDLE; }
     if (g_surf) { vkDestroySurfaceKHR(V.inst, g_surf, NULL); g_surf = VK_NULL_HANDLE; }
 }
@@ -107,6 +176,7 @@ static int swap_make(void) {
             VkFenceCreateInfo f = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT}; VKCHK(vkCreateFence(V.dev, &f, NULL, &g_pfence[i]));
         }
     }
+    pres_probe_init();
     VKLOG("swapchain %ux%u format %d, %u images", g_sext.width, g_sext.height, g_sfmt, g_nsimg);
     return 1;
 }
@@ -276,13 +346,19 @@ static void ov_panel(int st) {   // the pause menu, for menu state st (dm_menu_s
     int ts = (int)fmaxf(2, roundf(rh * 0.30f / 7)), is = (int)fmaxf(2, roundf(rh * 0.22f / 7));
     float ty = pad + rh / 2; cv_text(&cv, (W - cv_text_w("PAUSED", ts)) / 2, ty, "PAUSED", ts, C_WHITE);
     cv_rrect(&cv, pad, pad + rh - 1, W - pad, pad + rh, 0.5f, line);
-    static const char *labels[OVM_N] = {"Controller overlay", "Rumble", "Show FPS", "Mode", "Resume"};
+    static const char *labels[OVM_N] = {"Controller overlay", "Rumble", "Pad layout", "Show FPS", "Mode", "Resume"};
     int sel = (st >> 4 & 15) - 1;
     for (int i = 0; i < OVM_N; i++) {
         float y0 = pad + (i + 1) * rh, cy = y0 + rh / 2;
         if (i == sel) cv_rrect(&cv, pad * 0.6f, y0 + rh * 0.08f, W - pad * 0.6f, y0 + rh * 0.92f, rh * 0.14f, hi);
         if (i == OVM_RESUME) { cv_text(&cv, (W - cv_text_w(labels[i], is)) / 2, cy, labels[i], is, C_ACCENT); continue; }
         cv_text(&cv, pad * 1.6f, cy, labels[i], is, i == sel ? C_WHITE : dim);
+        if (i == OVM_LAYOUT) {
+            int mode = st >> 8 & 3;
+            const char *word = mode == 1 ? "Xbox" : mode == 2 ? "Nintendo" : st >> 10 & 1 ? "Auto: Xbox" : "Auto: Nintendo";
+            cv_text(&cv, W - pad * 1.6f - cv_text_w(word, is), cy, word, is, C_ACCENT);
+            continue;
+        }
         if (i == OVM_MODE) {   // two segments, the current one filled: Performance (handheld) | Resolution (docked)
             static const char *seg[2] = {"Performance", "Resolution"}; int docked = st >> 2 & 1;
             float sh = rh * 0.46f, sw = fmaxf(cv_text_w(seg[0], is), cv_text_w(seg[1], is)) + sh, x1 = W - pad * 1.6f, x0 = x1 - 2 * sw;
@@ -440,7 +516,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VkBufferCreateInfo bc = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)w * th * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE};
         VKCHK(vkCreateBuffer(V.dev, &bc, NULL, &g_ov.up)); VkMemoryRequirements bq; vkGetBufferMemoryRequirements(V.dev, g_ov.up, &bq);
         VkMemoryAllocateInfo bi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bq.size, vk_mem_type(bq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-        VKCHK(vkAllocateMemory(V.dev, &bi, NULL, &g_ov.upm)); VKCHK(vkBindBufferMemory(V.dev, g_ov.up, g_ov.upm, 0));
+        VKCHK(vk_buffer_memory_allocate(&bi, &g_ov.upm)); VKCHK(vkBindBufferMemory(V.dev, g_ov.up, g_ov.upm, 0));
         void *px; VKCHK(vkMapMemory(V.dev, g_ov.upm, 0, VK_WHOLE_SIZE, 0, &px)); g_ov.px = px;
         g_ov.w = w; g_ov.h = h; g_ov.sh = sh; ov_raster(g_ov.px, w, h, sh); memset(g_ov.px + (size_t)w * (h + sh) * 4, 0, (size_t)w * (g_ov.ph + g_ov.gh) * 4); ov_fps_glyphs();
         VkDescriptorImageInfo ii = {g_ov.samp, g_ov.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
@@ -474,7 +550,8 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
 // desired present time: the last one's plus the game's period, on the display's vsync grid (anchored at a past frame's actual present time), half a vsync before that vsync so
 // it cannot go out early. A frame that would not be ready in time moves the cadence to the first vsync it can make (a "resync": one longer frame, and from then on a vsync of
 // slack). The pause menu's redraws carry no time. DM_VK_PACE=0 (live) presents without times
-static uint64_t g_refresh_ns, g_pace_target, g_pace_anchor, g_pace_n, g_pace_resync, g_pace_slip; static uint32_t g_pace_id; static int g_pace_on = 1;
+static _Atomic uint64_t g_refresh_ns;
+static uint64_t g_pace_target, g_pace_anchor, g_pace_n, g_pace_resync, g_pace_slip; static int g_pace_on = 1, g_snapshot_lead = 1;
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void pace_reset(void) { g_pace_target = g_pace_anchor = g_refresh_ns = 0; }
 static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on the grid through the anchor
@@ -482,9 +559,10 @@ static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on th
     if (t <= a) return a - (a - t) / r * r;
     return a + (t - a + r - 1) / r * r;
 }
-static uint64_t pace_desired(double period) {   // the frame's desired present time (0 = none)
+static uint64_t pace_desired(double period, int buffered) {   // the frame's desired present time (0 = none)
     if (!V.has_dtiming || !g_swap) return 0;
-    if (g_pace_n % 30 == 0) { const char *e = getenv("DM_VK_PACE"); g_pace_on = !(e && !atoi(e)); }
+    if (g_pace_n % 30 == 0) { const char *e = getenv("DM_VK_PACE"); g_pace_on = !(e && !atoi(e));
+        e = getenv("DM_VK_SNAPSHOT_LEAD"); g_snapshot_lead = !(e && !atoi(e)); }
     if (!g_refresh_ns || g_pace_n % 120 == 0) {
         VkRefreshCycleDurationGOOGLE rc; uint64_t was = g_refresh_ns;
         if (vkGetRefreshCycleDurationGOOGLE(V.dev, g_swap, &rc) == VK_SUCCESS && rc.refreshDuration > 1000000) g_refresh_ns = rc.refreshDuration;
@@ -498,30 +576,40 @@ static uint64_t pace_desired(double period) {   // the frame's desired present t
             if (pt[i].desiredPresentTime && pt[i].actualPresentTime > pt[i].desiredPresentTime + g_refresh_ns) g_pace_slip++;   // went out a vsync or more after its own
         }
     g_pace_n++;
-    if (g_pace_n % 600 == 0) VKLOG("[perf] display timing: %llu frames, %llu resyncs, %llu shown a vsync or more after their time (cumulative)%s",
-                                   (unsigned long long)g_pace_n, (unsigned long long)g_pace_resync, (unsigned long long)g_pace_slip, g_pace_on ? "" : "; off (DM_VK_PACE=0)");
+    if (g_pace_n % 600 == 0) VKLOG("[perf] display timing: %llu frames, %llu resyncs, %llu shown a vsync or more after their time, %llu actual presentation samples (cumulative)%s",
+                                   (unsigned long long)g_pace_n, (unsigned long long)g_pace_resync, (unsigned long long)g_pace_slip, (unsigned long long)g_pres_recorded, g_pace_on ? "" : "; off (DM_VK_PACE=0)");
     if (!g_pace_on || !g_refresh_ns || !g_pace_anchor || period <= 0) { g_pace_target = 0; return 0; }
     // The earliest vsync this frame can make: its GPU work (submitted just before), the blit, then the latch a vsync before it is shown. When the cadence's next vsync is
     // earlier, the cadence restarts half a vsync further out than that, so the next frames have room for the jitter: restarting at the earliest itself made 31 long frames
     // in 4,200 (5 shown late), and going on until the target was under a vsync away made 54 in 3,600 go out late
-    double vk_gpu_ms_recent(void); double g = vk_gpu_ms_recent(); uint64_t gpu = (uint64_t)((g > 4 ? g : 4) * 1e6) + 3000000;
+    // A buffered frame's rendering and snapshot copy were submitted earlier on
+    // this queue. Reserving its entire timestamp span again counts elapsed work
+    // as a future delay and pushes the cadence out. Keep the blit margin;
+    // a GPU that really finishes late still appears late in the actual feedback.
+    double vk_gpu_ms_recent(void); double g = buffered && g_snapshot_lead ? 0 : vk_gpu_ms_recent();
+    uint64_t gpu = (uint64_t)((g > 4 ? g : 4) * 1e6) + 3000000;
     uint64_t now = mono_ns(), t = g_pace_target ? pace_snap(g_pace_target + (uint64_t)(period * 1e9) - g_refresh_ns / 2) : 0;
     if (t < now + gpu + g_refresh_ns) { if (g_pace_target) g_pace_resync++; t = pace_snap(now + gpu + g_refresh_ns * 3 / 2); }
     g_pace_target = t;
     return t - g_refresh_ns / 2;
 }
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
+    uint64_t cpu[8] = {0}; if (g_pres_probe_on > 0) cpu[0] = mono_ns();
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
+    pres_probe_read(k); if (g_pres_probe_on > 0) cpu[1] = mono_ns();
     VkFormat want = im->fmt == VK_FORMAT_R8G8B8A8_SRGB || im->fmt == VK_FORMAT_B8G8R8A8_SRGB || im->fmt == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     if (want != g_want) { g_want = want; swap_destroy(); if (!swap_make()) return; }   // once, at the first present of the other kind
     uint32_t idx; VkResult r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_destroy(); if (!swap_make()) return; r = vkAcquireNextImageKHR(V.dev, g_swap, UINT64_MAX, g_acq[k], VK_NULL_HANDLE, &idx); }
     if (r < 0) { VKRED_ONCE(90, "vkAcquireNextImageKHR: %d", r); return; }
+    if (g_pres_probe_on > 0) cpu[2] = mono_ns();
     vkResetFences(V.dev, 1, &g_pfence[k]);
     VkCommandBuffer cb = g_pcb[k];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(cb, &bi);
+    pres_probe_mark(cb, k, 0, ticket);
     vk_img_barrier_all(cb);   // after everything submitted before on this queue
+    pres_probe_mark(cb, k, 1, ticket);
     barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkClearColorValue black = {{0, 0, 0, 1}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cb, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rg);
@@ -530,6 +618,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     vk_pic_set((float)dx / g_sext.width, (float)dy / g_sext.height, (float)dw / g_sext.width, (float)dh / g_sext.height);
     VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{cx, cy, 0}, {cx + cw, cy + ch, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
     vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, g_simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    pres_probe_mark(cb, k, 2, ticket);
     VkImageLayout lay = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     int ovm = dm_overlay_visible(), menu = dm_menu_state(), fps = dm_overlay_fps();
     if ((ovm || menu >= 0 || fps) && overlay_ready(cb, k, menu) && (V.has_dynrender || ov_fb(idx))) {   // without dynamic rendering, only with the image's framebuffer
@@ -542,25 +631,38 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
                vkCmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE); }
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.layout, 0, 1, &g_ov.set, 0, NULL);
+        if (V.descriptor_buffer) vk_db_invalidate();
         VkViewport vp = {0, 0, (float)g_sext.width, (float)g_sext.height, 0, 1}; VkRect2D sc = {{0, 0}, g_sext};
         vkCmdSetViewport(cb, 0, 1, &vp); vkCmdSetScissor(cb, 0, 1, &sc);
         ov_render(cb, ovm, menu, fps);
         if (V.has_dynrender) vkCmdEndRendering(cb); else vkCmdEndRenderPass(cb);
     }
+    pres_probe_mark(cb, k, 3, ticket);
     barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    pres_probe_mark(cb, k, 4, ticket);
     vkEndCommandBuffer(cb);
+    if (g_pres_probe_on > 0) cpu[3] = mono_ns();
     VkPipelineStageFlags ws = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
+    if (g_pres_probe_on > 0) cpu[4] = mono_ns();
     if (vkQueueSubmit(V.q, 1, &si, g_pfence[k])) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed"); return; }
+    g_pres_probe_pending[k] = g_pres_probe_pool && ticket;
+    if (g_pres_probe_on > 0) cpu[5] = mono_ns();
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &g_done_sem[k], 1, &g_swap, &idx, NULL};
-    VkPresentTimeGOOGLE ptm = {++g_pace_id, period >= 0 ? pace_desired(period) : 0};
+    int vk_snapshot_image(const vkimg_t *); uint64_t desired = pace_desired(period, vk_snapshot_image(im));   // poll feedback even during host-menu redraws
+    uint32_t id = ++g_present_history.next; if (!id) id = ++g_present_history.next;
+    VkPresentTimeGOOGLE ptm = {id, period >= 0 ? desired : 0};
     VkPresentTimesInfoGOOGLE pti = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, NULL, 1, &ptm};
     if (V.has_dtiming) pi.pNext = &pti;
+    if (g_pres_probe_on > 0) cpu[6] = mono_ns();
     r = vkQueuePresentKHR(V.q, &pi);
+    if (g_pres_probe_on > 0) cpu[7] = mono_ns();
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
+    if (r < 0 && ticket) { pthread_mutex_lock(&g_pres_mu); vk_present_discard(&g_present_history, ticket); pthread_mutex_unlock(&g_pres_mu); }
     pthread_mutex_unlock(&g_vk_queue_mu);
+    pres_probe_cpu(cpu, ticket);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) swap_destroy();
 }
 // headless frame shots
@@ -593,15 +695,16 @@ static void shot(vkimg_t *im, uint64_t n) {
     free(row); fclose(f);
     VKLOG("frame %llu written to %s (%ux%u)", (unsigned long long)n, path, w, h);
 }
-static pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // the swapchain against the window going away (vk_window_lost, on the main thread)
+pthread_mutex_t g_present_mu = PTHREAD_MUTEX_INITIALIZER;   // swapchain/window and snapshot replacement against redraws
 void vk_window_lost(void) { pthread_mutex_lock(&g_present_mu); swap_destroy(); g_win = NULL; pthread_mutex_unlock(&g_present_mu); }
 // The present thread: mtl_present only queues the frame and returns (as on Apple), so the game thread never waits in vkAcquireNextImageKHR or on the
 // swapchain's fences (a FIFO swapchain blocks there until a vsync); the window texture is not drawn again before its blit, because NVN's acquire waits for
 // its ticket (mtl_present_wait), and the blit's submission comes after the frame's own on the one queue. DM_VK_SYNC_PRESENT=1 presents on the game thread.
 #define PQ_N 4
 static struct { vkimg_t *im; int crop[4], has_crop; uint64_t n; double period; } g_pq[PQ_N];
-static uint64_t g_pq_head, g_pq_tail, g_pq_done;   // queued [tail, head), presents up to ticket g_pq_done are blitted
+static uint64_t g_pq_head, g_pq_tail, g_pq_done, g_pq_skipped;   // skipped while the window is gone complete once earlier queued frames do
 static pthread_mutex_t g_pq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
+int vk_present_ticket_ready(uint64_t ticket) { pthread_mutex_lock(&g_pq_mu); int ready = ticket <= g_pq_done; pthread_mutex_unlock(&g_pq_mu); return ready; }
 // While the game is held (the pause menu) no frame comes: dm_overlay_redraw presents the last one again with what the overlay now shows.
 static _Atomic int g_redraw;
 void dm_overlay_redraw(void) { atomic_store(&g_redraw, 1); pthread_mutex_lock(&g_pq_mu); pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu); }
@@ -620,7 +723,9 @@ static void *present_thread(void *arg) {
         typeof(g_pq[0]) e = g_pq[g_pq_tail % PQ_N];
         pthread_mutex_unlock(&g_pq_mu);
         if (e.im) { last = e; pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(e.im, e.has_crop ? e.crop : NULL, e.period, e.n); pthread_mutex_unlock(&g_present_mu); }
-        pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
+        pthread_mutex_lock(&g_pq_mu); g_pq_tail++; g_pq_done = e.n;
+        if (g_pq_tail == g_pq_head && g_pq_skipped > g_pq_done) g_pq_done = g_pq_skipped;
+        pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
     }
     return NULL;
 }
@@ -630,7 +735,8 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
         if (sync && im) { pthread_mutex_lock(&g_present_mu); if (swap_make()) present_window(im, crop, period, n); pthread_mutex_unlock(&g_present_mu); }
-        pthread_mutex_lock(&g_pq_mu); if (g_pq_tail == g_pq_head) g_pq_done = n; pthread_mutex_unlock(&g_pq_mu);   // done at once (after any queued ones)
+        pthread_mutex_lock(&g_pq_mu); if (g_pq_tail == g_pq_head) g_pq_done = n; else g_pq_skipped = n;
+        pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         return n;
     }
     pthread_once(&once, present_thread_start);
@@ -668,6 +774,28 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
               nd, (g_vkst.ns_exec - pe) / 6e8, (g_vkst.ns_desc - pd) / 6e8, (g_vkst.ns_pipe - pp) / 6e8, (g_ns_submit - ps) / 6e8, (g_ubd_bytes - pb) / 600.0 / 1024, (g_gpu_ns - pg) / 6e8, (g_pkg_n - pkn) / 600.0, (g_pkg_bytes - pkb) / 600.0 / 1048576, (g_pkg_ns - pkt) / 6e8, (unsigned long long)g_set_hits, (unsigned long long)g_set_new, (g_ns_set_build - psb) / 6e8, (g_ns_set_hash - psh) / 6e8, (g_ns_set_new - psn) / 6e8,
               (g_set_memo - psm) / 600.0, (unsigned long long)g_set_memo_bad);
         void vk_pass_report(void); vk_pass_report();
+        { uint64_t allocated, reused, resets, discards; vk_descriptor_reuse_stats(&allocated, &reused, &resets, &discards);
+          VKLOG("descriptor allocation (cumulative): %llu new, %llu recycled, %llu pool resets, %llu cache discards",
+                (unsigned long long)allocated, (unsigned long long)reused, (unsigned long long)resets, (unsigned long long)discards); }
+        { uint64_t hits, misses, checks, failures; vk_buffer_cache_stats(&hits, &misses, &checks, &failures);
+          if (hits || misses) VKLOG("buffer range cache (present caller): %llu hits, %llu misses, %llu checked, %llu differences (cumulative)",
+              (unsigned long long)hits, (unsigned long long)misses, (unsigned long long)checks, (unsigned long long)failures); }
+        { extern uint64_t g_depth_clone_copies, g_depth_clone_failures, g_depth_clone_restarts;
+          if (g_depth_clone_copies || g_depth_clone_failures) VKLOG("depth copies: %llu made, %llu resource fallbacks, %llu writable restarts (cumulative)",
+              (unsigned long long)g_depth_clone_copies, (unsigned long long)g_depth_clone_failures, (unsigned long long)g_depth_clone_restarts); }
+        { extern uint64_t g_color_promotions, g_color_promotion_failures;
+          VKLOG("color compatibility: %llu images widened, %llu failed promotions (cumulative)",
+              (unsigned long long)g_color_promotions, (unsigned long long)g_color_promotion_failures); }
+        void vk_segment_report(void); vk_segment_report();
+        { extern uint64_t g_pipe_hot_hits; VKLOG("binding fast paths: pipelines %llu reused", (unsigned long long)g_pipe_hot_hits); }
+        { extern uint64_t g_snapshot_copies, g_snapshot_fallbacks, g_snapshot_wait_ns;
+          VKLOG("present snapshots: %llu copied, %llu ordinary fallbacks, %.2f s capacity wait (cumulative)",
+                (unsigned long long)g_snapshot_copies, (unsigned long long)g_snapshot_fallbacks, g_snapshot_wait_ns / 1e9); }
+        { extern uint64_t g_ucopy_jobs, g_ucopy_bytes; extern _Atomic uint64_t g_ucopy_wait_ns;
+          static uint64_t jobs, bytes, waits; uint64_t w = atomic_load_explicit(&g_ucopy_wait_ns, memory_order_relaxed);
+          VKLOG("uniform copy worker per frame: %.0f copies, %.2f MB, %.2f ms waiting before submit or CPU read",
+                (g_ucopy_jobs - jobs) / 600.0, (g_ucopy_bytes - bytes) / 600.0 / 1048576, (w - waits) / 6e8);
+          jobs = g_ucopy_jobs; bytes = g_ucopy_bytes; waits = w; }
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }
     if (!im) { no_img++; return present_enqueue(NULL, NULL, n, period); }
@@ -679,6 +807,8 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         void vk_pipeline_cache_save(void); pthread_t th; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
         pthread_create(&th, &a, (void *(*)(void *))(void *)vk_pipeline_cache_save, NULL); pthread_attr_destroy(&a);
     }
+    { vkimg_t *vk_snapshot_take(vkimg_t *, uint64_t); vkimg_t *snapshot = vk_snapshot_take(im, n);
+      if (snapshot) { present_enqueue(snapshot, crop, n, period); return 0; } }   // its copy is ordered before later writes to the game's image
     return present_enqueue(im, crop, n, period);
 }
 void mtl_present_wait(uint64_t tk) {   // NVN acquire: the window texture's last present has been blitted (the game may draw into it again)
@@ -689,7 +819,7 @@ void mtl_present_wait(uint64_t tk) {   // NVN acquire: the window texture's last
     pthread_mutex_unlock(&g_pq_mu);
 }
 double mtl_presented_time(uint64_t n) { return present_time_get(n); }
-double vk_refresh_ms(void) { return V.has_dtiming && g_pres_recorded && g_refresh_ns ? g_refresh_ns / 1e6 : 0; }   // perf_android.c's late check: the display's refresh, when display times are what it gets
+double vk_refresh_ms(void) { return V.has_dtiming && g_pres_recorded && g_refresh_ns ? g_refresh_ns / 1e6 : 0; }
 uint32_t mtl_present_qos(void) { return 0; }
 int mtl_link_active(void) { return 0; }
 int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns) { (void)vsyncs; (void)timeout_ns; return 0; }

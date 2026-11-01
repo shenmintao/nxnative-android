@@ -1,6 +1,6 @@
 // Android port: the host front end (dm/host/front.h), in two forms.
 //   dmhost executable (adb shell): headless, the guest runs on the calling thread as on the Mac without DM_WINDOW; no window, no input, no text entry.
-//   libdmhost.so in the app (a NativeActivity, no Java): ANativeActivity_onCreate lays out the game's files in the app's external files folder
+//   libdmhost.so in the app (a NativeActivity with a Java IME bridge): ANativeActivity_onCreate resolves the game's files in the app's external files folder
 //   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/, shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
 //   internal storage, and starts the host on a thread of its own. The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
 //   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; leaving and coming back pauses as on iOS.
@@ -8,6 +8,7 @@
 #include "front.h"
 #include "dm_input.h"
 #include "overlay_layout.h"
+#include "game_assets.h"
 #include <math.h>
 #include <time.h>
 #include <android/configuration.h>
@@ -35,6 +36,9 @@ void front_screen_match(int fps) { (void)fps; }
 
 // ---------------- the app ----------------
 static ANativeActivity *g_act;
+static jmethodID g_data_progress, g_data_ready;
+static char g_data_root[PATH_MAX];
+static _Atomic int g_preparing = 1;
 static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_win;
 ANativeWindow *dm_front_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWindow *w = g_win; pthread_mutex_unlock(&g_win_mu); return w; }
@@ -46,6 +50,8 @@ void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freez
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
+static _Atomic int g_pad_layout, g_auto_xbox = 1;   // 0 auto, 1 Xbox labels, 2 Nintendo positions; Android's standard labels are Xbox
+static int xbox_layout(void) { int mode = atomic_load(&g_pad_layout); return mode == 1 || (!mode && atomic_load(&g_auto_xbox)); }
 static _Atomic int g_mpos[2] = {-1, -1};   // where the player dragged the menu button: its centre in 1/10000 of the window's width and height, -1 the table's
 int dm_opmode(void); void dm_set_opmode(int m);   // hle_oe.c: 0 handheld, 1 docked; a change reaches the game as the Switch's operation mode notification
 static void settings_load(void) {
@@ -54,13 +60,14 @@ static void settings_load(void) {
     while (fgets(line, sizeof line, f)) { int v; if (sscanf(line, "overlay=%d", &v) == 1) atomic_store(&g_set_overlay, v != 0); else if (sscanf(line, "rumble=%d", &v) == 1) atomic_store(&g_set_rumble, v != 0);
         else if (sscanf(line, "fps=%d", &v) == 1) atomic_store(&g_set_fps, v != 0);
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
+        else if (sscanf(line, "pad_layout=%d", &v) == 1 && v >= 0 && v <= 2) atomic_store(&g_pad_layout, v);
         else if (sscanf(line, "menu_x=%d", &v) == 1 && v >= 0 && v <= 10000) atomic_store(&g_mpos[0], v); else if (sscanf(line, "menu_y=%d", &v) == 1 && v >= 0 && v <= 10000) atomic_store(&g_mpos[1], v); }
     fclose(f);
 }
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
-    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps));
+    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\npad_layout=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps), atomic_load(&g_pad_layout));
     if (atomic_load(&g_mpos[0]) >= 0 && atomic_load(&g_mpos[1]) >= 0) fprintf(f, "menu_x=%d\nmenu_y=%d\n", atomic_load(&g_mpos[0]), atomic_load(&g_mpos[1]));
     fclose(f); rename(tmp, p);
 }
@@ -72,24 +79,37 @@ __attribute__((weak)) void dm_overlay_redraw(void) {}   // the backend presents 
 static _Atomic int g_running, g_bg, g_menu;
 static pthread_mutex_t g_hold_mu = PTHREAD_MUTEX_INITIALIZER; static int g_held;
 static _Atomic int g_tx_on;   // text entry open (front_text_input): the game is held as by the menu
+static _Atomic int g_system_keyboard;
 static void hold_sync(void) {
     pthread_mutex_lock(&g_hold_mu);
     int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on);
     if (want != g_held) { g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
     pthread_mutex_unlock(&g_hold_mu);
 }
-static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchange(&g_bg, 1)) return; dm_focus_set(3); hold_sync(); dm_gfx_suspend(1); }
-static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); }
+static void go_background(void) { int was = atomic_exchange(&g_bg, 1); if (!atomic_load(&g_running) || was) return; dm_focus_set(2); dm_focus_set(3); hold_sync(); dm_gfx_suspend(1); }
+static void go_foreground(void) { int was = atomic_exchange(&g_bg, 0); if (!atomic_load(&g_running) || !was) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); }
 static void on_pause(ANativeActivity *a) { (void)a; go_background(); }
+// Restore InFocus only when Android returns input focus, including after HOME.
+// Notification-mode games otherwise remained OutOfFocus after onResume (upstream ce52af23).
+static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
 static void on_resume(ANativeActivity *a) { (void)a; go_foreground(); }
 static void on_destroy(ANativeActivity *a) { (void)a; _exit(0); }   // one game per process
 
 // ---- input ----
-static AInputQueue *g_queue; static ALooper *g_ilooper;
+static AInputQueue *g_queue; static _Atomic(ALooper *) g_ilooper;
+enum { RESET_PAD = 1, RESET_TOUCH = 2 };
+static _Atomic int g_input_reset;
+static void apply_input_resets(void);
+static void request_input_reset(int flags) {
+    atomic_fetch_or(&g_input_reset, flags);
+    ALooper *looper = atomic_load(&g_ilooper); if (looper) ALooper_wake(looper);
+}
 static uint64_t g_btn; static float g_ax[8]; static int g_pad_used;   // lx ly rx ry lt rt hatx haty
-static uint64_t key_bit(int32_t k) {   // Nintendo layout by position: the bottom face button is B, the right one A (as the iOS front end maps)
+static uint64_t key_bit(int32_t k) {   // Xbox: match the game's letter prompts; Nintendo: preserve physical positions (Android normalizes its keycodes)
+    int xbox = xbox_layout();
     switch (k) {
-    case AKEYCODE_BUTTON_A: return DM_BTN_B; case AKEYCODE_BUTTON_B: return DM_BTN_A; case AKEYCODE_BUTTON_X: return DM_BTN_Y; case AKEYCODE_BUTTON_Y: return DM_BTN_X;
+    case AKEYCODE_BUTTON_A: return xbox ? DM_BTN_A : DM_BTN_B; case AKEYCODE_BUTTON_B: return xbox ? DM_BTN_B : DM_BTN_A;
+    case AKEYCODE_BUTTON_X: return xbox ? DM_BTN_X : DM_BTN_Y; case AKEYCODE_BUTTON_Y: return xbox ? DM_BTN_Y : DM_BTN_X;
     case AKEYCODE_BUTTON_L1: return DM_BTN_L; case AKEYCODE_BUTTON_R1: return DM_BTN_R; case AKEYCODE_BUTTON_L2: return DM_BTN_ZL; case AKEYCODE_BUTTON_R2: return DM_BTN_ZR;
     case AKEYCODE_BUTTON_THUMBL: return DM_BTN_LS; case AKEYCODE_BUTTON_THUMBR: return DM_BTN_RS; case AKEYCODE_BUTTON_START: return DM_BTN_PLUS; case AKEYCODE_BUTTON_SELECT: return DM_BTN_MINUS;
     case AKEYCODE_DPAD_UP: return DM_BTN_UP; case AKEYCODE_DPAD_DOWN: return DM_BTN_DOWN; case AKEYCODE_DPAD_LEFT: return DM_BTN_LEFT; case AKEYCODE_DPAD_RIGHT: return DM_BTN_RIGHT;
@@ -158,7 +178,7 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
     atomic_store(&g_mpos[0], (int)(px / W * 10000)); atomic_store(&g_mpos[1], (int)(py / H * 10000));
 }
 
-// ---- controllers attached: InputDevice's list, read once a second through JNI (a code-less NativeActivity has no InputManager listener). A device counts
+// ---- controllers attached: InputDevice's list, read once a second through JNI. A device counts
 // when it is a gamepad or a joystick and not virtual (the tablet's own keys, touch screen and pen are neither). While one is attached nothing of the gamepad
 // is shown and every touch is the game's; its keys open the menu (Back, Mode, Menu: handle_event). When the last one goes, the gamepad comes back ----
 static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
@@ -169,10 +189,11 @@ static void *pad_watch(void *a) {
     jmethodID mIds = cID ? (*E)->GetStaticMethodID(E, cID, "getDeviceIds", "()[I") : NULL, mGet = cID ? (*E)->GetStaticMethodID(E, cID, "getDevice", "(I)Landroid/view/InputDevice;") : NULL;
     jmethodID mSrc = cID ? (*E)->GetMethodID(E, cID, "getSources", "()I") : NULL, mVirt = cID ? (*E)->GetMethodID(E, cID, "isVirtual", "()Z") : NULL;
     jmethodID mName = cID ? (*E)->GetMethodID(E, cID, "getName", "()Ljava/lang/String;") : NULL;
-    if (jx(E) || !mIds || !mGet || !mSrc || !mVirt || !mName) { LOG("[RED] [input] InputDevice methods missing: attached controllers are not watched"); return NULL; }
+    jmethodID mVendor = cID ? (*E)->GetMethodID(E, cID, "getVendorId", "()I") : NULL, mProduct = cID ? (*E)->GetMethodID(E, cID, "getProductId", "()I") : NULL;
+    if (jx(E) || !mIds || !mGet || !mSrc || !mVirt || !mName || !mVendor || !mProduct) { LOG("[RED] [input] InputDevice methods missing: attached controllers are not watched"); return NULL; }
     int prev[16], np = 0;
     for (;;) {
-        int ids[16], n = 0;
+        int ids[16], n = 0, auto_xbox = 1;
         jintArray arr = (*E)->CallStaticObjectMethod(E, cID, mIds);
         if (!jx(E) && arr) {
             jsize len = (*E)->GetArrayLength(E, arr); jint *v = (*E)->GetIntArrayElements(E, arr, NULL);
@@ -181,9 +202,12 @@ static void *pad_watch(void *a) {
                 jint src = (*E)->CallIntMethod(E, d, mSrc); jboolean virt = (*E)->CallBooleanMethod(E, d, mVirt);
                 if (!jx(E) && !virt && ((src & AINPUT_SOURCE_GAMEPAD) == AINPUT_SOURCE_GAMEPAD || (src & AINPUT_SOURCE_JOYSTICK) == AINPUT_SOURCE_JOYSTICK)) {
                     ids[n++] = v[i]; int known = 0; for (int k = 0; k < np; k++) known |= prev[k] == v[i];
-                    if (!known) {
+                    if (!known || n == 1) {
                         jstring s = (*E)->CallObjectMethod(E, d, mName); const char *nm = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
-                        LOG("[input] controller attached: %s (device %d): the gamepad is hidden", nm ? nm : "?", v[i]);
+                        int vendor = (*E)->CallIntMethod(E, d, mVendor), product = (*E)->CallIntMethod(E, d, mProduct); jx(E);
+                        // Android's Generic.kl uses Xbox-labelled keycodes. Nintendo devices are normalized by position instead.
+                        if (n == 1) auto_xbox = !(vendor == 0x057e || (nm && (strcasestr(nm, "Nintendo") || strcasestr(nm, "Joy-Con") || !strcasecmp(nm, "Pro Controller"))));
+                        if (!known) LOG("[input] controller attached: %s (device %d, %04x:%04x): the gamepad is hidden; auto layout %s", nm ? nm : "?", v[i], vendor, product, auto_xbox ? "Xbox" : "Nintendo");
                         if (nm) (*E)->ReleaseStringUTFChars(E, s, nm);
                         if (s) (*E)->DeleteLocalRef(E, s);
                     }
@@ -193,11 +217,18 @@ static void *pad_watch(void *a) {
             if (v) (*E)->ReleaseIntArrayElements(E, arr, v, JNI_ABORT);
             (*E)->DeleteLocalRef(E, arr);
         }
-        for (int k = 0; k < np; k++) { int still = 0; for (int i = 0; i < n; i++) still |= ids[i] == prev[k]; if (!still) LOG("[input] controller detached (device %d)", prev[k]); }
-        if (atomic_exchange(&g_pads, n) && !n) {   // the last one went: the gamepad again, and the device's motor for rumble
+        int removed = 0;
+        for (int k = 0; k < np; k++) { int still = 0; for (int i = 0; i < n; i++) still |= ids[i] == prev[k]; if (!still) { removed = 1; LOG("[input] controller detached (device %d)", prev[k]); } }
+        int previous = atomic_exchange(&g_pads, n);
+        int layout_changed = atomic_exchange(&g_auto_xbox, auto_xbox) != auto_xbox;
+        if (layout_changed) request_input_reset(RESET_PAD);
+        if (removed) request_input_reset(RESET_PAD);
+        if (!previous && n) request_input_reset(RESET_TOUCH);
+        if (previous && !n) {   // the last one went: the gamepad again, and the device's motor for rumble
             atomic_store(&g_overlay, 1); dm_haptics_android_device(-1);
             LOG("[input] no controller attached: the gamepad is shown");
         }
+        if (previous != n || removed || layout_changed) dm_overlay_redraw();   // update even while the game's last frame is held
         memcpy(prev, ids, sizeof ids); np = n;
         sleep(1);
     }
@@ -209,9 +240,10 @@ static _Atomic int g_menu_hi = -1;   // the highlighted item (a controller's sel
 static int g_menu_ptr = -1, g_menu_row = -2;   // the pointer pressing in the menu, and the row it went down on (-3 the menu button)
 static _Atomic int g_tx_ver;   // the text entry's edit count: the panel is drawn again when it changes
 int dm_menu_state(void) {
+    if (atomic_load(&g_system_keyboard)) return -1;   // the Java dialog owns text/IME rendering
     if (atomic_load(&g_tx_on)) return 1 << 16 | (atomic_load(&g_tx_ver) & 0xffff);   // the text entry's panel (gfx_vk_present.c ov_text_panel)
     if (!atomic_load(&g_menu)) return -1;
-    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4;
+    return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 | atomic_load(&g_pad_layout) << 8 | atomic_load(&g_auto_xbox) << 10;
 }
 int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
 static void menu_open(int hi) {
@@ -237,6 +269,7 @@ static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
+    else if (item == OVM_LAYOUT) { int mode = (atomic_load(&g_pad_layout) + 1) % 3; atomic_store(&g_pad_layout, mode); request_input_reset(RESET_PAD); settings_save(); LOG("[input] layout %s: effective %s", mode == 0 ? "Auto" : mode == 1 ? "Xbox" : "Nintendo", xbox_layout() ? "Xbox" : "Nintendo"); }
     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
     if (item >= 0 && item < OVM_N) dm_haptics_android_tap();
     if (item == OVM_RESUME) menu_close(); else dm_overlay_redraw();
@@ -273,11 +306,12 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
 // The game thread that asks waits here while the player types; the game is held as by the menu and the last frame is shown with the entry's panel and keys
 // (overlay_layout.h ov_kb_*, drawn by gfx_vk_present.c ov_text_panel from dm_text_entry). Touch: tap the keys. Controller: the d-pad moves the highlight,
 // A presses it, B erases, + accepts, − cancels. A physical keyboard types (letters, digits, space, punctuation as ASCII, the overlay's font), Del erases,
-// Enter accepts. Back cancels (the game keeps its initial text). Android's own keyboard is not used: a code-less NativeActivity's content view is no text
-// editor, so the system does not show one for it, and asking for one routed the key events to it
+// Enter accepts. Back cancels (the game keeps its initial text). This is the fallback for older APKs without the Java IME bridge;
+// current APKs call system_text_input first, letting Android render and route input to its own editor dialog.
 static pthread_mutex_t g_tx_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_tx_cv = PTHREAD_COND_INITIALIZER;
 static struct { char title[128], text[256]; int n, max, done, ok, sel, shift, ptr; } g_tx;
 int dm_text_entry(char *title, int tcap, char *text, int xcap, int *sel, int *shift) {   // the panel's content (the present thread); 0 when no entry is open
+    if (atomic_load(&g_system_keyboard)) return 0;
     if (!atomic_load(&g_tx_on)) return 0;
     pthread_mutex_lock(&g_tx_mu);
     snprintf(title, (size_t)tcap, "%s", g_tx.title); snprintf(text, (size_t)xcap, "%s", g_tx.text); *sel = g_tx.sel; *shift = g_tx.shift;
@@ -347,9 +381,51 @@ static void tx_touch(AInputEvent *e, float W, float H) {   // a key is pressed w
         if (key >= 0 && key == down) tx_press(key);
     }
 }
+static jbyteArray utf8_bytes(JNIEnv *env, const char *text) {
+    jsize size = (jsize)strlen(text); jbyteArray bytes = (*env)->NewByteArray(env, size);
+    if (bytes) (*env)->SetByteArrayRegion(env, bytes, 0, size, (const jbyte *)text);
+    return bytes;
+}
+static int system_text_input(const char *title, const char *initial, int maximum, char *out, int capacity) {
+    JNIEnv *env = NULL;
+    jint status = (*g_act->vm)->GetEnv(g_act->vm, (void **)&env, JNI_VERSION_1_6);
+    int attached = status == JNI_EDETACHED;
+    if (attached && (*g_act->vm)->AttachCurrentThread(g_act->vm, &env, NULL)) return -2;
+    if (!env) return -2;
+    jclass type = (*env)->GetObjectClass(env, g_act->clazz);
+    jmethodID method = (*env)->GetMethodID(env, type, "requestText", "([B[BIZ)[B");
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (!method) { (*env)->DeleteLocalRef(env, type); if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm); return -2; }
+    jbyteArray prompt = utf8_bytes(env, title), start = utf8_bytes(env, initial ? initial : "");
+    int result = -2;
+    if (prompt && start && !(*env)->ExceptionCheck(env)) {
+        request_input_reset(RESET_PAD | RESET_TOUCH);
+        atomic_store(&g_system_keyboard, 1); atomic_store(&g_tx_on, 1); hold_sync(); dm_overlay_redraw();
+        jbyteArray reply = (*env)->CallObjectMethod(env, g_act->clazz, method, prompt, start, maximum > 0 ? maximum : 255, (jboolean)xbox_layout());
+        result = 0;
+        if (!(*env)->ExceptionCheck(env) && reply) {
+            jsize length = (*env)->GetArrayLength(env, reply); int size = length < capacity - 1 ? length : capacity - 1;
+            (*env)->GetByteArrayRegion(env, reply, 0, size, (jbyte *)out);
+            // Never return the first half of a UTF-8 codepoint if the SDK's byte buffer is smaller.
+            int valid = 0;
+            while (valid < size) { unsigned c = (unsigned char)out[valid]; int n = c < 128 ? 1 : c < 224 ? 2 : c < 240 ? 3 : 4; if (valid + n > size) break; valid += n; }
+            out[valid] = 0; result = 1;
+        }
+        if (reply) (*env)->DeleteLocalRef(env, reply);
+        atomic_store(&g_tx_on, 0); atomic_store(&g_system_keyboard, 0); hold_sync(); dm_overlay_redraw();
+        LOG("[text] system keyboard %s", result ? "accepted" : "cancelled");
+    }
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (prompt) (*env)->DeleteLocalRef(env, prompt); if (start) (*env)->DeleteLocalRef(env, start);
+    (*env)->DeleteLocalRef(env, type); if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm);
+    return result;
+}
 int front_text_input(const char *title, const char *sub, const char *guide, const char *initial, int max_chars, char *out, int out_cap) {
     if (!out || out_cap <= 0) return -1;
     if (!g_act || !dm_front_window()) return -1;   // the adb shell executable, or no window yet: nothing is shown
+    const char *prompt = title && *title ? title : guide && *guide ? guide : sub && *sub ? sub : "Enter text";
+    int system = system_text_input(prompt, initial, max_chars, out, out_cap);
+    if (system != -2) return system;
     pthread_mutex_lock(&g_tx_mu);
     const char *t = title && *title ? title : guide && *guide ? guide : sub && *sub ? sub : "Enter text";
     snprintf(g_tx.title, sizeof g_tx.title, "%s", t);
@@ -428,6 +504,7 @@ static void touch_event(AInputEvent *e) {
     if (open) menu_open(-1);
 }
 static int handle_event(AInputEvent *e) {
+    if (atomic_load(&g_preparing)) return 1;
     int32_t src = AInputEvent_getSource(e), type = AInputEvent_getType(e);
     if (type == AINPUT_EVENT_TYPE_KEY) {
         if (atomic_load(&g_tx_on)) return tx_key(e);   // the text entry takes every key while it is open
@@ -468,28 +545,89 @@ static int handle_event(AInputEvent *e) {
 }
 static int on_input(int fd, int events, void *data) {
     (void)fd; (void)events; (void)data;
+    apply_input_resets();
     AInputEvent *e;
     while (g_queue && AInputQueue_getEvent(g_queue, &e) >= 0) {
-        // no preDispatch: the app shows no soft keyboard (the text entry draws its own), and the IME's pre-dispatch swallowed a keyboard's letter keys
+        // The Java IME dialog has its own input window; the native window handles game input and the fallback keyboard directly.
         AInputQueue_finishEvent(g_queue, e, handle_event(e));
     }
     return 1;
 }
 static void *input_thread(void *a) {
     (void)a; g_ilooper = ALooper_prepare(0);
-    for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
+    for (;;) { ALooper_pollOnce(-1, NULL, NULL, NULL); apply_input_resets(); }
     return NULL;
+}
+static void apply_input_resets(void) {
+    int flags = atomic_exchange(&g_input_reset, 0);
+    if (flags & RESET_PAD) { g_btn = 0; memset(g_ax, 0, sizeof g_ax); g_pad_used = 0; pad_publish(); }
+    if (flags & RESET_TOUCH) {
+        memset(g_ptr_ctl, 0, sizeof g_ptr_ctl); g_touch_btn = 0; g_drag.id = -1;
+        for (int i = 0; i < 16; ++i) atomic_store(&g_press_t[i], 0);
+        for (int s = 0; s < 2; ++s) for (int a = 0; a < 2; ++a) atomic_store(&g_knob[s][a], 0);
+        atomic_store(&g_menu_t, 0); dm_input_set(0, 0, 0, 0, 0); dm_touch_set(NULL, 0);
+    }
 }
 static void on_queue_created(ANativeActivity *a, AInputQueue *q) { (void)a; g_queue = q; while (!g_ilooper) usleep(1000); AInputQueue_attachLooper(q, g_ilooper, 1, on_input, NULL); }
 static void on_queue_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AInputQueue_detachLooper(q); g_queue = NULL; }
 
 // ---- the host ----
 int main(int argc, char **argv);   // dm/host/main.c
+static void env_file(const char *path);
+static void assets_progress(uint64_t done, uint64_t total, void *ctx) {
+    if (!g_data_progress) return;
+    JNIEnv *env = ctx;
+    static uint64_t last;
+    struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t ms = (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    if (done && done != total && ms - last < 100) return;
+    last = ms;
+    (*env)->CallVoidMethod(env, g_act->clazz, g_data_progress, (jlong)done, (jlong)total);
+    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); LOG("[RED] cannot update game preparation progress"); }
+}
 static void *host_thread(void *a) {
     (void)a;
-    char mods[600]; snprintf(mods, sizeof mods, "%s/mods", g_root);
+    JNIEnv *env = NULL;
+    int attached = (*g_act->vm)->GetEnv(g_act->vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED;
+    if (attached && (*g_act->vm)->AttachCurrentThread(g_act->vm, &env, NULL)) { LOG("[RED] cannot attach the game preparation thread"); return NULL; }
+    assets_progress(0, 0, env);
+    char error[512] = {0};
+    int embedded = dm_game_assets_prepare(g_act->assetManager, g_root, g_data_root, sizeof g_data_root, assets_progress, env, error, sizeof error);
+    if (g_data_ready) {
+        jstring message = embedded < 0 ? (*env)->NewStringUTF(env, error) : NULL;
+        (*env)->CallVoidMethod(env, g_act->clazz, g_data_ready, message);
+        if (message) (*env)->DeleteLocalRef(env, message);
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    }
+    if (attached) (*g_act->vm)->DetachCurrentThread(g_act->vm);
+    if (embedded < 0) { LOG("[RED] %s", error); return NULL; }
+    if (!embedded) {
+        char manifest[PATH_MAX]; snprintf(manifest, sizeof manifest, "%s/nx2a-data.json", g_root);
+        if (access(manifest, R_OK)) { LOG("[RED] Game data installation is not complete; finish the transfer before launching"); ANativeActivity_finish(g_act); return NULL; }
+    }
+    char p[PATH_MAX];
+    snprintf(p, sizeof p, "%s/RomFS", g_data_root); setenv("DM_ROMFS", p, 1);
+    snprintf(p, sizeof p, "%s/shaders.dmsv", g_data_root); setenv("DM_VK_SHADERS", p, 1);
+    snprintf(p, sizeof p, "%s/nintendo_ext.ttf", g_data_root);
+    if (!access(p, R_OK)) setenv("DM_FONT_DIR", g_data_root, 0);
+    snprintf(p, sizeof p, "%s/env.txt", g_data_root); env_file(p);
+    if (embedded) {
+        snprintf(p, sizeof p, "%s/aoc", g_data_root); setenv("DM_AOC_DIR", p, 1);
+        // The generated environment names the external pack. Embedded files
+        // instead live in this content-keyed directory after preparation.
+        snprintf(p, sizeof p, "%s/nintendo_ext.ttf", g_data_root);
+        if (!access(p, R_OK)) setenv("DM_SHARED_FONT_EXT", p, 1);
+    }
+#ifdef DM_RELEASE
+    unsetenv("DM_CTL");
+#endif
+    settings_load(); dm_haptics_android_start(g_act, atomic_load(&g_set_rumble));
+    { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, g_act->vm)) pthread_detach(w); }
+    atomic_store(&g_preparing, 0);
+    char mods[PATH_MAX]; snprintf(mods, sizeof mods, "%s/mods", g_data_root);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);
+    if (atomic_load(&g_bg)) { dm_focus_set(3); hold_sync(); dm_gfx_suspend(1); }
     int rc = main(2, argv);
     LOG("host returned %d", rc);
     _exit(rc);
@@ -507,10 +645,16 @@ static void env_file(const char *path) {   // KEY=VALUE per line (# comments): s
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;
     g_act = act;
+    { jclass type = (*act->env)->GetObjectClass(act->env, act->clazz);
+      g_data_progress = (*act->env)->GetMethodID(act->env, type, "onGameDataProgress", "(JJ)V");
+      if ((*act->env)->ExceptionCheck(act->env)) (*act->env)->ExceptionClear(act->env);
+      g_data_ready = (*act->env)->GetMethodID(act->env, type, "onGameDataReady", "(Ljava/lang/String;)V");
+      if ((*act->env)->ExceptionCheck(act->env)) (*act->env)->ExceptionClear(act->env);
+      (*act->env)->DeleteLocalRef(act->env, type); }
     { AConfiguration *cfg = AConfiguration_new(); AConfiguration_fromAssetManager(cfg, act->assetManager); g_dpi = AConfiguration_getDensity(cfg); AConfiguration_delete(cfg); }
     act->callbacks->onNativeWindowCreated = on_window_created; act->callbacks->onNativeWindowDestroyed = on_window_destroyed;
     act->callbacks->onInputQueueCreated = on_queue_created; act->callbacks->onInputQueueDestroyed = on_queue_destroyed;
-    act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onDestroy = on_destroy;
+    act->callbacks->onPause = on_pause; act->callbacks->onResume = on_resume; act->callbacks->onWindowFocusChanged = on_window_focus; act->callbacks->onDestroy = on_destroy;
     ANativeActivity_setWindowFlags(act, AWINDOW_FLAG_KEEP_SCREEN_ON | AWINDOW_FLAG_FULLSCREEN, 0);
     static int started; if (started++) return;   // a second onCreate (configuration change) keeps the running game
     snprintf(g_root, sizeof g_root, "%s", act->externalDataPath ? act->externalDataPath : act->internalDataPath);
@@ -519,16 +663,8 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
     setvbuf(stderr, NULL, _IOLBF, 0);
     setenv("DM_ROOT", g_root, 1);
-    snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
-    snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
-    snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
-#ifdef DM_RELEASE
-    unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
-#endif
-    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble));
-    { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, saves %s", g_root, act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which

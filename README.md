@@ -1,4 +1,12 @@
-# nx2android
+# nxnative-android
+
+本项目基于 [shirai91/nx2android](https://github.com/shirai91/nx2android) 的 Android 原生移植和 [seedds/nxnative](https://github.com/seedds/nxnative) 创建，保留其运行时、游戏配置和 MIT 许可。新增直接导入 NSP/XCI 文件、按所选游戏匹配更新/DLC，以及项目启动入口。
+
+**[中文使用说明](README.zh-CN.md)** · 双击 `nxnative-android.cmd` 启动，或运行 `python scripts/build_apk_from_nsp.py <NSP文件或游戏目录> -k <prod.keys>`。
+
+默认产物为包含游戏数据的 **单个 APK**；大型游戏可选择 `--data-mode external`，生成 **APK + 游戏数据目录**。当前单 APK 写入器使用 ZIP32，完整 APK 必须小于 4 GiB。NSP、XCI 均可直接导入；兼容性取决于逐个适配的 Android 游戏配置。支持触屏虚拟手柄、系统屏幕键盘和蓝牙手柄；连接实体手柄时自动隐藏虚拟手柄，断开后恢复用户的显示设置。以下保留 nx2android 的原始使用和开发说明，具体新增用法见中文说明。
+
+## nx2android upstream
 
 Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game files and keys; nothing from any game is in this repository.
 

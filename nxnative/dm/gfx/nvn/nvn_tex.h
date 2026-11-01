@@ -5,7 +5,7 @@
 typedef struct {
     int target, format, flags, samples;   // NVNtextureTarget / NVNformat / NVNtextureFlags / sample count (0 or 1 = single-sampled)
     uint32_t width, height, depth, levels, stride;
-    int pkg_block_h;                      // Byte 0 of the packaged texture layout parameters (log2 of block height) + 1; 0 = use the automatic algorithm
+    int pkg_block_h;                      // Packaged byte 0 + 1: low nibble block height, high nibble block depth; 0 = automatic
 } nvn_texdesc;
 
 typedef struct {
@@ -16,6 +16,8 @@ typedef struct {
 
 void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o);
 uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level);
+// Sparse tile size in texels and the number of tiled levels (0 also for a mip tail).
+int nvn_tex_sparse_tiles(const nvn_texdesc *d, uint32_t *w, uint32_t *h, uint32_t *depth);
 uint32_t nvn_tex_level_gobs(const nvn_texdesc *d, unsigned level);   // GOB columns level `level` is laid out with (its width in GOBs; padded to whole 64 KB tiles in a sparse texture's tiled levels)
 int nvn_fmt_bpb(int format, int *bw, int *bh);   // Bytes per block (0 = unknown format), block width and height
 // Block height / block depth actually used by level `level` (log2 of the GOB count): the per-level block height shrinks with that level's row count (block rows), and deswizzling uses it level by level

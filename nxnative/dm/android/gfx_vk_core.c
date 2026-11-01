@@ -10,6 +10,9 @@
 #include "gfx_vk.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
+#include "copy_queue.h"
+#include "gpu_segments.h"
+#include "pool_write_ranges.h"
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -22,6 +25,22 @@
 #define VK_DEF(f) PFN_##f f;
 VK_FNS(VK_DEF) VK_DEV_FNS(VK_DEF)
 static PFN_vkGetInstanceProcAddr p_vkGetInstanceProcAddr;
+// Large uniform shadows may be filled while replay continues. Every GPU submit
+// and scratch/mapping lifetime boundary drains these copies first.
+static vk_copy_queue g_ucopy = VK_COPY_QUEUE_INIT;
+static int g_ucopy_on;
+static _Atomic int g_ucopy_shadow_pools;
+uint64_t g_ucopy_jobs, g_ucopy_bytes;
+_Atomic uint64_t g_ucopy_wait_ns;
+static uint64_t ucopy_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static void ucopy_begin(void) { pthread_setname_np(pthread_self(), "dm-ub-copy"); }
+static void ucopy_wait(uint64_t sequence) {
+    if (atomic_load_explicit(&g_ucopy.done, memory_order_acquire) >= sequence) return;
+    uint64_t at = ucopy_now(); vk_copyq_wait(&g_ucopy, sequence);
+    atomic_fetch_add_explicit(&g_ucopy_wait_ns, ucopy_now() - at, memory_order_relaxed);
+}
+static void ucopy_drain(void) { ucopy_wait(vk_copyq_head(&g_ucopy)); }
+void vk_uniform_copy_config(int enabled) { if (!enabled) ucopy_drain(); g_ucopy_on = enabled; }
 vkdev_t V;
 pthread_mutex_t g_vk_queue_mu = PTHREAD_MUTEX_INITIALIZER;   // VkQueue access is externally synchronized: submissions and presents
 
@@ -84,9 +103,10 @@ void vk_init(void) {
     VkExtensionProperties *ex = calloc(ne, sizeof *ex); vkEnumerateDeviceExtensionProperties(V.pd, NULL, &ne, ex);
     const char *want[] = {"VK_KHR_swapchain", "VK_ANDROID_external_memory_android_hardware_buffer", "VK_EXT_queue_family_foreign", "VK_EXT_custom_border_color",
                           "VK_EXT_robustness2", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_index_type_uint8", "VK_EXT_transform_feedback",
-                          "VK_GOOGLE_display_timing"};
+                          "VK_GOOGLE_display_timing", "VK_EXT_depth_range_unrestricted"};
     const char *on[64]; uint32_t non = 0;
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) if (has_ext(ex, ne, want[i])) on[non++] = want[i]; else VKLOG("device has no %s", want[i]);
+    V.has_depth_range_unrestricted = has_ext(ex, ne, "VK_EXT_depth_range_unrestricted");
     // A Vulkan 1.1 or 1.2 device (Legion Y700 2023, Adreno 730: its stock driver reports 1.1) has what the replay uses from 1.2 / 1.3 as extensions: they are enabled
     // when present, so the features chained below and the functions loaded by their KHR names are valid there. A 1.3 device needs none of them
     int v12 = V.props.apiVersion >= VK_API_VERSION_1_2, v13 = V.props.apiVersion >= VK_API_VERSION_1_3; uint32_t npromo = 0;
@@ -133,6 +153,7 @@ void vk_init(void) {
     V.has_dynrender = v13 ? f13.dynamicRendering : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES)[0];
     // imageless framebuffers need render pass 2 (gfx_vk_exec.c rp_get): core in 1.2, else its extension
     V.has_imageless = v12 ? f12.imagelessFramebuffer : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES)[0] && is_on(on, non, "VK_KHR_create_renderpass2");
+    V.has_format_list = v12 || is_on(on, non, "VK_KHR_image_format_list");
     if (!V.has_imageless && !V.has_dynrender) die("[vk] the device has neither dynamic rendering nor imageless framebuffers with render pass 2: passes cannot be begun");
     if (!v13) VKLOG("Vulkan %u.%u device: %u extensions enabled for the features promoted to 1.2 / 1.3; dynamic rendering %s", VK_API_VERSION_MAJOR(V.props.apiVersion),
                     VK_API_VERSION_MINOR(V.props.apiVersion), npromo, V.has_dynrender ? "yes" : "no (render pass objects only)");
@@ -143,6 +164,23 @@ void vk_init(void) {
     VkPhysicalDeviceTransformFeedbackFeaturesEXT fxf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT, &fu8};
     VkPhysicalDeviceFeatures2 fx = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fxf};
     vkGetPhysicalDeviceFeatures2(V.pd, &fx);
+    VkPhysicalDeviceDescriptorBufferFeaturesEXT fdb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
+    const char *db_option = getenv("DM_VK_DESCRIPTOR_BUFFER");
+    if (db_option && atoi(db_option) && has_ext(ex, ne, "VK_EXT_descriptor_buffer")) {
+        VkPhysicalDeviceFeatures2 query = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fdb};
+        vkGetPhysicalDeviceFeatures2(V.pd, &query);
+        V.dbprops.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &V.dbprops};
+        vkGetPhysicalDeviceProperties2(V.pd, &properties);
+        int address = v12 ? f12.bufferDeviceAddress : featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[0];
+        V.descriptor_buffer = fdb.descriptorBuffer && address && non < 64 &&
+            V.dbprops.combinedImageSamplerDescriptorSingleArray && V.dbprops.descriptorBufferOffsetAlignment &&
+            V.dbprops.maxDescriptorBufferBindings >= 5 && V.dbprops.maxResourceDescriptorBufferBindings >= 5 &&
+            V.dbprops.maxSamplerDescriptorBufferBindings >= 5 && V.dbprops.maxSamplerDescriptorBufferRange >= 65536 &&
+            V.dbprops.maxResourceDescriptorBufferRange >= 65536;
+        if (V.descriptor_buffer) on[non++] = "VK_EXT_descriptor_buffer";
+    }
+    if (db_option && atoi(db_option)) VKLOG("descriptor-buffer transport %s", V.descriptor_buffer ? "enabled (experimental)" : "unavailable: using descriptor sets");
     // transform feedback (NVN BeginTransformFeedback; gfx_vk_exec.c xfb_*): Xenoblade Chronicles 3 captures particle state with it
     V.has_xfb = fxf.transformFeedback && has_ext(ex, ne, "VK_EXT_transform_feedback"); fxf.geometryStreams = 0;
     fr2.robustBufferAccess2 = 0; fr2.robustImageAccess2 = 0;   // nullDescriptor only: unbound slots read 0 without a dummy
@@ -162,7 +200,9 @@ void vk_init(void) {
     fxf.pNext = &fu8;
     VkBaseOutStructure *t = ff.pNext; while (t->pNext) t = t->pNext;   // the queried chain (core / promoted features), then the extensions'
     t->pNext = V.has_xfb ? (VkBaseOutStructure *)&fxf : (VkBaseOutStructure *)&fu8;
-    VkPhysicalDeviceFeatures2 enf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, ff.pNext, en};
+    fdb.descriptorBufferCaptureReplay = fdb.descriptorBufferImageLayoutIgnored = fdb.descriptorBufferPushDescriptors = 0;
+    fdb.pNext = ff.pNext;
+    VkPhysicalDeviceFeatures2 enf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, V.descriptor_buffer ? (void *)&fdb : ff.pNext, en};
     float prio = 1;
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.qf, 1, &prio};
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enf, 0, 1, &qci, 0, NULL, non, on, NULL};
@@ -171,6 +211,7 @@ void vk_init(void) {
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
     vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
+    vk_db_init();
     VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     char path[1024]; const char *root = getenv("DM_ROOT"); void *data = NULL; size_t dn = 0;
     if (root && !getenv("DM_VK_NOPCACHE")) { snprintf(path, sizeof path, "%s/vk_pipeline_cache.bin", root); FILE *f = fopen(path, "rb");   // DM_VK_NOPCACHE=1: start empty
@@ -197,10 +238,47 @@ void vk_pipeline_cache_save(void) {
 }
 
 // ---------------- memory pools ----------------
-#define MAXPOOL 4096
-static vkpool_t g_pool[MAXPOOL]; static int g_npool;
+#include "pool_ranges.h"
+#include <limits.h>
+static vkpool_t **g_pool; static int g_npool, g_pool_cap;
+static vk_pool_range *g_pool_ranges;
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t g_pool_gen;   // bumped under the write lock when a pool is added or removed: vk_pool_of's per-thread cache holds while it is unchanged
+static uint64_t g_pool_adds, g_pool_dels;
+// Exact buffer queries cache copied handles, never mutable registry pointers.
+// Both address and requested length matter when registered pools overlap.
+typedef struct { uint64_t addr, len, off, available; uint32_t gen; VkBuffer buf; } buf_lookup_t;
+static __thread struct { buf_lookup_t entry[64]; uint64_t hits, misses, checks, failures; } t_buflookup;
+static int g_buffer_cache_on;
+// Grow only the pointer table and address index. Pool records stay in their original
+// allocations: vk_pool_of returns them after unlocking, and its TLS cache keeps them.
+// Removed slots are reused (with the same swap-delete semantics as the old array).
+static void pool_reserve(void) {
+    if (g_npool < g_pool_cap) return;
+    if (g_pool_cap > INT_MAX / 2) die("[vk] memory pool registry capacity overflow");
+    int cap = g_pool_cap ? g_pool_cap * 2 : 64;
+    vkpool_t **slots = malloc((size_t)cap * sizeof *slots);
+    vk_pool_range *ranges = malloc((size_t)cap * sizeof *ranges);
+    vkpool_t *block = calloc((size_t)(cap - g_pool_cap), sizeof *block);
+    if (!slots || !ranges || !block) {
+        free(slots); free(ranges); free(block);
+        die("[vk] out of host memory growing memory pool registry to %d", cap);
+    }
+    if (g_pool_cap) {
+        memcpy(slots, g_pool, (size_t)g_pool_cap * sizeof *slots);
+        memcpy(ranges, g_pool_ranges, (size_t)g_npool * sizeof *ranges);
+    }
+    for (int i = g_pool_cap; i < cap; i++) slots[i] = &block[i - g_pool_cap];
+    free(g_pool); free(g_pool_ranges); g_pool = slots; g_pool_ranges = ranges; g_pool_cap = cap;
+    VKLOG("memory pool registry: capacity %d, live %d, added %llu, removed %llu (Vulkan allocation limit %u)",
+        cap, g_npool, (unsigned long long)g_pool_adds, (unsigned long long)g_pool_dels, V.props.limits.maxMemoryAllocationCount);
+}
+static void pool_log(const char *op, const vkpool_t *p) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_VK_POOL_LOG"); on = e && atoi(e); }
+    if (on) VKLOG("pool %s: serial %llu, range %#llx..%#llx, base %#llx, end %#llx, live %d, added %llu, removed %llu",
+        op, (unsigned long long)p->serial, (unsigned long long)p->lo, (unsigned long long)p->hi,
+        (unsigned long long)p->base, (unsigned long long)p->end, g_npool, (unsigned long long)g_pool_adds, (unsigned long long)g_pool_dels);
+}
 static int recv_fds(int sock, int *fds, int max) {
     char data[4096], ctl[CMSG_SPACE(sizeof(int) * 16)]; struct iovec iov = {data, sizeof data};
     struct msghdr m = {0}; m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
@@ -240,16 +318,17 @@ static int pool_zero_copy(vkpool_t *p, uint8_t *mem, uint64_t size) {
     VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, p->buf};   // the driver requires a dedicated allocation for an imported AHardwareBuffer
     VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, &ded, ahb};
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, ap.allocationSize, vk_mem_type(ap.memoryTypeBits, 0, 0)};
-    if (vkAllocateMemory(V.dev, &ai, NULL, &p->mem) || vkBindBufferMemory(V.dev, p->buf, p->mem, 0)) { vkDestroyBuffer(V.dev, p->buf, NULL); AHardwareBuffer_release(ahb); return -2; }
+    if (vk_buffer_memory_allocate(&ai, &p->mem) || vkBindBufferMemory(V.dev, p->buf, p->mem, 0)) { vkDestroyBuffer(V.dev, p->buf, NULL); AHardwareBuffer_release(ahb); return -2; }
     p->ahb = ahb; p->zero_copy = 1;
     return 0;
 }
 // A zero-copy pool's dma-buf mapped again over [mem, mem+len) in one piece per chunk, read-only (nvn_dirty_defrag: the mappings its protection split never merge). 0 = done
 int vk_pool_remap_ro(void *mem, size_t len) {
+    ucopy_drain();
     int rc = 0; uint64_t done = 0;
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool && !rc; i++) {
-        vkpool_t *p = &g_pool[i]; if (p->base != (uint64_t)(uintptr_t)mem || p->end - p->base != len) continue;
+        vkpool_t *p = g_pool[i]; if (p->base != (uint64_t)(uintptr_t)mem || p->end - p->base != len) continue;
         if (!p->zero_copy) { if (!p->shadow) { rc = -1; break; } done += p->hi - p->lo; continue; }   // a copied pool: nothing to map again (its protection stays as it is), and done, so defrag stops taking its pages busy
         int sv[2], fds[16], nfd = -1; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv)) { rc = -1; break; }
         if (!AHardwareBuffer_sendHandleToUnixSocket(p->ahb, sv[0])) nfd = recv_fds(sv[1], fds, 16);
@@ -276,6 +355,7 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
 // 2023's gralloc aborts the process (no error returned) allocating a hardware buffer for Unicorn Overlord's 860 MB pool, while its pools up to 250 MB are fine
 static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const char *e = getenv("DM_VK_ZEROCOPY_MAX_MB"); m = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 20 : 0; } return m && size > m; }
 void mtl_pool_add(const void *mem, uint64_t size) {
+    ucopy_drain();
     vk_init();
     if (!size) return;
     uint64_t a = (uint64_t)(uintptr_t)mem, c = ((a | size) & 0xfff) || zc_over(size) ? size : ZC_CHUNK;
@@ -284,8 +364,8 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t end) {
     pthread_rwlock_wrlock(&g_pool_mu);
-    if (g_npool == MAXPOOL) { pthread_rwlock_unlock(&g_pool_mu); die("[vk] too many memory pools"); }
-    vkpool_t *p = &g_pool[g_npool]; memset(p, 0, sizeof *p);
+    pool_reserve();
+    vkpool_t *p = g_pool[g_npool]; memset(p, 0, sizeof *p);
     p->lo = (uint64_t)(uintptr_t)mem; p->hi = p->lo + size; p->base = base; p->end = end; { static uint64_t ser; p->serial = ++ser; }
     int zc = ((uintptr_t)mem & 0xfff) || (size & 0xfff) ? -3 : getenv("DM_VK_NO_ZEROCOPY") ? -4 : zc_over(end - base) ? -5 : pool_zero_copy(p, (uint8_t *)mem, size);
     if (zc) {
@@ -295,20 +375,28 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
         VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, p->buf, &req);
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
             vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-        VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &p->mem)); VKCHK(vkBindBufferMemory(V.dev, p->buf, p->mem, 0));
+        VKCHK(vk_buffer_memory_allocate(&ai, &p->mem)); VKCHK(vkBindBufferMemory(V.dev, p->buf, p->mem, 0));
         void *m; VKCHK(vkMapMemory(V.dev, p->mem, 0, VK_WHOLE_SIZE, 0, &m)); p->shadow = m;
     }
+    vk_ranges_add(g_pool_ranges, g_npool, p->lo, p->hi, g_npool);
+    if (p->shadow) atomic_fetch_add_explicit(&g_ucopy_shadow_pools, 1, memory_order_relaxed);
     g_npool++; __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    g_pool_adds++; pool_log("add", p);
     pthread_rwlock_unlock(&g_pool_mu);
     static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
     static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB)", mem, (unsigned long long)size, zc ? "copied" : "zero-copy", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
 }
 void mtl_pool_del(const void *mem) {
+    ucopy_drain();
     for (;;) {   // every chunk of the pool
         pthread_rwlock_wrlock(&g_pool_mu);
-        int i = 0; while (i < g_npool && g_pool[i].base != (uint64_t)(uintptr_t)mem) i++;
+        int i = 0; while (i < g_npool && g_pool[i]->base != (uint64_t)(uintptr_t)mem) i++;
         if (i == g_npool) { pthread_rwlock_unlock(&g_pool_mu); return; }
-        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+        vkpool_t p = *g_pool[i];
+        if (p.shadow) atomic_fetch_sub_explicit(&g_ucopy_shadow_pools, 1, memory_order_relaxed);
+        vk_ranges_remove(g_pool_ranges, g_npool, i, g_npool - 1);
+        *g_pool[i] = *g_pool[--g_npool]; __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+        g_pool_dels++; pool_log("del", &p);
         pthread_rwlock_unlock(&g_pool_mu);
         if (p.zero_copy) pool_copy_back(&p);
         vk_defer_free_buffer(p.buf, p.mem);   // the AHardwareBuffer goes with the imported memory's last reference
@@ -322,18 +410,65 @@ vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
     if (c.gen == g) for (int i = 0; i < 4; i++) { vkpool_t *p = c.p[i]; if (p && addr >= p->lo && addr + len <= p->hi) return p; }
     vkpool_t *r = NULL; int across = 0;
     pthread_rwlock_rdlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) { r = &g_pool[i]; break; }
-                                       else if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) across = 1;
+    // Device sampling put over half of replay CPU time in the linear scan with thousands
+    // of pools. Keep the registry's lock/lifetime rules and index its address intervals.
+    int slot = vk_ranges_find(g_pool_ranges, g_npool, addr, len);
+    if (slot >= 0) r = g_pool[slot];
+    else {
+        slot = vk_ranges_find(g_pool_ranges, g_npool, addr, 1);
+        if (slot >= 0 && len <= g_pool[slot]->end - addr) across = 1;
+    }
     pthread_rwlock_unlock(&g_pool_mu);
     if (r) { if (c.gen != g) { memset(&c, 0, sizeof c); c.gen = g; } memmove(&c.p[1], &c.p[0], 3 * sizeof *c.p); c.p[0] = r; }
     if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
     return r;
 }
 uint32_t vk_pool_gen(void) { return __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE); }   // pools added or removed (gfx_vk_exec.c's descriptor set memo: vk_pool_of's results hold while it is unchanged)
+void vk_buffer_cache_config(int on) {
+    on = on > 1 ? 2 : on != 0;
+    if (__atomic_load_n(&g_buffer_cache_on, __ATOMIC_RELAXED) == on) return;
+    __atomic_store_n(&g_buffer_cache_on, on, __ATOMIC_RELAXED);
+    VKLOG("buffer range cache %s (DM_VK_BUFFER_CACHE)", on == 2 ? "verifying" : on ? "on" : "off");
+}
+void vk_buffer_cache_stats(uint64_t *hits, uint64_t *misses, uint64_t *checks, uint64_t *failures) {
+    *hits = t_buflookup.hits; *misses = t_buflookup.misses; *checks = t_buflookup.checks; *failures = t_buflookup.failures;
+}
+int vk_buf_range_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off, uint64_t *available) {
+    uint64_t need = len ? len : 1;
+    buf_lookup_t *cached = NULL;
+    int mode = __atomic_load_n(&g_buffer_cache_on, __ATOMIC_RELAXED), verify = 0;
+    if (mode) {
+        cached = &t_buflookup.entry[((addr >> 8) ^ (addr >> 20) ^ (need >> 4)) & 63];
+        uint32_t gen = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE);
+        if (cached->buf && cached->gen == gen && cached->addr == addr && cached->len == need) {
+            t_buflookup.hits++;
+            if (mode < 2 || (t_buflookup.hits & 63)) {
+                *buf = cached->buf; *off = cached->off; if (available) *available = cached->available;
+                return 1;
+            }
+            verify = 1; t_buflookup.checks++;
+        } else t_buflookup.misses++;
+    }
+    pthread_rwlock_rdlock(&g_pool_mu);
+    int slot = vk_ranges_find(g_pool_ranges, g_npool, addr, need);
+    const vkpool_t *p = slot >= 0 ? g_pool[slot] : NULL;
+    uint32_t gen = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE);
+    // A registration between the fast lookup and this lock legitimately changes
+    // the answer; compare only snapshots from the same registry generation.
+    if (verify && cached->gen == gen && (!p || cached->buf != p->buf || cached->off != addr - p->lo || cached->available != p->hi - addr)) {
+        if (t_buflookup.failures++ < 8) VKLOG("[RED] buffer range cache: snapshot differs at %#llx +%#llx", (unsigned long long)addr, (unsigned long long)need);
+    }
+    if (slot >= 0) {
+        *buf = p->buf; *off = addr - p->lo;
+        if (available) *available = p->hi - addr;
+        if (cached) *cached = (buf_lookup_t){addr, need, addr - p->lo, p->hi - addr,
+            gen, p->buf};
+    } else if (cached) cached->buf = VK_NULL_HANDLE;
+    pthread_rwlock_unlock(&g_pool_mu);
+    return slot >= 0;
+}
 int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
-    vkpool_t *p = vk_pool_of(addr, len ? len : 1);
-    if (!p) return 0;
-    *buf = p->buf; *off = addr - p->lo; return 1;
+    return vk_buf_range_at(addr, len, buf, off, NULL);
 }
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     vkpool_t *p = vk_pool_of(addr, len ? len : 1);
@@ -341,11 +476,10 @@ int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (buf) *buf = (void *)(uintptr_t)p->lo; if (off) *off = addr - p->lo; return 1;
 }
 void mtl_alias_drop_pool(const void *pool) { void vk_tex_drop_pool(const void *); vk_tex_drop_pool(pool); }
-// The NVN flags of the pool at mem (hle_nvn.c, after mtl_pool_add): a copied pool the CPU maps uncached (CPU_UNCACHED, 0x2) is one the game writes and the GPU reads;
-// the game reads GPU results from cached memory, so such a pool is not copied back after each submission
+// The NVN flags of the pool at mem (hle_nvn.c, after mtl_pool_add), for every chunk.
 void vk_pool_set_flags(const void *mem, int flags) {
     pthread_rwlock_rdlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].base == (uint64_t)(uintptr_t)mem) g_pool[i].flags = flags;   // (every chunk of it)
+    for (int i = 0; i < g_npool; i++) if (g_pool[i]->base == (uint64_t)(uintptr_t)mem) g_pool[i]->flags = flags;   // (every chunk of it)
     pthread_rwlock_unlock(&g_pool_mu);
 }
 static uint64_t g_sync_bytes, g_sync_full;   // copied pools: bytes copied by the incremental sync, full copies
@@ -357,7 +491,7 @@ void vk_pools_sync(VkCommandBuffer cb) {
     enum { BLK = 64 << 10 };
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) {
-        vkpool_t *p = &g_pool[i]; if (!p->shadow) continue;
+        vkpool_t *p = g_pool[i]; if (!p->shadow) continue;
         uint8_t *lo = (uint8_t *)(uintptr_t)p->lo; uint64_t size = p->hi - p->lo, st = nvn_dirty_now();
         if (!p->span && (p->span = nvn_dirty_span(lo, size))) p->synced = 0;   // tracked only now (nvnMemoryPoolInitialize registers the range after the pool): copied whole once more, protected
         if (!p->synced || !p->span) {   // untracked: every sync copies all of it, as before
@@ -375,16 +509,24 @@ void vk_pools_sync(VkCommandBuffer cb) {
     pthread_rwlock_unlock(&g_pool_mu);
     static uint64_t n, last; if (++n % 600 == 0) { VKLOG("copied pools: %.1f MB synced in the last 600 submissions (%.2f MB each), %llu full copies so far", (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 600.0 / 1048576.0, (unsigned long long)g_sync_full); last = g_sync_bytes; }
 }
-// Copied pools after a submission: what the GPU wrote, back into the guest's pages. A pool never synced yet is left alone (its copy holds nothing of the game's).
-// A CPU-uncached pool (vk_pool_set_flags) takes back only the ranges the submission's GPU writes covered (sub_gpu_wrote):
-// copying 860 MB back after every submission held Unicorn Overlord to a few frames a second
+// Copied pools after a submission: only recorded GPU write spans return to the guest.
+// A whole cached pool, or a gap between writes, can contain CPU changes made after
+// the upload. Copying an older GPU snapshot there loses those changes. A pool
+// never synced yet is left alone (its copy holds nothing of the game's).
 struct vksub; static void pools_copy_back(const struct vksub *s);
 
 // ---------------- submission slots ----------------
 #define NSLOT 6
-#define MAIN_CBS 32   // (allocated as used: DM_VK_PASS_SPLIT cuts inside passes as well)
-// GPU time: a timestamp at the start and end of each submission's main command buffer (one queue: their sum is the time the GPU was busy)
+#define MAIN_CBS 32   // allocated as used; long depth-free passes may be split
+_Static_assert(MAIN_CBS * 2 <= VK_GPU_SEGMENTS_MAX, "timestamp capacity covers main and upload buffers");
+// GPU span: first to last main-buffer timestamp, including possible CPU-feed gaps
+// between early submissions. Optional segment timestamps measure those gaps.
 static VkQueryPool g_tsq; uint64_t g_gpu_ns;
+static VkQueryPool g_segment_q;
+static VkQueryPool g_upload_segment_q;
+static pthread_mutex_t g_segment_mu = PTHREAD_MUTEX_INITIALIZER;
+static struct { uint64_t span, covered, gaps, parts, submissions, incomplete, all_covered, all_gaps, all_span, upload_covered, all_incomplete;
+    uint64_t cpu_setup, cpu_first, cpu_tail, cpu_count, cpu_early; } g_segment_stats;
 // Timestamp counters (ReportCounter TIMESTAMP): each writes a GPU timestamp where it is in the command stream (CQ per slot), and at completion it gets the guest
 // clock now less how long before the submission's end the GPU passed it. They used to all get the completion time of their submission: a game timing its GPU
 // work between two counters read 0 when both were in one submission and the gap between completions (our CPU replay included) when not. Xenoblade Chronicles 3
@@ -396,55 +538,139 @@ static VkQueryPool g_cq;
 typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; } scratch_blk;
 typedef struct { int kind; void *a; void *b; } dfree_t;   // 0 buffer+memory, 1 image+memory, 2 view
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr; uint32_t type; int q; } post_op;   // q: a timestamp counter's query in g_cq, or -1
+typedef struct { VkDescriptorSet *set; uint32_t count, used, capacity; } descriptor_reuse_entry;
+typedef struct { nvn_hmap layout; uint32_t count; int enabled, discard; } descriptor_reuse;
+enum { DESCRIPTOR_REUSE_LIMIT = 4096 };   // cache budget per slot, never an allocation limit
+static _Atomic uint64_t g_descriptor_allocated, g_descriptor_reused, g_descriptor_resets, g_descriptor_discards;
 struct vksub {
     VkCommandPool pool; VkCommandBuffer up, main; int up_used;
     VkCommandBuffer mains[MAIN_CBS]; int nmain_alloc, nmain_used, cb_err;
     VkCommandBuffer ups[MAIN_CBS]; int nup_alloc, nup_used; int nmain_sent;   // upload command buffers in order (one per part sent early), main buffers already submitted   // the submission's main command buffers in order (vk_cmd_split); main = the one being recorded
     uint64_t fence;   // the fence this slot last committed with (0 = never)
+    uint64_t cpu_begin, cpu_ready, cpu_first;   // optional segment attribution, all CLOCK_MONOTONIC
     int ncq;          // timestamp counter queries used in this submission (g_cq)
     scratch_blk *blk; int nblk, capblk;
+    scratch_blk *dbblk; int ndbblk, capdbblk;
     VkDescriptorPool *dp; int ndp, capdp, dp_cur;
     uint32_t dp_used[9], dp_sets; int dp_counted; int no_ts;   // what pool dp_cur has given out (vk_alloc_set)
+    descriptor_reuse reuse;   // allocated sets of each layout, available only after this slot's fence
     dfree_t *df; int ndf, capdf;
     post_op *post; int npost, cappost;
-    struct { uint64_t lo, hi; } gw[64]; int ngw;   // GPU writes into pool memory in this submission (sub_gpu_wrote), for pools_copy_back: nearby ones merged, and once full each joins the nearest
+    vk_pool_writes writes;   // exact GPU write-span union, retained until this slot's completion
 };
-enum { GW_SUB = 64 };
 static vksub_t g_slot[NSLOT]; static int g_cur = -1; uint64_t g_cmd_gen;   // g_cmd_gen: main command buffers begun (gfx_vk_exec.c bind cache)
 static void pools_copy_back(const struct vksub *s) {
     pthread_rwlock_rdlock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) { vkpool_t *p = &g_pool[i]; if (!p->shadow || !p->synced) continue;
-        if (!(p->flags & 0x2)) { memcpy((void *)(uintptr_t)p->lo, p->shadow, p->hi - p->lo); continue; }
-        for (int k = 0; k < s->ngw; k++) { uint64_t lo = s->gw[k].lo > p->lo ? s->gw[k].lo : p->lo, hi = s->gw[k].hi < p->hi ? s->gw[k].hi : p->hi;
-            if (lo < hi) memcpy((void *)(uintptr_t)lo, p->shadow + (lo - p->lo), hi - lo); } }
+    for (int i = 0; i < g_npool; i++) { vkpool_t *p = g_pool[i]; if (!p->shadow || !p->synced) continue;
+        vk_pool_writes_copy_back((uint8_t *)(uintptr_t)p->lo, p->shadow, p->lo, p->hi, &s->writes); }
     pthread_rwlock_unlock(&g_pool_mu);
 }
 static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
-// DM_VK_PASS_TIMES=1: a timestamp before and after every render pass (the replay's per-frame line then lists the passes that cost the most GPU time)
-enum { PASSQ = 128 };   // passes timed per submission
+static void segment_mark(vksub_t *s, int end) {
+    if (g_segment_q) vkCmdWriteTimestamp(s->main, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        g_segment_q, (uint32_t)((g_cur * MAIN_CBS + s->nmain_used - 1) * 2 + end));
+}
+static void upload_segment_mark(vksub_t *s, int end) {
+    if (g_upload_segment_q) vkCmdWriteTimestamp(s->up, end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        g_upload_segment_q, (uint32_t)((g_cur * MAIN_CBS + s->nup_used - 1) * 2 + end));
+}
+void vk_segment_report(void) {
+    if (!g_segment_q) return;
+    pthread_mutex_lock(&g_segment_mu);
+    VKLOG("GPU segments per frame: %.2f ms covered spans, %.2f ms between parts, %.2f ms envelope; %.1f parts in %.1f submissions, %llu incomplete submissions (covered spans include internal stalls)",
+        g_segment_stats.covered / 6e8, g_segment_stats.gaps / 6e8, g_segment_stats.span / 6e8,
+        g_segment_stats.parts / 600.0, g_segment_stats.submissions / 600.0, (unsigned long long)g_segment_stats.incomplete);
+    if (g_upload_segment_q) VKLOG("GPU spans including uploads per frame: %.2f ms covered, %.2f ms between parts, %.2f ms envelope (%.2f ms in upload buffers); %llu incomplete submissions",
+        g_segment_stats.all_covered / 6e8, g_segment_stats.all_gaps / 6e8, g_segment_stats.all_span / 6e8,
+        g_segment_stats.upload_covered / 6e8, (unsigned long long)g_segment_stats.all_incomplete);
+    if (g_segment_stats.cpu_count) {
+        double d = g_segment_stats.cpu_count * 1e6;
+        VKLOG("CPU feed per committed submission: setup+slot wait %.3f ms, recording before first queue call %.3f, record+submit tail %.3f; %llu submissions, %llu sent early",
+            g_segment_stats.cpu_setup/d, g_segment_stats.cpu_first/d, g_segment_stats.cpu_tail/d,
+            (unsigned long long)g_segment_stats.cpu_count, (unsigned long long)g_segment_stats.cpu_early);
+    }
+    memset(&g_segment_stats, 0, sizeof g_segment_stats);
+    pthread_mutex_unlock(&g_segment_mu);
+}
+// DM_VK_PASS_TIMES=1: continuous pass timing; =2: only sample frames requested
+// by a new DM_VK_PASS_CAPTURE path (DM_VK_PASS_CAPTURE_FRAMES=1..16, default 4).
+enum { PASSQ = 512 };   // passes timed per submission; omissions are counted
 static VkQueryPool g_pq; static int g_pq_on = -1;
 typedef struct { uint32_t w, h, fmt, draws, fidx; } pass_meta;   // fidx: the pass's place in its frame (submissions are cut every DM_VK_CB_DRAWS draws)
-enum { FPASSQ = 512 }; static int g_fpass;   // passes of the frame so far
-void vk_pass_frame(void) { g_fpass = 0; }   // a present: the next pass is the frame's first
+enum { FPASSQ = 1024 }; static int g_fpass;   // true pass ordinal, including untimed passes
+static int g_pass_sample;
+static char g_pass_request[1024]; static unsigned g_pass_left;
+static unsigned pass_capture_frames(void) { const char *e = getenv("DM_VK_PASS_CAPTURE_FRAMES"); int n = e ? atoi(e) : 4; return n < 1 ? 1u : n > 16 ? 16u : (unsigned)n; }
+void vk_pass_frame(void) {
+    g_fpass = 0;
+    if (g_pq_on != 2) return;
+    const char *p = getenv("DM_VK_PASS_CAPTURE");
+    if (p && *p && strlen(p) < sizeof g_pass_request && strcmp(p, g_pass_request)) {
+        snprintf(g_pass_request, sizeof g_pass_request, "%s", p); g_pass_left = pass_capture_frames();
+    }
+    g_pass_sample = g_pass_left != 0; if (g_pass_left) g_pass_left--;
+}
 static pass_meta g_pmeta[NSLOT][PASSQ]; static int g_npass[NSLOT];
 static double g_pacc[FPASSQ]; static uint32_t g_pcnt[FPASSQ]; static pass_meta g_plast[FPASSQ]; static int g_pmax;   // by the pass's place in its frame (the completion thread adds)
-static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e && atoi(e); } return g_pq_on && g_pq; }
+static pthread_mutex_t g_pass_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_pass_omitted;
+static uint64_t g_pass_timed, g_pass_invalid, g_pass_unranked;   // under g_pass_mu
+static int pass_times_on(void) { if (g_pq_on < 0) { const char *e = getenv("DM_VK_PASS_TIMES"); g_pq_on = e ? atoi(e) : 0; } return g_pq && (g_pq_on == 1 || (g_pq_on == 2 && g_pass_sample)); }
 void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws) {
-    if (!pass_times_on() || g_cur < 0) return; int *n = &g_npass[g_cur]; if (*n >= PASSQ) return;
+    if (!pass_times_on() || g_cur < 0) return;
+    int *n = &g_npass[g_cur];
+    if (*n >= PASSQ) { if (end) { g_fpass++; atomic_fetch_add_explicit(&g_pass_omitted, 1, memory_order_relaxed); } return; }
     vkCmdWriteTimestamp(g_slot_main_cb(), end ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_pq, (uint32_t)(g_cur * PASSQ * 2 + *n * 2 + end));
-    if (end) { g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)(g_fpass < FPASSQ - 1 ? g_fpass : FPASSQ - 1)}; (*n)++; g_fpass++; }
+    if (end) { g_pmeta[g_cur][*n] = (pass_meta){w, h, fmt, draws, (uint32_t)g_fpass++}; (*n)++; }
+}
+// The completion thread writes at most sixteen requested frames. Re-arm with a
+// different path; raw same-queue ticks permit offline overlap/coverage checks.
+static void pass_capture(uint64_t frame, uint64_t fence, const pass_meta *meta, const uint64_t *ticks, int count) {
+    static FILE *out; static char opened[1024]; static uint64_t last = UINT64_MAX;
+    static unsigned frames, limit;
+    const char *p = getenv("DM_VK_PASS_CAPTURE"); if (!p || !*p || strlen(p) >= sizeof opened) return;
+    if (strcmp(opened, p)) {
+        if (out) fclose(out);
+        snprintf(opened, sizeof opened, "%s", p); out = fopen(p, "w"); frames = 0; last = UINT64_MAX; limit = pass_capture_frames();
+        if (!out) { VKLOG("[RED] cannot open pass capture %s", p); return; }
+        fprintf(out, "frame\tfence\tpass\twidth\theight\tformat\tdraws\tbbox_width\tbegin_ticks\tend_ticks\ttick_ns\n");
+    }
+    if (!out) return;
+    if (frame != last) {
+        if ((last != UINT64_MAX && frame < last) || frames == limit) return;
+        last = frame; frames++;
+    }
+    for (int i = 0; i < count; ++i) fprintf(out, "%llu\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%llu\t%llu\t%.9g\n",
+        (unsigned long long)frame, (unsigned long long)fence, meta[i].fidx, meta[i].w, meta[i].h, meta[i].fmt,
+        meta[i].draws & 0xffff, meta[i].draws >> 16, (unsigned long long)ticks[2*i], (unsigned long long)ticks[2*i+1], (double)V.props.limits.timestampPeriod);
+    fflush(out);
+}
+static void pass_accumulate(const pass_meta *meta, const uint64_t *ticks, int count) {
+    pthread_mutex_lock(&g_pass_mu);
+    for (int i = 0; i < count; ++i) {
+        if (ticks[2*i+1] < ticks[2*i]) { g_pass_invalid++; continue; }
+        unsigned f = meta[i].fidx; g_pass_timed++;
+        if (f >= FPASSQ) { g_pass_unranked++; continue; }
+        g_pacc[f] += (double)(ticks[2*i+1] - ticks[2*i]) * V.props.limits.timestampPeriod / 1e6;
+        g_pcnt[f]++; g_plast[f] = meta[i]; if ((int)f + 1 > g_pmax) g_pmax = (int)f + 1;
+    }
+    pthread_mutex_unlock(&g_pass_mu);
 }
 void vk_pass_report(void) {   // the most expensive passes since the last report, then the counters start again
-    if (!pass_times_on()) return;
+    if (!g_pq) return;
+    pthread_mutex_lock(&g_pass_mu);
     static int idx[FPASSQ]; int m = g_pmax; for (int i = 0; i < m; i++) idx[i] = i;
     for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (g_pcnt[idx[j]] && (!g_pcnt[idx[i]] || g_pacc[idx[j]] / g_pcnt[idx[j]] > g_pacc[idx[i]] / g_pcnt[idx[i]])) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
     double tot = 0; for (int i = 0; i < m; i++) if (g_pcnt[i]) tot += g_pacc[i] / g_pcnt[i];
-    char b[1200]; int o = snprintf(b, sizeof b, "passes by GPU time (%d passes, %.2f ms in passes per frame):", m, tot);
+    char b[1600]; int o = snprintf(b, sizeof b, "passes by GPU time (%d ordinals, %.2f ms sum of ordinal means; %llu timed, %llu untimed, %llu invalid, %llu unranked):", m, tot,
+        (unsigned long long)g_pass_timed, (unsigned long long)atomic_exchange_explicit(&g_pass_omitted, 0, memory_order_relaxed), (unsigned long long)g_pass_invalid, (unsigned long long)g_pass_unranked);
     for (int i = 0; i < m && i < 10 && o < (int)sizeof b - 80; i++) { int k = idx[i]; if (!g_pcnt[k]) continue;
         o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (%ux%u fmt %u, %u draws over %u px wide);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].fmt, g_plast[k].draws & 0xffff, g_plast[k].draws >> 16); }
     { extern uint64_t g_nvn_discards[2]; static uint64_t pd0, pd1; o += snprintf(b + o, sizeof b - (size_t)o, " discards since: colour %llu, depth %llu", (unsigned long long)(g_nvn_discards[0] - pd0), (unsigned long long)(g_nvn_discards[1] - pd1)); pd0 = g_nvn_discards[0]; pd1 = g_nvn_discards[1]; }
     VKLOG("%s", b);
     memset(g_pacc, 0, sizeof g_pacc); memset(g_pcnt, 0, sizeof g_pcnt); g_pmax = 0;
+    g_pass_timed = g_pass_invalid = g_pass_unranked = 0;
+    pthread_mutex_unlock(&g_pass_mu);
 }
 // one submission at a time: the game's (hle_nvn.c holds its own lock around them) and the backend's own (texel readback, present)
 static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -458,6 +684,17 @@ static void slots_init(void) {
     VKCHK(vkCreateSemaphore(V.dev, &si, NULL, &g_timeline));
     VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, 2 * NSLOT};
     if (V.props.limits.timestampComputeAndGraphics && vkCreateQueryPool(V.dev, &qi, NULL, &g_tsq)) g_tsq = VK_NULL_HANDLE;
+    { const char *e = getenv("DM_VK_SEGMENT_TIMES"), *u = getenv("DM_VK_UPLOAD_TIMES"); if (g_tsq && ((e && atoi(e)) || (u && atoi(u)))) {
+        VkQueryPoolCreateInfo sq = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NSLOT * MAIN_CBS * 2};
+        if (vkCreateQueryPool(V.dev, &sq, NULL, &g_segment_q)) g_segment_q = VK_NULL_HANDLE;
+        VKLOG("command-buffer segment timing %s (DM_VK_SEGMENT_TIMES)", g_segment_q ? "on" : "unavailable");
+    } }
+    const char *upload_times = getenv("DM_VK_UPLOAD_TIMES");
+    if (g_segment_q && upload_times && atoi(upload_times)) {
+        VkQueryPoolCreateInfo sq = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NSLOT * MAIN_CBS * 2};
+        if (vkCreateQueryPool(V.dev, &sq, NULL, &g_upload_segment_q)) g_upload_segment_q = VK_NULL_HANDLE;
+        VKLOG("upload command-buffer timing %s (DM_VK_UPLOAD_TIMES)", g_upload_segment_q ? "on" : "unavailable");
+    }
     VkQueryPoolCreateInfo cqi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NSLOT * CQ};
     if (!g_tsq || vkCreateQueryPool(V.dev, &cqi, NULL, &g_cq)) g_cq = VK_NULL_HANDLE;
     { const char *e = getenv("DM_VK_PASS_TIMES"); if (e && atoi(e)) { VkQueryPoolCreateInfo pq = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, NULL, 0, VK_QUERY_TYPE_TIMESTAMP, NSLOT * PASSQ * 2}; if (vkCreateQueryPool(V.dev, &pq, NULL, &g_pq)) g_pq = VK_NULL_HANDLE; } }
@@ -481,7 +718,38 @@ static void wait_fence(uint64_t f) {
 // rather than as soon as the GPU has. DM_VK_X_NOPRERESET=1 (start-up): reset as they are begun
 static int g_prereset = -1;
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);
+static void descriptor_reuse_free(void *value) {
+    descriptor_reuse_entry *e = value; free(e->set); free(e);
+}
+static void descriptor_slot_recycle(vksub_t *s) {
+    // Called only after the slot's existing GPU completion wait has passed.
+    // Every returned set is still fully rewritten by stage_set before use. Set
+    // content caches retain their existing per-submission epoch; no content is
+    // assumed to survive recycling, and no set is returned twice in one epoch.
+    const char *env = getenv("DM_VK_SET_REUSE"); int enabled = !env || atoi(env);   // =0: reset/reallocate as before (live at slot recycle)
+    descriptor_reuse *r = &s->reuse;
+    if (!enabled || !r->enabled || r->discard) {
+        if (r->discard) atomic_fetch_add_explicit(&g_descriptor_discards, 1, memory_order_relaxed);
+        nvn_hm_clear(&r->layout, descriptor_reuse_free); r->count = 0; r->discard = 0;
+        for (int i = 0; i < s->ndp; i++) {
+            VKCHK(vkResetDescriptorPool(V.dev, s->dp[i], 0));
+            atomic_fetch_add_explicit(&g_descriptor_resets, 1, memory_order_relaxed);
+        }
+        s->dp_cur = 0; s->dp_counted = -1;
+    } else for (uint32_t i = 0; i < r->layout.cap; i++) if (r->layout.vals[i])
+        ((descriptor_reuse_entry *)r->layout.vals[i])->used = 0;
+    if (!!enabled != !!r->enabled) VKLOG("descriptor set allocation reuse %s for a recycled slot (DM_VK_SET_REUSE)", enabled ? "on" : "off");
+    r->enabled = !!enabled;
+    if (!r->layout.klen) r->layout.klen = sizeof(VkDescriptorSetLayout);
+}
+void vk_descriptor_reuse_stats(uint64_t *allocated, uint64_t *reused, uint64_t *resets, uint64_t *discards) {
+    *allocated = atomic_load_explicit(&g_descriptor_allocated, memory_order_relaxed);
+    *reused = atomic_load_explicit(&g_descriptor_reused, memory_order_relaxed);
+    *resets = atomic_load_explicit(&g_descriptor_resets, memory_order_relaxed);
+    *discards = atomic_load_explicit(&g_descriptor_discards, memory_order_relaxed);
+}
 static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last submission: free what it held, rewind its allocators
+    ucopy_drain();   // a queued shadow may still read this slot's immutable inline updates
     if (g_prereset < 0) { const char *e = getenv("DM_VK_X_NOPRERESET"); g_prereset = !(e && atoi(e)); }
     if (g_prereset) mtl_wait(s->fence, ~0ull); else wait_fence(s->fence);
     for (int i = 0; i < s->ndf; i++) {
@@ -494,8 +762,8 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
     }
     s->ndf = 0;
     for (int i = 0; i < s->nblk; i++) s->blk[i].used = 0;
-    for (int i = 0; i < s->ndp; i++) vkResetDescriptorPool(V.dev, s->dp[i], 0);
-    s->dp_cur = 0; s->dp_counted = -1;
+    for (int i = 0; i < s->ndbblk; i++) s->dbblk[i].used = 0;
+    descriptor_slot_recycle(s);
     // The pool is not reset: each command buffer is reset as it is begun again (the pool allows it). A reset of the transient pool made Adreno's driver free the
     // command memory and map it again as the next submission grew (ioctl, mmap and munmap): in Xenoblade Chronicles 3's battles the submission's start took 21%
     // of the replay thread, now 9%, and frames went from about 42 to 38 ms
@@ -506,17 +774,21 @@ int vk_sub_open(void) { return g_cur >= 0; }
 // vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY), which NEO's handheld frames reached at about the 712th draw. The caller has ended the render pass.
 void vk_cmd_split(void) {
     vksub_t *s = cur(); if (s->nmain_used == MAIN_CBS || s->nup_used == MAIN_CBS) return;
+    segment_mark(s, 1);
     if (vkEndCommandBuffer(s->main) < 0) { s->cb_err = 1; static int n; if (n++ < 3) VKLOG("[RED] a part of a long submission was refused at its end (part %d)", s->nmain_used); }
     // what is recorded so far goes to the GPU now, as a submission of its own (with its uploads first): Adreno refuses a single submission past about
     // 700 draws (NEO's handheld frames: VK_ERROR_OUT_OF_HOST_MEMORY at vkEndCommandBuffer whatever the draws were, and in one command buffer or several)
     const char *se = getenv("DM_VK_SUBMIT_SPLIT"); int send = !(se && !atoi(se));   // on unless DM_VK_SUBMIT_SPLIT=0
     if (send && !s->cb_err) {
         VkCommandBuffer cbs[2]; uint32_t n = 0;
-        if (s->up_used) { vk_img_barrier_all(s->up); if (vkEndCommandBuffer(s->up) < 0) s->cb_err = 1; cbs[n++] = s->up; }
+        if (s->up_used) { vk_img_barrier_all(s->up); upload_segment_mark(s, 1); if (vkEndCommandBuffer(s->up) < 0) s->cb_err = 1; cbs[n++] = s->up; }
         cbs[n++] = s->main;
         if (!s->cb_err) {
             VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, cbs, 0, NULL};
-            pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu);
+            ucopy_drain();   // these parts may already consume newly bound uniform shadows
+            pthread_mutex_lock(&g_vk_queue_mu);
+            if (g_segment_q && !s->cpu_first) s->cpu_first = ucopy_now();
+            VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu);
             if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
             { static int n; if (n++ < 3) VKLOG("a long submission: part %d sent early", s->nmain_used); }
             s->nmain_sent = s->nmain_used;
@@ -531,13 +803,20 @@ void vk_cmd_split(void) {
         VKCHK(vkAllocateCommandBuffers(V.dev, &ai, &s->mains[s->nmain_alloc])); s->nmain_alloc++; }
     s->main = s->mains[s->nmain_used++];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
+    segment_mark(s, 0);
 }   // outside a submission nothing may be recorded (present, a pool finalized between frames)
 VkCommandBuffer vk_cmd(void) { return cur()->main; }
 int vk_cmd_parts_left(void) { vksub_t *s = cur(); return MAIN_CBS - (s->nmain_used > s->nup_used ? s->nmain_used : s->nup_used); }   // parts vk_cmd_split can still begin (gfx_vk_exec.c pass splits)
 uint64_t g_up_gen;   // upload command buffers begun (gfx_vk_tex.c lin_copy: once per upload buffer)
 VkCommandBuffer vk_upload_cmd(void) {
     vksub_t *s = cur();
-    if (!s->up_used) { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->up, &bi)); s->up_used = 1; g_up_gen++; }
+    if (!s->up_used) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->up, &bi)); s->up_used = 1; g_up_gen++;
+        // Uploads execute before their main part. Their query pool must be
+        // reset here, not by the first main buffer after the uploads ran.
+        if (g_upload_segment_q && s->nup_used == 1) vkCmdResetQueryPool(s->up, g_upload_segment_q, (uint32_t)(g_cur * MAIN_CBS * 2), MAIN_CBS * 2);
+        upload_segment_mark(s, 0);
+    }
     return s->up;
 }
 void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
@@ -554,13 +833,43 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b->b));
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b->b, &req);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
-    VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
+    VKCHK(vk_buffer_memory_allocate(&ai, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
     b->used = n; *buf = b->b; *off = 0; return b->p;
+}
+// Descriptor bytes share the submission slot's fence lifetime, but have their
+// own bounded blocks: ordinary UBO/vertex scratch can exceed descriptor ranges.
+void *vk_db_scratch(VkDeviceSize n, VkBuffer *buffer, VkDeviceSize *offset) {
+    vksub_t *s = cur(); VkDeviceSize align = V.dbprops.descriptorBufferOffsetAlignment;
+    VkDeviceSize limit = V.dbprops.maxResourceDescriptorBufferRange;
+    if (V.dbprops.maxSamplerDescriptorBufferRange < limit) limit = V.dbprops.maxSamplerDescriptorBufferRange;
+    if (!align || n > limit) die("[vk] descriptor block exceeds the device's range");
+    for (int i = 0; i < s->ndbblk; i++) {
+        scratch_blk *b = &s->dbblk[i]; VkDeviceSize off = (b->used + align - 1) / align * align;
+        if (off <= b->size && n <= b->size - off) { b->used = off + n; *buffer = b->b; *offset = off; return b->p + off; }
+    }
+    if (s->ndbblk == s->capdbblk) {
+        int capacity = s->capdbblk ? s->capdbblk * 2 : 4;
+        void *blocks = realloc(s->dbblk, (size_t)capacity * sizeof *s->dbblk);
+        if (!blocks) die("[vk] cannot allocate descriptor block metadata");
+        s->dbblk = blocks; s->capdbblk = capacity;
+    }
+    scratch_blk *b = &s->dbblk[s->ndbblk++]; memset(b, 0, sizeof *b);
+    b->size = limit < (1u << 20) ? limit : (1u << 20); if (b->size < n) b->size = n;
+    VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, b->size,
+        VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT, VK_SHARING_MODE_EXCLUSIVE};
+    VKCHK(vkCreateBuffer(V.dev, &ci, NULL, &b->b));
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b->b, &req);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
+        vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+    VKCHK(vk_buffer_memory_allocate(&ai, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
+    void *mapped; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &mapped)); b->p = mapped;
+    b->used = n; *buffer = b->b; *offset = 0; return b->p;
 }
 static void df_add(int kind, void *a, void *b) {
     if (g_cur < 0) {   // outside a submission (a pool finalized between frames): after everything submitted so far
         wait_fence(g_fence);
+        if (kind == 1 || kind == 4) { void vk_snapshot_source_free(VkImage); vk_snapshot_source_free((VkImage)a); }
         if (kind == 0) { vkDestroyBuffer(V.dev, (VkBuffer)a, NULL); if (b) vkFreeMemory(V.dev, (VkDeviceMemory)b, NULL); }
         else if (kind == 1) { vkDestroyImage(V.dev, (VkImage)a, NULL); if (b) vkFreeMemory(V.dev, (VkDeviceMemory)b, NULL); }
         else if (kind == 4) { void img_sub_free_(void *); vkDestroyImage(V.dev, (VkImage)a, NULL); img_sub_free_(b); }
@@ -624,9 +933,7 @@ void vk_dsl_register(VkDescriptorSetLayout l, const VkDescriptorSetLayoutBinding
     for (uint32_t i = 0; i < n; i++) if ((uint32_t)b[i].descriptorType < 9) need[b[i].descriptorType] += b[i].descriptorCount;
     pthread_mutex_lock(&g_dsl_mu); nvn_hm_put(&g_dsl_need, &l, need); pthread_mutex_unlock(&g_dsl_mu);
 }
-VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
-    vksub_t *s = cur();
-    pthread_mutex_lock(&g_dsl_mu); const uint32_t *need = nvn_hm_get(&g_dsl_need, &l); pthread_mutex_unlock(&g_dsl_mu);
+static VkDescriptorSet descriptor_alloc(vksub_t *s, VkDescriptorSetLayout l, const uint32_t *need) {
     for (;;) {
         if (s->dp_cur == s->ndp) {
             VkDescriptorPoolSize sz[9]; uint32_t nz = 0;
@@ -646,33 +953,72 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
         s->dp_cur++;
     }
 }
+VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
+    vksub_t *s = cur(); descriptor_reuse *r = &s->reuse; descriptor_reuse_entry *e = NULL;
+    if (r->enabled) {
+        e = nvn_hm_get(&r->layout, &l);
+        if (e && e->used < e->count) {
+            atomic_fetch_add_explicit(&g_descriptor_reused, 1, memory_order_relaxed);
+            return e->set[e->used++];
+        }
+    }
+    pthread_mutex_lock(&g_dsl_mu); const uint32_t *need = nvn_hm_get(&g_dsl_need, &l); pthread_mutex_unlock(&g_dsl_mu);
+    VkDescriptorSet set = descriptor_alloc(s, l, need);
+    atomic_fetch_add_explicit(&g_descriptor_allocated, 1, memory_order_relaxed);
+    // An unknown layout cannot be budgeted by descriptor type. Keep the normal
+    // allocator for it and reset the slot at its next safe recycle. Oversized
+    // working sets and entry/handle storage allocation failure fall back without limiting
+    // the game's allocations or resetting a pool that still holds recorded work.
+    if (r->enabled && !r->discard) {
+        if (!need || r->count >= DESCRIPTOR_REUSE_LIMIT) r->discard = 1;
+        else {
+            if (!e) {
+                e = calloc(1, sizeof *e);
+                if (e) nvn_hm_put(&r->layout, &l, e); else r->discard = 1;
+            }
+            if (e && e->count == e->capacity) {
+                uint32_t capacity = e->capacity ? e->capacity * 2 : 8;
+                VkDescriptorSet *sets = realloc(e->set, sizeof *sets * (size_t)capacity);
+                if (sets) { e->set = sets; e->capacity = capacity; } else r->discard = 1;
+            }
+            if (!r->discard) { e->set[e->count++] = set; e->used = e->count; r->count++; }
+        }
+    }
+    return set;
+}
 
 // ---------------- submissions: begin, CPU-visible effects, commit ----------------
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
 void mtl_init(void) { vk_init(); }
 static int g_shadow_pools;
-void mtl_sub_begin(void) {
+static void sub_begin(int continuation) {
     vk_init();
+    uint64_t cpu_begin = g_segment_q ? ucopy_now() : 0;
     pthread_mutex_lock(&g_sub_lock);
     // the next slot of the ring (g_cur is -1 between submissions, so it cannot say where the ring is: every submission took slot 0 and waited in slot_recycle
     // for the one before to finish on the GPU, which kept the replay of a frame from overlapping the GPU work of the last)
     static int next; g_cur = next; next = (next + 1) % NSLOT; vksub_t *s = &g_slot[g_cur];
     slot_recycle(s);
-    s->npost = 0; s->up_used = 0; s->ngw = 0;
+    s->cpu_begin = cpu_begin; s->cpu_ready = s->cpu_first = 0;
+    s->npost = 0; s->up_used = 0; s->writes.count = 0;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
     VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
     // copied pools: what the game wrote before submitting goes into the GPU copy before any part of the submission can reach the GPU (DM_VK_CB_DRAWS sends
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
-    pthread_rwlock_rdlock(&g_pool_mu); int shadow = 0; for (int i = 0; i < g_npool; i++) shadow |= g_pool[i].shadow != NULL; pthread_rwlock_unlock(&g_pool_mu);
+    pthread_rwlock_rdlock(&g_pool_mu); int shadow = 0; for (int i = 0; i < g_npool; i++) shadow |= g_pool[i]->shadow != NULL; pthread_rwlock_unlock(&g_pool_mu);
     g_shadow_pools = shadow;
     if (shadow) { mtl_wait(g_fence, ~0ull); vk_pools_sync(NULL); }   // (after the completion thread's copy-back of the last submission, not only its GPU work)
     if (g_tsq) { vkCmdResetQueryPool(s->main, g_tsq, 2 * (uint32_t)g_cur, 2); vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur); }
+    if (g_segment_q) { vkCmdResetQueryPool(s->main, g_segment_q, (uint32_t)(g_cur * MAIN_CBS * 2), MAIN_CBS * 2); segment_mark(s, 0); }
     if (g_cq) vkCmdResetQueryPool(s->main, g_cq, (uint32_t)g_cur * CQ, CQ);
     s->ncq = 0;
     g_npass[g_cur] = 0; if (pass_times_on()) vkCmdResetQueryPool(s->main, g_pq, (uint32_t)(g_cur * PASSQ * 2), PASSQ * 2);
-    vk_exec_reset();
+    if (continuation) vk_exec_continue(); else vk_exec_reset();
+    if (g_segment_q) s->cpu_ready = ucopy_now();
 }
+void mtl_sub_begin(void) { sub_begin(0); }
+void vk_sub_restart(void) { (void)mtl_sub_commit(); sub_begin(1); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, -1}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) {
     vksub_t *s = cur(); int q = -1;
@@ -712,9 +1058,15 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
 // before nearly every draw: NEO had about 145 passes for 148 draws a frame). NVN applies the update in command order, so a draw after it whose uniform
 // binding overlaps it reads a shadow: memory with the deferred updates applied in order (vk_ubd_shadow). The real copies are made in order when a pass
 // ends anyway, and at the end of the submission (vk_ubd_land), so later passes, copies, dispatches and the CPU see them as before.
-typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p; } ubd_t;
+#include "uniform_overlay.h"
+#include "uniform_versions.h"
+typedef struct { vk_uniform_span span; VkBuffer sb; VkDeviceSize so; } ubd_t;
 enum { UBD_MAX = 512 };
-static ubd_t g_ubd[UBD_MAX]; static int g_nubd; uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
+static ubd_t g_ubd[UBD_MAX]; static int g_nubd; static vk_uniform_versions g_ubd_versions = {.gen = 1};
+uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
+static void ubd_changed(uint64_t a, uint64_t n) {
+    vk_uniform_changed(&g_ubd_versions, a, n); g_ubd_gen = g_ubd_versions.gen;
+}
 void vk_end_pass_land(void);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     VkBuffer db, sb; VkDeviceSize dof, so;
@@ -722,10 +1074,10 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     if (!vk_buf_at(dst, n, &db, &dof)) { VKRED_ONCE(3, "uniform update outside the memory pools"); return; }
     // an update of exactly the range of a deferred one supersedes it: the older one goes (Unity rewrites the same few constant buffers before every draw,
     // so the list keeps about one entry per buffer region, which keeps the landing to a few copies and the shadows cheap to build)
-    for (int i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].lo == dst && g_ubd[i].hi == dst + n) { memmove(&g_ubd[i], &g_ubd[i + 1], sizeof *g_ubd * (size_t)(g_nubd - i - 1)); g_nubd--; g_ubd_superseded++; break; }
+    for (int i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].span.lo == dst && g_ubd[i].span.hi == dst + n) { memmove(&g_ubd[i], &g_ubd[i + 1], sizeof *g_ubd * (size_t)(g_nubd - i - 1)); g_nubd--; g_ubd_superseded++; break; }
     if (g_nubd == UBD_MAX) vk_end_pass_land();   // too many distinct ranges: they land now
     uint8_t *p = vk_scratch(n, 4, &sb, &so); memcpy(p, data, n);
-    g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, p}; g_ubd_gen++;
+    g_ubd[g_nubd++] = (ubd_t){{dst, dst + n, 0, p}, sb, so}; ubd_changed(dst, n);
 }
 // the draw bisection (gfx_vk_exec.c draw_allowed): the outcome of this submission
 extern int g_bis_on, g_bis_lo, g_bis_hi, g_bis_trace, g_bis_var; void vk_bisect_reset_count(void);
@@ -744,11 +1096,11 @@ static void vk_bisect_result(int ok) {
     if (g_bis_hi - g_bis_lo <= 1) { done = 1; g_bis_on = 0; g_bis_trace = g_bis_lo; VKLOG("bisection: draw %d of %d is the first the driver refuses (traced in the next submission)", g_bis_lo, draws_seen); }
     vk_bisect_reset_count();
 }
-void vk_ubd_land_drop(void) { g_nubd = 0; g_ubd_gen++; }
+void vk_ubd_land_drop(void) { ucopy_drain(); g_nubd = 0; ubd_changed(0, 0); }
 // Landed updates still in flight: their copies are queued but the GPU may not have run them, so memory may not hold them yet; a shadow built on the
 // CPU (vk_ubd_read) applies them over memory until their submission completes. Without this a shadow mixed the newest update with the frame before's
 // memory (shadows detached from moving characters, far pedestrians flickering).
-typedef struct { uint64_t lo, hi, fence; const uint8_t *data; } ubd_infl_t;   // data: the update's bytes in its submission's scratch memory, which is not reused before that submission completes
+typedef vk_uniform_span ubd_infl_t;   // data: the update's bytes in its submission's scratch memory, which is not reused before that submission completes
 static ubd_infl_t *g_infl; static int g_ninfl, g_capinfl;
 static void infl_prune(void) {
     uint64_t done = vk_fence_done(); int o = 0;
@@ -762,25 +1114,23 @@ void vk_ubd_land(VkCommandBuffer cb) {   // outside a render pass
     for (int i = 0; i < g_nubd; i++) {
         if (g_ninfl == g_capinfl) { g_capinfl = g_capinfl ? 2 * g_capinfl : 256; g_infl = realloc(g_infl, sizeof *g_infl * (size_t)g_capinfl); }
         // (the bytes used to be copied into the heap here: a malloc, memcpy and free of up to 64 KB per update, for bytes the scratch memory keeps anyway)
-        g_infl[g_ninfl++] = (ubd_infl_t){g_ubd[i].lo, g_ubd[i].hi, g_fence + 1, g_ubd[i].p};   // the fence of the submission being recorded
+        g_infl[g_ninfl++] = (ubd_infl_t){g_ubd[i].span.lo, g_ubd[i].span.hi, g_fence + 1, g_ubd[i].span.data};   // the fence of the submission being recorded
     }
     vk_img_barrier_all(cb);
-    for (int i = 0; i < g_nubd; i++) { VkBuffer db; VkDeviceSize dof; if (vk_buf_at(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo, &db, &dof)) {
-        VkBufferCopy r = {g_ubd[i].so, dof, g_ubd[i].hi - g_ubd[i].lo}; vkCmdCopyBuffer(cb, g_ubd[i].sb, db, 1, &r); sub_gpu_wrote(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo); } }
+    for (int i = 0; i < g_nubd; i++) { VkBuffer db; VkDeviceSize dof; if (vk_buf_at(g_ubd[i].span.lo, g_ubd[i].span.hi - g_ubd[i].span.lo, &db, &dof)) {
+        VkBufferCopy r = {g_ubd[i].so, dof, g_ubd[i].span.hi - g_ubd[i].span.lo}; vkCmdCopyBuffer(cb, g_ubd[i].sb, db, 1, &r); sub_gpu_wrote(g_ubd[i].span.lo, g_ubd[i].span.hi - g_ubd[i].span.lo); } }
     vk_img_barrier_all(cb);
-    g_ubd_landed += (uint64_t)g_nubd; g_nubd = 0; g_ubd_gen++;
+    g_ubd_landed += (uint64_t)g_nubd; g_nubd = 0; ubd_changed(0, 0);
 }
-int vk_ubd_overlaps(uint64_t a, uint64_t n) { for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) return 1; return 0; }
+int vk_ubd_overlaps(uint64_t a, uint64_t n) { for (int i = 0; i < g_nubd; i++) if (g_ubd[i].span.lo < a + n && a < g_ubd[i].span.hi) return 1; return 0; }
 // GPU writes to pool memory (buffer copies and fills, texture → buffer copies, storage buffers of dispatches) whose submission may not have completed:
 // until it has, a CPU read of that memory (vk_ubd_read: a shadow, a handle in a uniform buffer) may see the bytes from before them or after them
 typedef struct { uint64_t lo, hi, fence; } gpuw_t; enum { GW_MAX = 1024 };
 static gpuw_t g_gw[GW_MAX]; static int g_ngw; uint64_t g_ubd_racy;
 static void sub_gpu_wrote(uint64_t a, uint64_t n) {   // into the open submission's list (pools_copy_back)
-    if (g_cur < 0 || !n) return;
-    vksub_t *s = &g_slot[g_cur]; uint64_t lo = a, hi = a + n, bd = ~0ull; int best = -1;
-    for (int k = 0; k < s->ngw; k++) { uint64_t d = lo > s->gw[k].hi ? lo - s->gw[k].hi : s->gw[k].lo > hi ? s->gw[k].lo - hi : 0; if (d < bd) { bd = d; best = k; } }
-    if (best >= 0 && (bd <= 65536 || s->ngw == GW_SUB)) { if (lo < s->gw[best].lo) s->gw[best].lo = lo; if (hi > s->gw[best].hi) s->gw[best].hi = hi; }
-    else { s->gw[s->ngw].lo = lo; s->gw[s->ngw].hi = hi; s->ngw++; }
+    if (g_cur < 0 || !n || !atomic_load_explicit(&g_ucopy_shadow_pools, memory_order_relaxed)) return;
+    if (!vk_pool_writes_add(&g_slot[g_cur].writes, a, n))
+        die("[vk] GPU write span could not be recorded (%#llx +%#llx)", (unsigned long long)a, (unsigned long long)n);
 }
 void vk_gpu_wrote(uint64_t a, uint64_t n) {
     uint64_t f = g_fence + 1;
@@ -797,31 +1147,63 @@ int vk_gpu_pending(uint64_t a, uint64_t n) {
     return 0;
 }
 // what a GPU read of [a, a + n) sees at this point of the command stream, into dst (memory, then the deferred updates in order)
-void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
-    if (vk_gpu_pending(a, n)) { static int k; g_ubd_racy++; if (k < 20) { k++; int cov = 0; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo <= a && a + n <= g_ubd[i].hi) cov = 1;
-        VKLOG("[RED] a CPU read of %#llx +%llu (%s) overlaps a GPU write not known to be complete", (unsigned long long)a, (unsigned long long)n, cov ? "covered by a deferred update" : "partly from memory"); } }
-    memcpy(dst, (const void *)(uintptr_t)a, n);
-    if (g_ninfl) { uint64_t done = vk_fence_done();
-        for (int i = 0; i < g_ninfl; i++) { if (g_infl[i].fence <= done) continue; uint64_t lo = g_infl[i].lo > a ? g_infl[i].lo : a, hi = g_infl[i].hi < a + n ? g_infl[i].hi : a + n;
-            if (lo < hi) memcpy(dst + (lo - a), g_infl[i].data + (lo - g_infl[i].lo), hi - lo); } }
-    for (int i = 0; i < g_nubd; i++) { uint64_t lo = g_ubd[i].lo > a ? g_ubd[i].lo : a, hi = g_ubd[i].hi < a + n ? g_ubd[i].hi : a + n;
-        if (lo < hi) memcpy(dst + (lo - a), g_ubd[i].p + (lo - g_ubd[i].lo), hi - lo); }
+typedef struct { vk_copy_op ops[64]; size_t count; } ucopy_batch;
+static void ucopy_flush(ucopy_batch *batch) {
+    if (batch->count) { vk_copyq_push_many(&g_ucopy, batch->ops, batch->count); batch->count = 0; }
 }
-// a uniform binding [a, a + n) that deferred updates overlap: its shadow (0 when none overlaps). Shadows are kept per (address, size) until the next update.
+static void ucopy_emit(void *context, uint8_t *dst, const uint8_t *src, size_t size) {
+    ucopy_batch *batch = context;
+    if (batch->count == sizeof batch->ops / sizeof *batch->ops) ucopy_flush(batch);
+    batch->ops[batch->count++] = (vk_copy_op){dst, src, size}; g_ucopy_jobs++; g_ucopy_bytes += size;
+}
+static void ubd_read_(uint64_t a, uint64_t n, uint8_t *dst, int queued) {
+    if (vk_gpu_pending(a, n)) { static int k; g_ubd_racy++; if (k < 20) { k++; int cov = 0; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].span.lo <= a && a + n <= g_ubd[i].span.hi) cov = 1;
+        VKLOG("[RED] a CPU read of %#llx +%llu (%s) overlaps a GPU write not known to be complete", (unsigned long long)a, (unsigned long long)n, cov ? "covered by a deferred update" : "partly from memory"); } }
+    vk_uniform_list in = {g_infl, sizeof *g_infl, g_ninfl, 1, g_ninfl ? vk_fence_done() : 0};
+    vk_uniform_list pending = {g_ubd, sizeof *g_ubd, g_nubd, 0, 0};
+    extern int g_vk_bind_cache;
+    ucopy_batch batch; batch.count = 0;
+    vk_uniform_emit(dst, (const uint8_t *)(uintptr_t)a, a, n, in, pending, g_vk_bind_cache,
+                    queued ? ucopy_emit : vk_uniform_copy_now, &batch);
+    if (queued) ucopy_flush(&batch);
+}
+void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) { ubd_read_(a, n, dst, 0); }
+// A uniform binding [a, a + n) that deferred updates overlap: its immutable shadow.
+// An unrelated update keeps it valid; landing invalidates every scratch reference.
 int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
     if (!g_nubd || !vk_ubd_overlaps(a, n)) return 0;   // (a binding no deferred update touches reads memory on the GPU, after the in-flight copies: no shadow needed)
-    enum { NC = 64 }; static struct { uint64_t a, n, gen; VkBuffer b; VkDeviceSize o; } c[NC];
-    unsigned k = (unsigned)((a ^ n * 0x9E3779B97F4A7C15ull) >> 6) % NC;
-    extern int g_x_noshc; if (c[k].a == a && c[k].n == n && c[k].gen == g_ubd_gen && !g_x_noshc) { *buf = c[k].b; *off = c[k].o; return 1; }
-    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
-    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
+    enum { NC = 512 }; static struct { uint64_t a, n, gen, copied; VkBuffer b; VkDeviceSize o; const uint8_t *data; } c[NC];
+    extern int g_x_noshc, g_vk_bind_cache, g_vk_bind_verify;
+    unsigned k = g_vk_bind_cache ? vk_uniform_cache_slot(a, n, NC) : (unsigned)((a ^ n * 0x9E3779B97F4A7C15ull) >> 6) % 64;
+    if (c[k].a == a && c[k].n == n && !g_x_noshc && (g_vk_bind_cache ? vk_uniform_unchanged(&g_ubd_versions, c[k].gen, a, n) : c[k].gen == g_ubd_versions.gen)) {
+        int ok = 1;
+        if (g_vk_bind_verify) {
+            ucopy_wait(c[k].copied);
+            uint8_t *expected = malloc(n);
+            if (expected) { vk_ubd_read(a, n, expected); ok = !memcmp(expected, c[k].data, n); free(expected); }
+            if (!ok) VKRED_ONCE(95, "reused uniform shadow differs from current bytes (%#llx +%llu)", (unsigned long long)a, (unsigned long long)n);
+        }
+        if (ok) { *buf = c[k].b; *off = c[k].o; c[k].gen = g_ubd_versions.gen; return 1; }
+    }
+    uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off);
+    int queued = g_ucopy_on && n >= 4096 && !atomic_load_explicit(&g_ucopy_shadow_pools, memory_order_relaxed) && !vk_gpu_pending(a, n) && vk_copyq_start(&g_ucopy, ucopy_begin);
+    ubd_read_(a, n, d, queued); g_ubd_bytes += n;
+    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_versions.gen; c[k].b = *buf; c[k].o = *off; c[k].data = d; g_ubd_shadows++;
+    c[k].copied = queued ? vk_copyq_head(&g_ucopy) : 0;
+    if (queued && g_vk_bind_verify) {
+        ucopy_wait(c[k].copied);
+        uint8_t *expected = malloc(n);
+        if (expected) { vk_ubd_read(a, n, expected);
+            if (memcmp(d, expected, n)) { VKRED_ONCE(96, "queued uniform shadow differs from synchronous bytes (%#llx +%llu)", (unsigned long long)a, (unsigned long long)n); memcpy(d, expected, n); }
+            free(expected); }
+    }
     return 1;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // completion: a queue of committed submissions, each with its CPU-visible effects
-typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot; int npass; pass_meta pmeta[PASSQ]; struct cpend *next; } cpend;
+typedef struct cpend { uint64_t fence, frame; post_op *ops; int n; int slot, rslot; int npass, nsegments, nup_segments; pass_meta *pmeta; struct cpend *next; } cpend;
 static cpend *g_ch, *g_ct; static pthread_mutex_t g_cmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_ccv = PTHREAD_COND_INITIALIZER;
 uint64_t guest_ns(void);
 static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); g = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; } return g * 12 / 625; }
@@ -841,15 +1223,47 @@ static void *completion_main(void *a) {
         while (!g_ch) pthread_cond_wait(&g_ccv, &g_cmu);
         cpend *c = g_ch; pthread_mutex_unlock(&g_cmu);
         wait_fence(c->fence);
+        uint64_t segment_ticks[MAIN_CBS * 4]; unsigned segment_count = 0;
         if (g_shadow_pools && c->rslot >= 0) pools_copy_back(&g_slot[c->rslot]);
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
             { uint64_t ns = (uint64_t)((double)(t[1] - t[0]) * V.props.limits.timestampPeriod); g_gpu_ns += ns; int k = (int)(c->frame % 64);
               if (g_frame_gpu_of[k] != c->frame + 1) { g_frame_gpu[k] = 0; g_frame_gpu_of[k] = c->frame + 1; } g_frame_gpu[k] += ns; } }
-        if (g_pq && pass_times_on() && c->slot >= 0) {   // this submission's passes
-            int np = c->npass; uint64_t t[PASSQ * 2];
-            if (np && vkGetQueryPoolResults(V.dev, g_pq, (uint32_t)(c->slot * PASSQ * 2), (uint32_t)np * 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
-                for (int i = 0; i < np; i++) if (t[2 * i + 1] > t[2 * i]) { int f = (int)c->pmeta[i].fidx; g_pacc[f] += (double)(t[2 * i + 1] - t[2 * i]) * V.props.limits.timestampPeriod / 1e6; g_pcnt[f]++; g_plast[f] = c->pmeta[i]; if (f + 1 > g_pmax) g_pmax = f + 1; }
+        if (g_segment_q && c->slot >= 0 && c->nsegments) {
+            uint64_t *t = segment_ticks, span, covered, gaps;
+            if (vkGetQueryPoolResults(V.dev, g_segment_q, (uint32_t)(c->slot * MAIN_CBS * 2), (uint32_t)c->nsegments * 2,
+                    sizeof segment_ticks, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && vk_gpu_segments(t, (unsigned)c->nsegments, &span, &covered, &gaps)) {
+                segment_count = (unsigned)c->nsegments;
+                double period = V.props.limits.timestampPeriod;
+                pthread_mutex_lock(&g_segment_mu);
+                g_segment_stats.span += (uint64_t)(span * period); g_segment_stats.covered += (uint64_t)(covered * period);
+                g_segment_stats.gaps += (uint64_t)(gaps * period); g_segment_stats.parts += (uint64_t)c->nsegments; g_segment_stats.submissions++;
+                pthread_mutex_unlock(&g_segment_mu);
+            } else { pthread_mutex_lock(&g_segment_mu); g_segment_stats.incomplete++; pthread_mutex_unlock(&g_segment_mu); }
         }
+        if (g_upload_segment_q && segment_count && c->nup_segments) {
+            size_t offset = segment_count * 2 * sizeof *segment_ticks;
+            if (g_upload_segment_q && vkGetQueryPoolResults(V.dev, g_upload_segment_q, (uint32_t)(c->slot * MAIN_CBS * 2), (uint32_t)c->nup_segments * 2,
+                    sizeof segment_ticks - offset, segment_ticks + segment_count * 2, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) segment_count += (unsigned)c->nup_segments;
+            else segment_count = 0;
+        }
+        if (g_upload_segment_q) {
+            uint64_t span, covered, gaps, up_span = 0, up_covered = 0, up_gaps = 0;
+            int valid = segment_count && vk_gpu_segments(segment_ticks, segment_count, &span, &covered, &gaps);
+            if (valid && c->nup_segments) valid = vk_gpu_segments(segment_ticks + c->nsegments * 2, (unsigned)c->nup_segments, &up_span, &up_covered, &up_gaps);
+            pthread_mutex_lock(&g_segment_mu);
+            if (valid) { double period = V.props.limits.timestampPeriod;
+                g_segment_stats.all_span += (uint64_t)(span * period); g_segment_stats.all_covered += (uint64_t)(covered * period);
+                g_segment_stats.all_gaps += (uint64_t)(gaps * period); g_segment_stats.upload_covered += (uint64_t)(up_covered * period);
+            } else g_segment_stats.all_incomplete++;
+            pthread_mutex_unlock(&g_segment_mu);
+        }
+        if (g_pq && c->npass && c->slot >= 0) {   // read submitted samples even after capture mode stops recording
+            int np = c->npass; uint64_t t[PASSQ * 2];
+            if (vkGetQueryPoolResults(V.dev, g_pq, (uint32_t)(c->slot * PASSQ * 2), (uint32_t)np * 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+                pass_capture(c->frame, c->fence, c->pmeta, t, np);
+                pass_accumulate(c->pmeta, t, np);
+            } else { pthread_mutex_lock(&g_pass_mu); g_pass_invalid += (uint64_t)np; pthread_mutex_unlock(&g_pass_mu); }
+        } else if (g_pq && c->npass) { pthread_mutex_lock(&g_pass_mu); g_pass_invalid += (uint64_t)c->npass; pthread_mutex_unlock(&g_pass_mu); }
         uint64_t now = gpu_ticks(), tend = 0;
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) tend = t[1]; }
         for (int i = 0; i < c->n; i++) {
@@ -865,7 +1279,7 @@ static void *completion_main(void *a) {
         if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];   // its command buffers reset here (slot_recycle); the slot is not taken before g_done passes this fence
             if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
         pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
-        free(c->ops); free(c);
+        free(c->pmeta); free(c->ops); free(c);
     }
     return NULL;
 }
@@ -874,6 +1288,7 @@ uint64_t mtl_sub_commit(void) {
     vksub_t *s = cur();
     vk_end_pass_land();
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
+    segment_mark(s, 1);
     VkResult er = vkEndCommandBuffer(s->main); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
     if (er < 0) {   // the driver refused something recorded in it: logged with what the submission held, then it is dropped and the game goes on
         extern uint32_t g_sub_ops[64]; char ops[600]; int o = 0;
@@ -892,16 +1307,37 @@ uint64_t mtl_sub_commit(void) {
     }
     else vk_bisect_result(1);
     { extern uint32_t g_sub_ops[64]; memset(g_sub_ops, 0, sizeof g_sub_ops); }
-    if (s->up_used) { vk_img_barrier_all(s->up); VKCHK(vkEndCommandBuffer(s->up)); }
+    if (s->up_used) { vk_img_barrier_all(s->up); upload_segment_mark(s, 1); VKCHK(vkEndCommandBuffer(s->up)); }
     uint64_t f = ++g_fence;
     VkCommandBuffer cbs[1 + MAIN_CBS]; uint32_t ncb = 0; if (s->up_used) cbs[ncb++] = s->up; for (int i = s->nmain_sent; i < s->nmain_used; i++) cbs[ncb++] = s->mains[i];
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 0, NULL, 1, &f};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts, 0, NULL, NULL, ncb, cbs, 1, &g_timeline};
-    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    ucopy_drain();   // no GPU read may see an unfinished shadow
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu);
+    if (g_segment_q && !s->cpu_first) s->cpu_first = ucopy_now();
+    VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
     if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
+    if (g_segment_q && s->cpu_begin && s->cpu_ready >= s->cpu_begin && s->cpu_first >= s->cpu_ready) {
+        uint64_t end = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec;
+        if (end >= s->cpu_first) {
+            pthread_mutex_lock(&g_segment_mu);
+            g_segment_stats.cpu_setup += s->cpu_ready - s->cpu_begin;
+            g_segment_stats.cpu_first += s->cpu_first - s->cpu_ready;
+            g_segment_stats.cpu_tail += end - s->cpu_first;
+            g_segment_stats.cpu_count++; g_segment_stats.cpu_early += s->nmain_sent != 0;
+            pthread_mutex_unlock(&g_segment_mu);
+        }
+    }
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
-    c->npass = g_npass[g_cur]; memcpy(c->pmeta, g_pmeta[g_cur], sizeof(pass_meta) * (size_t)c->npass);
+    c->nsegments = s->nmain_used;
+    c->nup_segments = s->nup_used - 1 + (s->up_used != 0);
+    c->npass = g_npass[g_cur];
+    if (c->npass) {
+        c->pmeta = malloc(sizeof *c->pmeta * (size_t)c->npass);
+        if (c->pmeta) memcpy(c->pmeta, g_pmeta[g_cur], sizeof *c->pmeta * (size_t)c->npass);
+        else { pthread_mutex_lock(&g_pass_mu); g_pass_invalid += (uint64_t)c->npass; pthread_mutex_unlock(&g_pass_mu); c->npass = 0; VKRED_ONCE(96, "cannot allocate pass timing metadata"); }
+    }
     if (s->npost) { c->ops = malloc(s->npost * sizeof *c->ops); memcpy(c->ops, s->post, s->npost * sizeof *c->ops); }
     pthread_mutex_lock(&g_cmu); if (g_ct) g_ct->next = c; else g_ch = c; g_ct = c; pthread_cond_signal(&g_ccv); pthread_mutex_unlock(&g_cmu);
     s->npost = 0; g_cur = -1;

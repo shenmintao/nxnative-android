@@ -26,12 +26,13 @@ class LayoutCache(unittest.TestCase):
 #include <assert.h>
 #include <vulkan/vulkan.h>
 #include "nvn_hmap.h"
-static struct { VkDevice dev; } V;
+static struct { VkDevice dev; int descriptor_buffer; } V;
 static unsigned created, registered;
 static VkResult make_layout(VkDevice dev, const VkDescriptorSetLayoutCreateInfo *ci,
                             const VkAllocationCallbacks *alloc, VkDescriptorSetLayout *out) {
     (void)dev; (void)alloc;
-    assert(ci->flags == 0 && ci->pNext == NULL && ci->bindingCount <= 96);
+    assert(ci->flags == (V.descriptor_buffer ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT : 0));
+    assert(ci->pNext == NULL && ci->bindingCount <= 96);
     for (uint32_t i = 0; i < ci->bindingCount; i++) assert(ci->pBindings[i].pImmutableSamplers == NULL);
     *out = (VkDescriptorSetLayout)(uintptr_t)++created;
     return VK_SUCCESS;
@@ -42,11 +43,13 @@ void vk_dsl_register(VkDescriptorSetLayout layout, const VkDescriptorSetLayoutBi
 #define vkCreateDescriptorSetLayout make_layout
 #define VKCHK(call) assert((call) == VK_SUCCESS)
 ''' + helper + r'''
-int main(void) {
+int main(int argc, char **argv) {
+    (void)argv; V.descriptor_buffer = argc > 1;
     VkDescriptorSetLayoutBinding a[2] = {
         {3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT, NULL},
         {8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, VK_SHADER_STAGE_VERTEX_BIT, NULL}
     }, b[2];
+    if (V.descriptor_buffer) a[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     VkDescriptorSetLayout original = shader_layout(a, 2);
     assert(shader_layout(a, 2) == original && created == 1 && registered == 1);
     memset(b, 0xa5, sizeof b);
@@ -59,7 +62,7 @@ int main(void) {
     for (unsigned field = 0; field < 4; field++) {
         memcpy(b, a, sizeof a);
         if (field == 0) b[0].binding++;
-        if (field == 1) b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        if (field == 1) b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         if (field == 2) b[0].descriptorCount++;
         if (field == 3) b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         assert(shader_layout(b, 2) != original && created == field + 2 && registered == created);
@@ -84,6 +87,7 @@ int main(void) {
                             '-idirafter', str(headers),
                             '-I' + str(DM / 'gfx/nvn'), str(cfile), '-o', str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
+            subprocess.run([str(exe), 'descriptor-buffer'], check=True)
 
 
 if __name__ == '__main__':

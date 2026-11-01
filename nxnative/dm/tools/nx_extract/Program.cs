@@ -9,6 +9,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text.Json;
 using System.Runtime.InteropServices;
 using LibHac.Common;
 using LibHac.Common.Keys;
@@ -20,6 +22,7 @@ using LibHac.Tools.Fs;
 using LibHac.Tools.FsSystem;
 using LibHac.Tools.FsSystem.NcaUtils;
 using LibHac.Tools.FsSystem.RomFs;
+using LibHac.Tools.Ncm;
 using Path = System.IO.Path;
 
 static class P {
@@ -28,13 +31,20 @@ static class P {
     static int Main(string[] a) {
         bool manifest = Array.IndexOf(a, "--manifest") >= 0; a = Array.FindAll(a, s => s != "--manifest");
         g_allow = Array.IndexOf(a, "--allow-damaged") >= 0; a = Array.FindAll(a, s => s != "--allow-damaged");
+        bool baseOnly = Array.IndexOf(a, "--base-only") >= 0; a = Array.FindAll(a, s => s != "--base-only");
+        if (a.Length == 3 && a[1] == "--info") return Info(ExternalKeyReader.ReadKeyFile(a[0]), a[2]);
+        if (a.Length == 4 && a[1] == "--export-nsp") return ExportNsp(ExternalKeyReader.ReadKeyFile(a[0]), a[2], a[3]);
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
-        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
+        if (a[1] == "--aoc") return Aoc(ks, a[2], a[3], a.Length >= 6 && a[4] == "--title-id" ? Convert.ToUInt64(a[5], 16) : null);
         var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
-        Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
-        Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
-        Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
+        Cnmt baseMeta = Application(basePkg);
+        Nca baseProg = FromMeta(basePkg, baseMeta, LibHac.Ncm.ContentType.Program) ?? Pick(basePkg.Ncas.Where(n => !IsPatch(n)).ToList(), NcaContentType.Program) ?? throw new Exception("no base Program NCA in the container");
+        Package patches = updPkg ?? (baseOnly ? null : basePkg);
+        Cnmt patchMeta = patches == null ? null : Patch(patches, baseMeta?.TitleId ?? baseProg.Header.TitleId);
+        Nca updProg = patches == null ? null : FromMeta(patches, patchMeta, LibHac.Ncm.ContentType.Program);
+        if (updPkg != null && updProg == null) updProg = Pick(updPkg.Ncas, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update");
+        Nca ctrl = FromMeta(patches, patchMeta, LibHac.Ncm.ContentType.Control) ?? FromMeta(basePkg, baseMeta, LibHac.Ncm.ContentType.Control) ?? Pick(basePkg.Ncas, NcaContentType.Control, baseProg.Header.TitleId);
         Console.WriteLine($"title {baseProg.Header.TitleId:x16}" + (updProg != null ? $", update {updProg.Header.TitleId:x16}" : ""));
         string outDir = a[3], cmpDir = a.Length > 4 ? a[4] : null;
         if (ctrl != null) {   // control data (NACP): display version and game name; a raw copy goes to <output dir>/control.nacp for naming the app
@@ -84,9 +94,11 @@ static class P {
     }
 
     // DLC NSP: one data NCA (content type PublicData / Data) + a meta NCA + the ticket; only the data NCA's RomFS is written
-    static int Aoc(KeySet ks, string nsp, string outDir) {
+    static int Aoc(KeySet ks, string nsp, string outDir, ulong? titleId = null) {
         var pkg = OpenNsp(ks, nsp);
-        Nca data = Pick(pkg, NcaContentType.PublicData) ?? Pick(pkg, NcaContentType.Data) ?? throw new Exception("no data NCA in the DLC NSP");
+        var metas = pkg.Metas.Where(m => m.Type == LibHac.Ncm.ContentMetaType.AddOnContent && (!titleId.HasValue || m.TitleId == titleId.Value)).OrderByDescending(m => m.TitleVersion.Version).ToList();
+        if (!titleId.HasValue && metas.Select(m => m.TitleId).Distinct().Count() > 1) throw new Exception("this container has multiple DLC titles: give --title-id <hex>");
+        Nca data = FromMeta(pkg, metas.FirstOrDefault(), LibHac.Ncm.ContentType.Data) ?? Pick(pkg.Ncas, NcaContentType.PublicData, titleId) ?? Pick(pkg.Ncas, NcaContentType.Data, titleId) ?? throw new Exception("no data NCA of the requested DLC in the container");
         Console.WriteLine($"add-on content {data.Header.TitleId:x16}");
         Directory.CreateDirectory(outDir);
         Copy(new RomFsFileSystem(data.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid)), outDir, null);
@@ -94,7 +106,29 @@ static class P {
     }
 
     // Open an NSP (PFS0) or the secure partition of an XCI, import the common tickets, list all NCAs
-    static List<Nca> OpenNsp(KeySet ks, string path) {
+    sealed class Package {
+        public List<Nca> Ncas = new();
+        public Dictionary<string, Nca> ById = new(StringComparer.OrdinalIgnoreCase);
+        public List<Cnmt> Metas = new();
+    }
+    static bool IsPatch(Nca n) => n.Header.ContentType == NcaContentType.Program && n.SectionExists(NcaSectionType.Data) && n.GetFsHeader(1).IsPatchSection();
+    static Cnmt Application(Package pkg) => pkg.Metas.Where(m => m.Type == LibHac.Ncm.ContentMetaType.Application).OrderBy(m => m.TitleId).ThenByDescending(m => m.TitleVersion.Version).FirstOrDefault();
+    static Cnmt Patch(Package pkg, ulong app) => pkg.Metas.Where(m => m.Type == LibHac.Ncm.ContentMetaType.Patch && (m.ApplicationTitleId == app || m.TitleId == app + 0x800)).OrderByDescending(m => m.TitleVersion.Version).FirstOrDefault();
+    static Nca FromMeta(Package pkg, Cnmt meta, LibHac.Ncm.ContentType type) {
+        if (pkg == null || meta == null) return null;
+        return meta.ContentEntries.Where(e => e.Type == type).Select(e => pkg.ById.GetValueOrDefault(Convert.ToHexString(e.NcaId))).Where(n => n != null).OrderBy(n => n.Header.TitleId).FirstOrDefault();
+    }
+    static int Info(KeySet ks, string path) {
+        Package pkg = OpenNsp(ks, path); Cnmt app = Application(pkg);
+        if (app == null) throw new Exception("no application content metadata in the container");
+        var patches = pkg.Metas.Where(m => m.Type == LibHac.Ncm.ContentMetaType.Patch && (m.ApplicationTitleId == app.TitleId || m.TitleId == app.TitleId + 0x800)).OrderBy(m => m.TitleVersion.Version);
+        var dlc = pkg.Metas.Where(m => m.Type == LibHac.Ncm.ContentMetaType.AddOnContent && m.ApplicationTitleId == app.TitleId).OrderBy(m => m.TitleId);
+        Console.WriteLine(JsonSerializer.Serialize(new { title_id = app.TitleId.ToString("X16"), base_version = app.TitleVersion.Version,
+            updates = patches.Select(m => new { title_id = m.TitleId.ToString("X16"), version = m.TitleVersion.Version }),
+            dlc = dlc.Select(m => new { title_id = m.TitleId.ToString("X16"), version = m.TitleVersion.Version }) }));
+        return 0;
+    }
+    static Package OpenNsp(KeySet ks, string path) {
         IFileSystem pfs; var st0 = new LocalStorage(path, FileAccess.Read);
         byte[] magic = new byte[4]; st0.Read(0x100, magic).ThrowIfFailure();
         if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic at 0x100
@@ -104,7 +138,7 @@ static class P {
         } else {
             var p = new PartitionFileSystem(); p.Initialize(st0).ThrowIfFailure(); pfs = p;
         }
-        var ncas = new List<Nca>();
+        var pkg = new Package();
         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default)) {
             using var f = new UniqueRef<IFile>();
             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
@@ -113,9 +147,56 @@ static class P {
                 byte[] t = new byte[0x2c0]; st.Read(0, t).ThrowIfFailure();
                 if (t[0x281] != 0) { Console.Error.WriteLine($"[RED] {e.Name} is not a common ticket; supply the title key separately"); continue; }
                 ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
-            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) ncas.Add(new Nca(ks, st));
+            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) {
+                var nca = new Nca(ks, st); pkg.Ncas.Add(nca);
+                string id = e.Name.Split('.')[0]; pkg.ById[id] = nca;
+            }
         }
-        return ncas;
+        foreach (Nca nca in pkg.Ncas.Where(n => n.Header.ContentType == NcaContentType.Meta)) {
+            IFileSystem fs = nca.OpenFileSystem(0, IntegrityCheckLevel.ErrorOnInvalid);
+            foreach (DirectoryEntryEx entry in fs.EnumerateEntries("*.cnmt", SearchOptions.Default)) {
+                using var file = new UniqueRef<IFile>(); fs.OpenFile(ref file.Ref, entry.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                byte[] data = new byte[entry.Size]; file.Get.Read(out long read, 0, data, ReadOption.None).ThrowIfFailure();
+                if (read != data.Length) throw new InvalidDataException("incomplete content metadata");
+                using var stream = new MemoryStream(data, false); pkg.Metas.Add(new Cnmt(stream));
+            }
+        }
+        return pkg;
+    }
+    // Rewrap the secure XCI partition as a real PFS0/NSP, retaining every original encrypted
+    // NCA and ticket byte-for-byte. Used to exercise the NSP path with the same local game.
+    static int ExportNsp(KeySet ks, string input, string output) {
+        if (File.Exists(output)) throw new IOException("the NSP output already exists");
+        using var storage = new LocalStorage(input, FileAccess.Read);
+        var xci = new Xci(ks, storage); IFileSystem fs = xci.OpenPartition(XciPartitionType.Secure);
+        var entries = fs.EnumerateEntries("*", SearchOptions.Default).Where(e => e.Type == DirectoryEntryType.File).OrderBy(e => e.Name, StringComparer.Ordinal).ToArray();
+        var names = new MemoryStream(); var offsets = new List<uint>();
+        foreach (var entry in entries) { offsets.Add((uint)names.Length); names.Write(System.Text.Encoding.UTF8.GetBytes(entry.Name)); names.WriteByte(0); }
+        int pad = (int)((16 - (16 + entries.Length * 24 + names.Length) % 16) % 16); names.SetLength(names.Length + pad);
+        long total = 16 + entries.Length * 24 + names.Length + entries.Sum(e => e.Size);
+        if (new DriveInfo(Path.GetPathRoot(Path.GetFullPath(output))).AvailableFreeSpace < total + (1L << 30)) throw new IOException("not enough space for the NSP verification copy");
+        string tmp = output + ".partial"; bool created = false;
+        try {
+            using (var destination = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4 << 20)) {
+                created = true; using var writer = new BinaryWriter(destination, System.Text.Encoding.UTF8, true);
+                writer.Write(new byte[] { 80, 70, 83, 48 }); writer.Write(entries.Length); writer.Write((uint)names.Length); writer.Write(0);
+                long at = 0;
+                for (int i = 0; i < entries.Length; ++i) { writer.Write(at); writer.Write(entries[i].Size); writer.Write(offsets[i]); writer.Write(0); at += entries[i].Size; }
+                writer.Write(names.ToArray()); byte[] buffer = new byte[4 << 20]; long copied = 0, shown = 0;
+                foreach (var entry in entries) {
+                    using var source = new UniqueRef<IFile>(); fs.OpenFile(ref source.Ref, entry.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                    long pos = 0;
+                    while (pos < entry.Size) {
+                        int size = (int)Math.Min(buffer.Length, entry.Size - pos); source.Get.Read(out long read, pos, buffer.AsSpan(0, size), ReadOption.None).ThrowIfFailure();
+                        if (read != size) throw new EndOfStreamException("incomplete XCI while exporting NSP");
+                        destination.Write(buffer, 0, size); pos += size; copied += size;
+                        if (copied - shown >= 1L << 30) { Console.WriteLine($"NSP export {copied / (double)(1L << 30):F1} GiB"); shown = copied; }
+                    }
+                }
+                destination.Flush(true);
+            }
+            File.Move(tmp, output); Console.WriteLine($"NSP export: {entries.Length} files, {total} bytes"); return 0;
+        } finally { if (created && File.Exists(tmp)) File.Delete(tmp); }
     }
     // A multi-program application has a Program and a Control NCA per program index (ROMANCE OF THE THREE KINGDOMS 8 REMAKE: its update 1.1.3 adds a whole second program,
     // title ID …0001, beside the game's patch, …0000): with no title ID the lowest one (program index 0, the game), else the NCA of that title ID

@@ -8,9 +8,9 @@ def _parser():
     sub = ap.add_subparsers(dest='cmd', required=True)
     d = sub.add_parser('doctor', help='check the tools a port needs'); d.add_argument('--json', action='store_true'); d.add_argument('-k', '--keys')
     p = sub.add_parser('profiles', help='list the games the tool can port'); p.add_argument('--all', action='store_true', help='also the iOS profiles not ported to Android'); p.add_argument('--json', action='store_true')
-    i = sub.add_parser('inspect', help='what a game folder holds and whether it can be ported'); i.add_argument('folder'); i.add_argument('--json', action='store_true')
+    i = sub.add_parser('inspect', help='inspect an NSP/XCI file or game folder'); i.add_argument('folder'); i.add_argument('--json', action='store_true'); i.add_argument('-k', '--keys', help='prod.keys, to identify embedded updates and DLC')
     po = sub.add_parser('port', help='make the APK and the data pack (and install them)')
-    po.add_argument('folder', help='the game\'s folder: its base game NSP / XCI, updates and DLC')
+    po.add_argument('folder', help='an NSP/XCI file or a game folder; matching updates and DLC beside the selected file are included')
     po.add_argument('-k', '--keys', help='prod.keys (default: the configured one)')
     po.add_argument('-o', '--out', help='folder for the APK and the data pack (default: the game folder)')
     po.add_argument('-p', '--version', default='', help='version to pack, v<N> (default: the newest in the folder)')
@@ -24,8 +24,9 @@ def _parser():
     po.add_argument('--package', default='', help="the app's package instead of the profile's (a test install beside another build of the game)")
     po.add_argument('--fps60', action='store_true', help='60 fps: the profile\'s own frame-rate cap, else the community\'s FPSLocker-Warehouse config of the game\'s build, fetched from GitHub')
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
+    po.add_argument('--data-mode', choices=('embedded', 'external'), default='embedded', help='embedded: one APK with automatic first-launch preparation; external: APK + data directory for games beyond the APK size limit')
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
-    ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
+    ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='a standalone APK, or a data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK for an external data pack (default: <App>.apk beside the pack)')
     ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
@@ -59,7 +60,7 @@ def cmd_profiles(a):
 def cmd_inspect(a):
     from porter import pipeline
     from porter.upstream import BuildError
-    try: info = pipeline.inspect(a.folder)
+    try: info = pipeline.inspect(a.folder, keys=a.keys)
     except BuildError as e:
         if a.json: _print_json({'error': str(e)})
         else: print(e, file=sys.stderr)
@@ -98,7 +99,7 @@ def _with_progress(mode, fn):
 def cmd_port(a):
     from porter import pipeline
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
-                            app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, jobs=a.jobs)
+                            app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, jobs=a.jobs, data_mode=a.data_mode)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -107,7 +108,10 @@ def cmd_install(a):
     from porter.upstream import BuildError, PROG
     def go():
         data = Path(a.data).resolve()
-        apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
+        if data.is_file() and data.suffix.lower() == '.apk':
+            if a.apk: raise BuildError('--apk is only used with an external data directory')
+            apk, data = data, None
+        else: apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
         PROG.plan(1)
         cfg = config.load()
         install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer)
