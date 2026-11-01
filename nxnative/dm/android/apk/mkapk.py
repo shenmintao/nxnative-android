@@ -7,6 +7,7 @@ from pathlib import Path
 
 from apk_stream import Entry, write_apk
 from game_pack import ASSET, MANIFEST_ASSET, GamePack
+from pipeline_keys import ASSET as PIPELINE_ASSET, read_keys
 
 import argparse as _ap
 _p = _ap.ArgumentParser(); _p.add_argument('so'); _p.add_argument('out'); _p.add_argument('key', nargs='?'); _p.add_argument('--package', default='org.nx2a.probe')
@@ -16,6 +17,7 @@ _p.add_argument('--query-package', action='append', default=[], help='make a nam
 _p.add_argument('--icon', help='launcher icon (a PNG, used at its own size: nodpi)')
 _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--data', help='embed a data pack in the APK for automatic first-launch preparation')
+_p.add_argument('--pipeline-keys', help='recorded PPE1 keys for this game build, seeded on first launch')
 _p.add_argument('--abi', choices=('arm64-v8a', 'x86_64'), default='arm64-v8a', help='native library ABI (the game runtime uses arm64-v8a)')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
@@ -222,6 +224,7 @@ def main():
     if ARGS.data:
         data = GamePack(ARGS.data, PKG)
         entries += [Entry(ASSET, data), Entry(MANIFEST_ASSET, data.manifest)]
+    if ARGS.pipeline_keys: entries.append(Entry(PIPELINE_ASSET, read_keys(ARGS.pipeline_keys)))
     size = write_apk(entries, out, lambda digest: v2_block(digest, k, crt))
     print(f'{out}: {size} bytes, signer SHA-256 {hashlib.sha256(crt).hexdigest()[:16]}...')
 

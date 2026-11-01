@@ -828,6 +828,19 @@ typedef struct {
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
+// Debug acceptance runs count runtime creation calls, a conservative upper bound
+// on driver compilations. Prewarm calls are excluded; timestamps are MONOTONIC.
+static uint64_t pipeline_observe_start(void) {
+#ifndef DM_RELEASE
+    const char *e = getenv("DM_VK_PIPELINE_TIMES");
+    if (e && atoi(e)) return tnow();
+#endif
+    return 0;
+}
+static void pipeline_observe_end(const char *kind, uint64_t start) {
+    if (start) VKLOG("runtime pipeline %s: start_ns=%llu end_ns=%llu", kind,
+                     (unsigned long long)start, (unsigned long long)tnow());
+}
 // The last key and its pipeline (the replay thread's only; pipelines are never dropped): runs of draws with one pipeline skip the 992-byte hash and the lock
 static pkey g_last_k; static VkPipeline g_last_p;
 static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
@@ -835,7 +848,9 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
     if (p) { g_last_k = *k; g_last_p = p; return p == (void *)1 ? VK_NULL_HANDLE : p; }
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
+    uint64_t observed = pipeline_observe_start();
     p = build_pipeline(k, layout, stg);
+    pipeline_observe_end("graphics", observed);
     pthread_mutex_lock(&g_pipe_mu);
     VkPipeline had = nvn_hm_get(&g_pipes, k);
     if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
@@ -1699,7 +1714,9 @@ rebind_compute_views:;
     if (!p) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, ck[1], ck[2], 0, 0), "main", NULL}, layout, VK_NULL_HANDLE, -1};
         if (V.descriptor_buffer) ci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        uint64_t observed = pipeline_observe_start();
         if (vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p)) { LOG("[RED] [vk] compute pipeline failed: %016llx", (unsigned long long)cs->key); p = (VkPipeline)1; }
+        pipeline_observe_end("compute", observed);
         nvn_hm_put(&g_cpipes, ck, p);
     }
     if (p == (void *)1) return;

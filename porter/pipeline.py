@@ -7,7 +7,7 @@ import os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, containers, datapack, fpslocker, install, native_tools, paths, profiles, sources, toolchain
+from porter import config, containers, datapack, fpslocker, install, native_tools, paths, prewarm, profiles, sources, toolchain
 from porter.adb import Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say
@@ -357,9 +357,11 @@ class Port:
         stem = app_stem(self.g, self.app_name)
         self.apk_path = self.o.out / f'{stem}.apk'; self.o.out.mkdir(parents=True, exist_ok=True)
         icon = self.icon()
+        pipeline_keys = prewarm.find_keys(self.aw, self.game / 'ExeFS/main')
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(version_code(self.pkg_ver)), '--version-name', self.display]
                 + (['--data', self.data_path] if self.o.data_mode == 'embedded' else [])
+                + (['--pipeline-keys', pipeline_keys] if pipeline_keys else [])
                 + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + ([] if self.o.debug else ['--release']),
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)

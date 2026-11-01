@@ -621,6 +621,9 @@ static void *host_thread(void *a) {
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");
 #endif
+    int seeded = dm_pipeline_keys_seed(g_act->assetManager, getenv("DM_ROOT"));
+    if (seeded < 0) LOG("[RED] could not seed the APK's pipeline keys");
+    else if (seeded) LOG("pipeline prewarm keys installed from APK");
     settings_load(); dm_haptics_android_start(g_act, atomic_load(&g_set_rumble));
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, g_act->vm)) pthread_detach(w); }
     atomic_store(&g_preparing, 0);

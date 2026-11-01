@@ -83,6 +83,25 @@ static int write_atomic(const char *tmp, const char *path, const void *data, siz
     if (!ok || rename(tmp, path)) { unlink(tmp); return -1; }
     return 0;
 }
+int dm_pipeline_keys_seed(AAssetManager *manager, const char *root) {
+    char path[PATH_MAX], tmp[PATH_MAX]; struct stat st;
+    if (!root || path_join(path, sizeof path, root, "vk_pipelines.bin") ||
+        path_join(tmp, sizeof tmp, root, "vk_pipelines.seed.tmp")) return -1;
+    if (!lstat(path, &st)) return 0;   // Never replace keys already learned by the player.
+    if (errno != ENOENT) return -1;
+    AAsset *asset = AAssetManager_open(manager, "nxnative/vk_pipelines.bin", AASSET_MODE_STREAMING);
+    if (!asset) return 0;
+    int result = -1; unsigned char *data = NULL;
+    int64_t size = AAsset_getLength64(asset);
+    if (size > 8 && size <= 64 * 1024 * 1024 && (data = malloc((size_t)size)) &&
+        !asset_read(asset, data, (size_t)size)) {
+        uint32_t stride = u32(data + 4);
+        if (u32(data) == 0x31455050u && stride && stride <= 65536 && !((size - 8) % stride))
+            result = write_atomic(tmp, path, data, (size_t)size) ? -1 : 1;
+    }
+    free(data); AAsset_close(asset);
+    return result;
+}
 static int remove_tree(const char *path) {
     struct stat st; if (lstat(path, &st)) return errno == ENOENT ? 0 : -1;
     if (!S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return unlink(path);
