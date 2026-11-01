@@ -1,12 +1,23 @@
-# Android bring-up: Shrine progression and short copied-save Great Plateau tests.
-# Duplicate-MRT materials, the pool-count abort and first-use texture content are corrected; full gameplay is not validated.
+# TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-01.
+# Owned Great Plateau save, 60 s warmup + 120 s actual-present windows.
+# Docked 1920x1080 output with the game's 1280x720..1600x900 dynamic rendering.
+# Private stack baseline: fixed 57.893/58.127 fps, moving 57.646; final integrated acceptance pending.
+# HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-10-30: Chinese menus, save/load, controller and touch input; growable pool registry and first-use sky/light fix; CPU-access mapping and HOME focus restoration checked; 25.44 s normal handheld 30-target movement averaged 29.87 fps, max 67 ms; standing lower-leg ground occlusion remains reproducible; earlier private native-1080p static probe averaged 53.91 fps over 20.78 s; cinematic playback, sustained native 1080p60 and full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-01: Chinese menus, save/load, controller/touch, CPU mapping and HOME restoration checked; docked 1080p output private-stack baseline fixed mean 58.010 fps, moving 57.646 fps; long-frame thresholds not met; integrated build acceptance pending; standing lower-leg ground occlusion remains reproducible, full gameplay unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn
 setting	overlay=1
 setting	rumble=1
-setting	docked=0
-# Conservative bring-up target; --fps60 overrides this environment row when packing.
-env	DM_FPS_TARGET=30
+setting	docked=1
+env	DM_OPMODE=1
+env	DM_FPS_TARGET=60
+env	DM_FPS_HOLD=off
+env	DM_VK_ENCODE_THREAD=1
+env	DM_VK_TAIL_DRAWS=256
+env	DM_PIN_REPLAY=prime
+env	DM_VK_GUEST_NOTIFY=1
+env	DM_VK_DEFER_PARTS=1
+env	DM_VK_CMP_CONSTANT=1
+env	DM_VK_DESCRIPTOR_BUFFER=1
