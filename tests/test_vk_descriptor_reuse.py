@@ -25,7 +25,11 @@ class DescriptorAllocationReuse(unittest.TestCase):
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
         source = (ROOT / 'nxnative/dm/android/gfx_vk_core.c').read_text(encoding='utf-8')
+        header = (ROOT / 'nxnative/dm/android/gfx_vk.h').read_text(encoding='utf-8')
+        start = header.index('typedef struct {\n    int end_error')
+        state = header[start:header.index('int vk_encode_deferred_parts(void);', start)]
         types = source[source.index('typedef struct { VkBuffer b; VkDeviceMemory m; uint8_t *p; VkDeviceSize size, used; } scratch_blk;'):source.index('static vksub_t g_slot[NSLOT];')]
+        types = state + types
         declarations = source[source.index('enum { DP_SETS = 4096 };'):source.index('void vk_dsl_register(')]
         implementation = declarations + '\n'.join(function(source, signature) for signature in (
             'static void descriptor_reuse_free(', 'static void descriptor_slot_recycle(',

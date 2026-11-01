@@ -25,7 +25,8 @@ class CompareSnapshot(unittest.TestCase):
         declaration = source[start:source.index('\n', start)]
         functions = []
         for signature in ('void vk_tex_written(', 'static void compare_drop(vkimg_t *im) {',
-                          'static VkDeviceSize compare_regions(', 'static int compare_make(', 'static void compare_refresh('):
+                          'static VkDeviceSize compare_regions(', 'static int compare_make(', 'static int compare_make_constant(',
+                          'static void compare_refresh(', 'static vkimg_t *compare_depth('):
             start = source.index(signature)
             functions.append(source[start:source.index('\n}', start) + 3])
         code = r'''
@@ -40,6 +41,7 @@ typedef struct vkimg vkimg_t;
 ''' + image + '\n' + declaration + r'''
 static struct { VkDevice dev; } V;
 static uint64_t g_tex_gen=1,g_vk_image_gen,g_compare_copies,g_compare_bytes,g_compare_hits;
+static uint64_t g_const_compare_created,g_const_compare_reads,g_const_compare_clears;
 static unsigned fail,types,images,buffers,memories,suballocate,restarts,barriers,recorded;
 static char events[32];
 static vkimg_t *current;
@@ -77,6 +79,11 @@ static void vk_end_pass_land(void){event('E');}
 static VkCommandBuffer vk_cmd(void){return H(VkCommandBuffer,1);}
 static void vk_tex_prepare(VkCommandBuffer cb,vkimg_t *im){assert(cb&&im);event(im==current?'S':'D');im->layout=VK_IMAGE_LAYOUT_GENERAL;}
 static void vk_img_barrier_all(VkCommandBuffer cb){assert(cb);barriers++;event('B');}
+static void vkCmdClearDepthStencilImage(VkCommandBuffer cb,VkImage image,VkImageLayout layout,const VkClearDepthStencilValue *value,uint32_t count,const VkImageSubresourceRange *range){
+    assert(cb&&image==current->compare->depth.img&&layout==VK_IMAGE_LAYOUT_GENERAL&&count==1);
+    assert(value->depth==0&&value->stencil==0&&range->aspectMask==VK_IMAGE_ASPECT_DEPTH_BIT);
+    assert(range->baseMipLevel==0&&range->levelCount==3&&range->baseArrayLayer==0&&range->layerCount==3);event('Z');
+}
 static void check_regions(uint32_t n,const VkBufferImageCopy *r,VkImageAspectFlags aspect){
     assert(n==3);const VkDeviceSize offsets[]={0,464,556};const unsigned widths[]={11,5,2},heights[]={7,3,1};
     for(unsigned i=0;i<n;i++)assert(r[i].bufferOffset==offsets[i]&&!r[i].bufferRowLength&&!r[i].bufferImageHeight&&
@@ -115,6 +122,23 @@ int main(void){
     recorded=barriers=0;events[0]=0;compare_refresh(&im);assert(im.compare->valid&&g_compare_copies==2&&g_compare_bytes==1136&&g_vk_image_gen==2);
     assert(im.img==original_image&&im.compare->depth.img==depth_image&&im.compare->buffer==original_bridge);
     vk_tex_written(NULL);compare_drop(&im);assert(!im.compare&&!images&&!buffers&&!memories);
+    // Constant comparison preserves shape and initializes all subresources
+    // without copying source contents or allocating an intermediate buffer.
+    for(suballocate=0;suballocate<2;suballocate++)for(fail=1;fail<=4;fail++){
+        types=0;assert(!compare_make_constant(&im,VK_FORMAT_D16_UNORM,2));assert(!im.compare&&!images&&!buffers&&!memories);
+    }
+    suballocate=0;fail=0;types=0;recorded=barriers=0;events[0]=0;
+    vkimg_t *constant=compare_depth(&im,VK_FORMAT_D16_UNORM,2,1);
+    assert(constant==&im.compare->depth&&im.compare->constant_only&&images==1&&!buffers&&memories==1);
+    assert(!strcmp(events,"EDBZB")&&g_const_compare_created==1&&g_const_compare_reads==1&&g_const_compare_clears==1);
+    assert(g_compare_copies==2);recorded_before=recorded;
+    assert(compare_depth(&im,VK_FORMAT_D16_UNORM,2,1)==constant&&recorded==recorded_before&&g_const_compare_clears==1);
+    // A later content-dependent comparison replaces the surrogate before use.
+    types=0;recorded=barriers=0;events[0]=0;
+    assert(compare_depth(&im,VK_FORMAT_D16_UNORM,2,0)==&im.compare->depth);
+    assert(!im.compare->constant_only&&im.compare->valid&&images==1&&buffers==1&&memories==2);
+    assert(!strcmp(events,"ESDBIBCBT")&&g_compare_copies==3&&g_const_compare_reads==2);
+    compare_drop(&im);assert(!im.compare&&!images&&!buffers&&!memories);
     return 0;
 }
 '''

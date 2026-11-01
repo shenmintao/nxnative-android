@@ -30,15 +30,18 @@ class SamplerLod(unittest.TestCase):
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
+#include <pthread.h>
+#include "nvn_hmap.h"
 static struct { VkDevice dev; float max_aniso; int has_custom_border; } V;
 static VkSamplerCreateInfo captured;
+static uintptr_t next_sampler;
 static VkResult record_sampler(VkDevice device, const VkSamplerCreateInfo *info,
                               const VkAllocationCallbacks *allocator, VkSampler *sampler) {
     (void)device; (void)allocator;
     // The original positive guest minimum exceeded the non-mipmapped maximum.
     assert(info->minLod <= info->maxLod);
     captured = *info;
-    *sampler = (VkSampler)(uintptr_t)1;
+    *sampler = (VkSampler)++next_sampler;
     return VK_SUCCESS;
 }
 #define vkCreateSampler record_sampler
@@ -73,6 +76,13 @@ int main(void) {
                         assert(captured.maxLod == p.lod_max);
                     }
                 }
+    assert(!vk_samp_compare_constant(VK_NULL_HANDLE));
+    for (unsigned mode=0;mode<2;mode++)for(unsigned function=1;function<=8;function++) {
+        samp_par p={0};p.cmp_mode=(uint8_t)mode;p.cmp_func=(uint8_t)function;p.aniso=1.0f;
+        VkSampler sampler=make_sampler(&p);
+        assert(vk_samp_compare_constant(sampler)==(mode==1&&(function==1||function==8)));
+    }
+    assert(!vk_samp_compare_constant((VkSampler)(uintptr_t)0xdeadbeef));
     return 0;
 }
 '''
@@ -82,7 +92,7 @@ int main(void) {
             exe = path / 'sampler.exe'
             c.write_text(prefix + params + '\n' + functions + suffix, encoding='utf8')
             subprocess.run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
-                            '-Wno-missing-field-initializers', '-idirafter', str(headers),
+                            '-Wno-missing-field-initializers', '-pthread', '-I', str(DM / 'gfx/nvn'), '-idirafter', str(headers),
                             str(c), '-o', str(exe)], check=True)
             result = subprocess.run([str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
