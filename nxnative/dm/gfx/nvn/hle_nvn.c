@@ -11,6 +11,13 @@
 #include "../../host/hle.h"
 #include "nvn_protos.h"
 #include "nvn_count.h"
+#if DM_ANDROID
+#include "../../android/sync_trace.h"
+#else
+#define DM_SYNC_SCOPE(...) ((void)0)
+#define DM_SYNC_FENCE_SCOPE(...) ((void)0)
+#define dm_sync_pair_point(...) ((void)0)
+#endif
 #include "nvn_tex.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
@@ -668,6 +675,7 @@ NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddres
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
+    DM_SYNC_FENCE_SCOPE(o->fenced == 2 ? "fence: NVN acquire wait" : o->fenced ? "fence: NVN explicit wait" : "fence: NVN unassigned wait", o->fenced ? o->fence : 0);
     if (!o->fenced) { SEQ("syncwait %p unfenced", (void *)s); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
     if (nvn_fence_wait(o->fence, 0)) { SEQ("syncwait %p kind %u already", (void *)s, o->fenced); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = now_ns(); int r = nvn_fence_wait(o->fence, timeout);
@@ -1208,6 +1216,7 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h);
 static uint64_t present_now(const tex_t *tex, double period, const int crop[4]) {
     pthread_mutex_lock(&g_sub_mu);
     uint64_t ticket = mtl_present(tex, period, crop);
+    dm_sync_pair_point("frame: NVN present", ticket, g_frame);
     pthread_mutex_unlock(&g_sub_mu);
     return ticket;
 }
@@ -1308,6 +1317,7 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
     submit_now(q, n, h);
 }
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
+    DM_SYNC_SCOPE("sync: NVN submit");
     SEQ("submit %d handles", n);
     gfx_enter();
     pthread_mutex_lock(&g_sub_mu);

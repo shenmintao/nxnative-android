@@ -3,6 +3,7 @@
 // presented with FIFO (vsync) pacing. Headless (dmhost from adb shell): frames are counted, and DM_VK_SHOT=n1,n2,... writes those presented frames as PPM files to
 // DM_VK_SHOT_DIR (default DM_ROOT), which is how a run without a screen is checked.
 #include "gfx_vk.h"
+#include "sync_trace.h"
 #include <android/native_window.h>
 #include <string.h>
 #include <math.h>
@@ -29,9 +30,11 @@ static void present_time_begin(uint64_t ticket, uint64_t ns) {
     pthread_mutex_unlock(&g_pres_mu);
 }
 static void present_time_map(uint32_t id, uint64_t ticket) {
+    dm_sync_pair_point("frame: map present", id, ticket);
     pthread_mutex_lock(&g_pres_mu); vk_present_map(&g_present_history, id, ticket); pthread_mutex_unlock(&g_pres_mu);
 }
 static void present_time_record(uint32_t id, uint64_t ns) {
+    dm_sync_pair_point("frame: actual present", id, ns);
     pthread_mutex_lock(&g_pres_mu); g_pres_recorded += vk_present_record(&g_present_history, id, ns); pthread_mutex_unlock(&g_pres_mu);
 }
 static void present_time_reset(void) {
@@ -594,6 +597,7 @@ static uint64_t pace_desired(double period, int buffered) {   // the frame's des
     return t - g_refresh_ns / 2;
 }
 static void present_window(vkimg_t *im, const int crop[4], double period, uint64_t ticket) {   // period: the game's frame period (s); < 0 for a redraw (ticket 0)
+    DM_SYNC_FENCE_SCOPE("frame: present window", ticket);
     uint64_t cpu[8] = {0}; if (g_pres_probe_on > 0) cpu[0] = mono_ns();
     uint32_t k = g_pi++ % 8;
     vkWaitForFences(V.dev, 1, &g_pfence[k], 1, UINT64_MAX);
@@ -657,7 +661,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkPresentTimesInfoGOOGLE pti = {VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, NULL, 1, &ptm};
     if (V.has_dtiming) pi.pNext = &pti;
     if (g_pres_probe_on > 0) cpu[6] = mono_ns();
-    r = vkQueuePresentKHR(V.q, &pi);
+    { DM_SYNC_FENCE_SCOPE("frame: queue present", ticket); r = vkQueuePresentKHR(V.q, &pi); }
     if (g_pres_probe_on > 0) cpu[7] = mono_ns();
     if (V.has_dtiming && r >= 0) present_time_map(ptm.presentID, ticket);
     if (r < 0 && ticket) { pthread_mutex_lock(&g_pres_mu); vk_present_discard(&g_present_history, ticket); pthread_mutex_unlock(&g_pres_mu); }
@@ -757,6 +761,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     static ANativeWindow *rate_win; static double rate_period;
     if (g_win && (g_win != rate_win || period != rate_period)) { rate_win = g_win; rate_period = period; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
     uint64_t n = ++g_presents;
+    dm_sync_counter("sync: game present", (long long)n);
     // without display times (no VK_GOOGLE_display_timing, no window, or none came back) the hand-over time stands in, as before: the governor's late check needs readings
     { int disp = V.has_dtiming && dm_front_window() && (n <= 240 || g_pres_recorded); struct timespec ts; if (!disp) clock_gettime(CLOCK_MONOTONIC, &ts);
       present_time_begin(n, disp ? 0 : (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec); }

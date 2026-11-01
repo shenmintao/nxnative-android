@@ -132,7 +132,9 @@ int main(void) {
         with tempfile.TemporaryDirectory(prefix='nvn-resource-lock-') as temp:
             for name, variant in [('production', helpers), ('old-sync-bypass', old_lock)]:
                 path, exe = Path(temp) / (name + '.c'), Path(temp) / name
-                path.write_text(prefix + variant + suffix, encoding='utf-8')
+                trace_header = (ROOT / 'nxnative/dm/android/sync_trace.h').as_posix()
+                path.write_text('#include "' + trace_header + '"\n' + prefix + variant + suffix,
+                                encoding='utf-8')
                 built = subprocess.run([cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
                                         '-pthread', str(path), '-o', str(exe)],
                                        capture_output=True, text=True)

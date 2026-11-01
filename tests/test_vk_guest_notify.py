@@ -68,7 +68,8 @@ class GuestNotification(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='vk-guest-notify-') as temp:
             for label, selected_state, selected_retire, selected_guest, negative in variants:
                 with self.subTest(variant=label):
-                    code = prefix + '\n'.join((selected_state, selected_retire, wait, selected_guest, done)) + suffix
+                    trace = '#include "' + str(ROOT / 'nxnative/dm/android/sync_trace.h').replace('\\', '/') + '"\n'
+                    code = trace + prefix + '\n'.join((selected_state, selected_retire, wait, selected_guest, done)) + suffix
                     executable = self.build(Path(temp), label, code)
                     failures = 0
                     for flag, enabled in ((None, 0), ('0', 0), ('1', 1)):

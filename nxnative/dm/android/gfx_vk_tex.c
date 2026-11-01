@@ -5,6 +5,7 @@
 //   dirty-page tracker saw a write to its pages. Other textures retain GPU ownership after their first use; initial pool content that the CPU published is uploaded once.
 //   Version 1 keeps every image in VK_IMAGE_LAYOUT_GENERAL after its first use, ordered by whole-pipeline barriers.
 #include "gfx_vk.h"
+#include "sync_trace.h"
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
@@ -239,6 +240,7 @@ static int pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracke
 // This is a one-time upload, without dirty-page tracking: later GPU writes stay.
 int nvn_flushed(const void *p, uint64_t n);
 static int initial_content(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+    DM_SYNC_SCOPE("work: initial texture content");
     if (im->layout != VK_IMAGE_LAYOUT_UNDEFINED || im->gpu_w || !t->mem || !t->pool || !t->pool->mem || t->has_layout) return 0;
     if (im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_COMPRESSIBLE | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ||

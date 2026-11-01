@@ -58,7 +58,7 @@ static void env_set(const char *name,const char *value) {
         preamble += header[start:header.index('int vk_encode_deferred_parts(void);', start)]
         preamble += '\npthread_mutex_t g_vk_queue_mu = PTHREAD_MUTEX_INITIALIZER;\n'
         preamble += '\n'.join(f'PFN_{name} {name};' for name in sorted(hooks)) + '\n'
-        code = preamble + source.replace('#include "gfx_vk.h"', '')
+        code = preamble + source.replace('#include "gfx_vk.h"', '').replace('#include "sync_trace.h"', '#include "' + str(ROOT / 'nxnative/dm/android/sync_trace.h').replace('\\', '/') + '"')
         code += (ROOT / 'tests/native/vk_encode.c').read_text(encoding='utf8')
         with tempfile.TemporaryDirectory(prefix='vk-encode-') as temp:
             path, exe = Path(temp) / 'encode.c', Path(temp) / 'encode'

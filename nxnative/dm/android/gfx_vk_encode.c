@@ -2,6 +2,7 @@
 // on the replay thread; only driver calls with owned argument snapshots move.
 // DM_VK_ENCODE_THREAD=1 is experimental. Other threads keep their direct calls.
 #include "gfx_vk.h"
+#include "sync_trace.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -104,6 +105,7 @@ static void vke_publish(void) {
     pthread_cond_signal(&g_vke_work); pthread_mutex_unlock(&g_vke_mu);
 }
 static vke_block *vke_take(void) {
+    DM_SYNC_SCOPE("sync: encoder handoff");
     pthread_mutex_lock(&g_vke_mu);
     while (!g_vke_free) { g_vke_stats.backpressure++; pthread_cond_wait(&g_vke_idle, &g_vke_mu); }
     vke_block *b = g_vke_free; g_vke_free = b->next;
@@ -133,6 +135,7 @@ static void *vke_pack(unsigned char **at, const void *source, size_t count, size
 }
 void vk_encode_drain(void) {
     if (!g_vke_owner || (!g_vke_current && !atomic_load_explicit(&g_vke_outstanding, memory_order_acquire))) return;
+    DM_SYNC_SCOPE("sync: encoder drain");
     uint64_t begin = vke_now(); vke_publish();
     pthread_mutex_lock(&g_vke_mu);
     while (atomic_load_explicit(&g_vke_outstanding, memory_order_acquire)) pthread_cond_wait(&g_vke_idle, &g_vke_mu);
@@ -699,6 +702,7 @@ typedef struct {
     vk_deferred_part_state *state; // persistent slot; producer reads after drain
 } vke_deferred_part_args;
 static void vke_run_deferred_part(const void *payload) {
+    DM_SYNC_SCOPE("work: deferred part end and submit");
     const vke_deferred_part_args *a = payload;
     vk_deferred_part_state *s = a->state;
     VkResult result = real_vkEndCommandBuffer(a->main);

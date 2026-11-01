@@ -8,6 +8,7 @@
 //   (event writes, counter reports), as nvn_mtl.m does in its completion handler.
 #define _GNU_SOURCE
 #include "gfx_vk.h"
+#include "sync_trace.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
 #include "copy_queue.h"
@@ -214,6 +215,7 @@ void vk_init(void) {
     vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
     vk_db_init();
     vk_encode_init();
+    dm_sync_vulkan_install();
     VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     char path[1024]; const char *root = getenv("DM_ROOT"); void *data = NULL; size_t dn = 0;
     if (root && !getenv("DM_VK_NOPCACHE")) { snprintf(path, sizeof path, "%s/vk_pipeline_cache.bin", root); FILE *f = fopen(path, "rb");   // DM_VK_NOPCACHE=1: start empty
@@ -695,6 +697,7 @@ static void completion_notify_guest(uint64_t fence) {
     if (!guest_notify_enabled()) return;
     pthread_mutex_lock(&g_guest_done_mu);
     if (fence > g_guest_done) g_guest_done = fence;
+    dm_sync_fence_point("fence: guest visible", fence);
     pthread_cond_broadcast(&g_guest_done_cv);
     pthread_mutex_unlock(&g_guest_done_mu);
 }
@@ -730,6 +733,7 @@ static void slots_init(void) {
 uint64_t vk_fence_done(void) { return __atomic_load_n(&g_done, __ATOMIC_ACQUIRE); }   // written under g_done_mu (for the waiters) with a release store
 static void wait_fence(uint64_t f) {
     if (!f) return;
+    DM_SYNC_FENCE_SCOPE("fence: GPU wait", f);
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &g_timeline, &f};
     vkWaitSemaphores(V.dev, &wi, UINT64_MAX);
 }
@@ -1068,7 +1072,7 @@ static void sub_begin(int continuation) {
     if (continuation) vk_exec_continue(); else vk_exec_reset();
     if (g_segment_q) s->cpu_ready = ucopy_now();
 }
-void mtl_sub_begin(void) { sub_begin(0); }
+void mtl_sub_begin(void) { DM_SYNC_SCOPE("sync: sub begin"); sub_begin(0); }
 void vk_sub_restart(void) { (void)mtl_sub_commit(); sub_begin(1); }
 void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, -1}); }
 void mtl_sub_counter(uint64_t addr, uint32_t type) {
@@ -1269,6 +1273,7 @@ double vk_gpu_ms_recent(void) {   // the latest finished frame's GPU time among 
 }
 // Internal completion protects command-pool host access and slot reuse.
 static void completion_retire(cpend *c) {
+    DM_SYNC_FENCE_SCOPE("fence: retire", c->fence);
     if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];
         if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
     pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
@@ -1280,6 +1285,7 @@ static void *completion_main(void *a) {
         while (!g_ch) pthread_cond_wait(&g_ccv, &g_cmu);
         cpend *c = g_ch; pthread_mutex_unlock(&g_cmu);
         wait_fence(c->fence);
+        { DM_SYNC_FENCE_SCOPE("fence: CPU effects", c->fence);
         uint64_t segment_ticks[MAIN_CBS * 4]; unsigned segment_count = 0;
         if (g_shadow_pools && c->rslot >= 0) pools_copy_back(&g_slot[c->rslot]);
         if (g_tsq && c->slot >= 0) { uint64_t t[2]; if (vkGetQueryPoolResults(V.dev, g_tsq, 2 * (uint32_t)c->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -1334,6 +1340,7 @@ static void *completion_main(void *a) {
         }
         // All guest-visible effects above are complete. Internal retirement stays later.
         completion_notify_guest(c->fence);
+        }
         pthread_mutex_lock(&g_cmu); g_ch = c->next; if (!g_ch) g_ct = NULL; pthread_mutex_unlock(&g_cmu);
         completion_retire(c);
         free(c->pmeta); free(c->ops); free(c);
@@ -1342,6 +1349,7 @@ static void *completion_main(void *a) {
 }
 static void completion_start(void) { pthread_t t; if (pthread_create(&t, NULL, completion_main, NULL)) die("[vk] completion thread"); pthread_detach(t); }
 uint64_t mtl_sub_commit(void) {
+    DM_SYNC_SCOPE("sync: sub commit");
     vksub_t *s = cur();
     vk_end_pass_land();
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
@@ -1370,9 +1378,12 @@ uint64_t mtl_sub_commit(void) {
     VkTimelineSemaphoreSubmitInfo ts = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, NULL, 0, NULL, 1, &f};
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, &ts, 0, NULL, NULL, ncb, cbs, 1, &g_timeline};
     ucopy_drain();   // no GPU read may see an unfinished shadow
-    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu);
+    struct timespec t0, t1; VkResult r;
+    { DM_SYNC_FENCE_SCOPE("fence: final submit", f);
+    clock_gettime(CLOCK_MONOTONIC, &t0); pthread_mutex_lock(&g_vk_queue_mu);
     if (g_segment_q && !s->cpu_first) s->cpu_first = ucopy_now();
-    VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    }
     if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
     if (g_segment_q && s->cpu_begin && s->cpu_ready >= s->cpu_begin && s->cpu_first >= s->cpu_ready) {
         uint64_t end = (uint64_t)t1.tv_sec * 1000000000ull + (uint64_t)t1.tv_nsec;
@@ -1387,6 +1398,7 @@ uint64_t mtl_sub_commit(void) {
     }
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
+    dm_sync_pair_point("frame: submit", f, c->frame);
     c->nsegments = s->nmain_used;
     c->nup_segments = s->nup_used - 1 + (s->up_used != 0);
     c->npass = g_npass[g_cur];
@@ -1404,6 +1416,7 @@ uint64_t mtl_sub_commit(void) {
 }
 uint64_t mtl_last_fence(void) { return g_fence; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
+    DM_SYNC_FENCE_SCOPE(timeout_ns ? "fence: host wait" : "fence: host poll", fence);
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600ull * 1000000000ull ? 3600ull * 1000000000ull : timeout_ns);
     dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
@@ -1415,6 +1428,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
 // NVN SyncWait only needs its submitted work and CPU-visible effects complete.
 // Backend drain/readback/slot reuse retain mtl_wait's stronger retirement boundary.
 int vk_guest_wait(uint64_t fence, uint64_t timeout_ns) {
+    DM_SYNC_FENCE_SCOPE(timeout_ns ? "fence: guest wait" : "fence: guest poll", fence);
     if (!guest_notify_enabled()) return mtl_wait(fence, timeout_ns);
     atomic_fetch_add_explicit(&g_guest_wait_calls, 1, memory_order_relaxed);
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);

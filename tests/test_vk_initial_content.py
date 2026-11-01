@@ -31,6 +31,7 @@ class InitialTextureContent(unittest.TestCase):
         functions = '\n'.join(function(source, name) for name in ('linear_pitch', 'pkg_upload_', 'pkg_upload', 'initial_content'))
         code = (ROOT / 'tests/native/vk_initial_content.c').read_text(encoding='utf-8')
         code = code.replace('/* PRODUCTION_FUNCTIONS */', functions)
+        code = '#include "' + str(ROOT / 'nxnative/dm/android/sync_trace.h').replace('\\', '/') + '"\n' + code
         with tempfile.TemporaryDirectory(prefix='vk-initial-content-') as temp:
             path, exe = Path(temp) / 'initial.c', Path(temp) / 'initial'
             path.write_text(code, encoding='utf-8')

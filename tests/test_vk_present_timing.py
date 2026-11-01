@@ -22,6 +22,7 @@ class PresentTiming(unittest.TestCase):
 #include <stdint.h>
 #include <string.h>
 #include "present_history.h"
+#include "sync_trace.h"
 ''' + history + r'''
 int main(void) {
     assert(present_time_get(0) == 0);

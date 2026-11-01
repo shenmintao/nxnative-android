@@ -62,7 +62,8 @@ class DeferredSubmission(unittest.TestCase):
                         self.assertNotEqual((driver, backend), (internal, split), 'negative control did not change the source')
                     source = directory / (label + '.c')
                     executable = directory / (label + '.exe')
-                    source.write_text(prefix + state + support + driver + wrappers + fixture + backend + suffix, encoding='utf8')
+                    trace = '#include "' + str(ROOT / 'nxnative/dm/android/sync_trace.h').replace('\\', '/') + '"\n'
+                    source.write_text(trace + prefix + state + support + driver + wrappers + fixture + backend + suffix, encoding='utf8')
                     built = subprocess.run([cc, '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
                                             '-Wno-unused-function', '-Wno-unused-variable', '-Wno-unused-value',
                                             '-Wno-missing-field-initializers', '-idirafter', str(headers),
