@@ -661,9 +661,12 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
 // need an actual depth format for that operation. Preserve the original image
 // and copy its bits through a device buffer into a matching depth image. This
 // also works without maintenance8's colour/depth image-copy relaxation.
-struct vkcompare { vkimg_t depth; VkBuffer buffer; VkDeviceMemory memory; VkDeviceSize size; int valid; };
+struct vkcompare { vkimg_t depth; VkBuffer buffer; VkDeviceMemory memory; VkDeviceSize size; int valid, constant_only; };
 uint64_t g_compare_copies, g_compare_bytes, g_compare_hits, g_compare_failures;
+static uint64_t g_const_compare_created, g_const_compare_reads, g_const_compare_clears;
 static void compare_report(void) {
+    if (g_const_compare_reads) VKLOG("constant comparison depth (cumulative): %llu created, %llu reads, %llu clears",
+        (unsigned long long)g_const_compare_created, (unsigned long long)g_const_compare_reads, (unsigned long long)g_const_compare_clears);
     if (g_compare_copies || g_compare_failures) VKLOG("comparison snapshots at present %llu: %llu copies, %.2f MB copied, %llu reuse checks, %llu failures (cumulative)",
         (unsigned long long)g_tex_frame, (unsigned long long)g_compare_copies, g_compare_bytes / 1048576.0,
         (unsigned long long)g_compare_hits, (unsigned long long)g_compare_failures);
@@ -725,6 +728,27 @@ static int compare_make(vkimg_t *src, VkFormat format, unsigned bpp) {
 failed:
     src->compare = c; compare_drop(src); return 0;
 }
+static int compare_make_constant(vkimg_t *src, VkFormat format, unsigned bpp) {
+    VkBufferImageCopy regions[32]; VkDeviceSize bytes = compare_regions(src, bpp, regions);
+    if (!bytes) return 0;
+    struct vkcompare *c = calloc(1, sizeof *c); if (!c) return 0;
+    vkimg_t *d = &c->depth;
+    d->w = src->w; d->h = src->h; d->d = 1; d->levels = src->levels; d->layers = src->layers; d->samples = 1;
+    d->fmt = format; d->aspect = VK_IMAGE_ASPECT_DEPTH_BIT; d->vtype = src->vtype;
+    d->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    d->cflags = src->cflags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    VkImageType type = src->vtype == VK_IMAGE_VIEW_TYPE_1D || src->vtype == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? VK_IMAGE_TYPE_1D : VK_IMAGE_TYPE_2D;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, d->cflags, type, format,
+        {d->w, d->h, 1}, d->levels, d->layers, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, d->usage,
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(V.dev, &ci, NULL, &d->img)) goto failed;
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, d->img, &req);
+    uint32_t mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0); VkDeviceSize offset = 0;
+    if (mt == UINT32_MAX || !(d->mem = vk_image_memory(&req, mt, &offset, &d->sub)) || vkBindImageMemory(V.dev, d->img, d->mem, offset)) goto failed;
+    c->constant_only = 1; src->compare = c; g_const_compare_created++; return 1;
+failed:
+    src->compare = c; compare_drop(src); return 0;
+}
 static void compare_refresh(vkimg_t *src) {
     struct vkcompare *c = src->compare;
     if (c->valid) { g_compare_hits++; return; }
@@ -741,12 +765,35 @@ static void compare_refresh(vkimg_t *src) {
     vk_img_barrier_all(cb); c->valid = 1; g_compare_copies++; g_compare_bytes += c->size;
     vk_sub_restart(); g_vk_image_gen++;
 }
-VkImageView vk_tex_compare_view(const tex_t *t, const view_t *vw, int dim, int arrayed, vkimg_t **out) {
+
+// NEVER/ALWAYS still execute the original shader and sampler. A shape-identical
+// initialized depth image preserves size, layer and LOD queries without reading
+// or converting the source payload. A later content-dependent use must replace
+// this surrogate with an ordinary ordered snapshot.
+static vkimg_t *compare_depth(vkimg_t *src, VkFormat format, unsigned bpp, int constant) {
+    if (!constant && src->compare && src->compare->constant_only) compare_drop(src);
+    if (!src->compare && !(constant ? compare_make_constant(src, format, bpp) : compare_make(src, format, bpp))) return NULL;
+    struct vkcompare *c = src->compare; if (c->depth.fmt != format) return NULL;
+    if (!constant) compare_refresh(src);
+    else {
+        if (c->depth.layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+            vk_end_pass_land(); VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, &c->depth); vk_img_barrier_all(cb);
+            VkClearDepthStencilValue value = {0, 0};
+            VkImageSubresourceRange range = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, c->depth.levels, 0, c->depth.layers};
+            vkCmdClearDepthStencilImage(cb, c->depth.img, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+            vk_img_barrier_all(cb); g_const_compare_clears++;
+        }
+        g_const_compare_reads++;
+    }
+    return &c->depth;
+}
+
+VkImageView vk_tex_compare_view_mode(const tex_t *t, const view_t *vw, int dim, int arrayed, vkimg_t **out, int constant) {
     vkimg_t *src = NULL; VkImageView ordinary = vk_tex_view(t, vw, dim, arrayed, 0, &src);
     if (out) *out = src;
     if (!ordinary || !src || src->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return ordinary;
     VkFormat format = vk_view_fmt == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM :
-                      vk_view_fmt == VK_FORMAT_R32_SFLOAT && V.has_depth_range_unrestricted ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
+                      vk_view_fmt == VK_FORMAT_R32_SFLOAT && (constant || V.has_depth_range_unrestricted) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
     const vkfmt_t *base = vk_fmt(src->nvn_format);
     unsigned bpp = format == VK_FORMAT_D16_UNORM ? 2 : 4;
     if (!format || !base || base->compressed || base->bpb != bpp || src->d != 1 || src->samples != 1 || src->vtype == VK_IMAGE_VIEW_TYPE_3D) {
@@ -758,13 +805,11 @@ VkImageView vk_tex_compare_view(const tex_t *t, const view_t *vw, int dim, int a
     for (vview *v = nvn_hm_get(&g_views, &src); v; v = v->next) if (v->v == ordinary) { source = *v; break; }
     pthread_mutex_unlock(&g_view_mu);
     if (!source.v) return VK_NULL_HANDLE;
-    if (!src->compare && !compare_make(src, format, bpp)) {
+    vkimg_t *depth = compare_depth(src, format, bpp, constant);
+    if (!depth) {
         VKRED_ONCE(98, "comparison snapshot allocation failed: format %d %ux%u layers %u", format, src->w, src->h, src->layers);
         g_compare_failures++; return VK_NULL_HANDLE;
     }
-    if (src->compare->depth.fmt != format) return VK_NULL_HANDLE;
-    compare_refresh(src);
-    vkimg_t *depth = &src->compare->depth;
     pthread_mutex_lock(&g_view_mu);
     vview *head = nvn_hm_get(&g_views, &depth);
     for (vview *v = head; v; v = v->next) if (v->type == source.type && v->lv0 == source.lv0 && v->nlv == source.nlv &&
@@ -780,6 +825,10 @@ VkImageView vk_tex_compare_view(const tex_t *t, const view_t *vw, int dim, int a
     *v = source; v->v = view; v->fmt = format; v->aspect = VK_IMAGE_ASPECT_DEPTH_BIT; v->next = head;
     nvn_hm_put(&g_views, &depth, v); pthread_mutex_unlock(&g_view_mu);
     vk_view_fmt = format; return view;
+}
+
+VkImageView vk_tex_compare_view(const tex_t *t, const view_t *vw, int dim, int arrayed, vkimg_t **out) {
+    return vk_tex_compare_view_mode(t, vw, dim, arrayed, out, 0);
 }
 
 // ---------------- texture / sampler ID tables ----------------
@@ -830,6 +879,16 @@ static VkSamplerAddressMode wrap(int w) {
                  case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER; default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; }
 }
 static VkCompareOp cmp_op(int f) { return f >= 1 && f <= 8 ? (VkCompareOp)(f - 1) : VK_COMPARE_OP_ALWAYS; }   // NVN NEVER..ALWAYS = 1..8, Vulkan 0..7 in the same order
+
+static nvn_hmap g_sampler_constant = {.klen = sizeof(VkSampler)};
+static pthread_mutex_t g_sampler_constant_mu = PTHREAD_MUTEX_INITIALIZER;
+int vk_samp_compare_constant(VkSampler sampler) {
+    if (!sampler) return 0;
+    pthread_mutex_lock(&g_sampler_constant_mu);
+    int result = nvn_hm_get(&g_sampler_constant, &sampler) != NULL;
+    pthread_mutex_unlock(&g_sampler_constant_mu); return result;
+}
+
 static VkSampler make_sampler(const samp_par *p) {
     VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     VkSamplerReductionModeCreateInfo rd = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO, NULL, p->reduction == 1 ? VK_SAMPLER_REDUCTION_MODE_MIN : p->reduction == 2 ? VK_SAMPLER_REDUCTION_MODE_MAX : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE};
@@ -856,6 +915,11 @@ static VkSampler make_sampler(const samp_par *p) {
         }
     }
     VkSampler s; if (vkCreateSampler(V.dev, &ci, NULL, &s)) return VK_NULL_HANDLE;
+    if (ci.compareEnable && (ci.compareOp == VK_COMPARE_OP_NEVER || ci.compareOp == VK_COMPARE_OP_ALWAYS)) {
+        pthread_mutex_lock(&g_sampler_constant_mu);
+        nvn_hm_put(&g_sampler_constant, &s, (void *)(uintptr_t)1);
+        pthread_mutex_unlock(&g_sampler_constant_mu);
+    }
     return s;
 }
 void mtl_reg_samp(int sid, const samp_par *sp) {

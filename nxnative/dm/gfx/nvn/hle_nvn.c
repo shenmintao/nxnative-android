@@ -1252,12 +1252,20 @@ static int job_wait(uint64_t id, uint64_t timeout_ns) {
 // The fence a sync takes now: the last job queued, or the last commit when replay is synchronous
 static uint64_t nvn_fence_now(void) { return nvn_async() ? ASYNC_FENCE | g_job_enq : mtl_last_fence(); }
 // mtl_wait for a fence nvn_fence_now gave: first the job's replay, then its commit fence on the GPU (a job too old for the ring has long been replayed: the latest fence covers it)
+static int nvn_backend_fence_wait(uint64_t f, uint64_t timeout_ns) {
+#ifdef DM_ANDROID
+    int vk_guest_wait(uint64_t, uint64_t) __attribute__((weak));
+    return vk_guest_wait ? vk_guest_wait(f, timeout_ns) : mtl_wait(f, timeout_ns);
+#else
+    return mtl_wait(f, timeout_ns);
+#endif
+}
 static int nvn_fence_wait(uint64_t f, uint64_t timeout_ns) {
-    if (!(f & ASYNC_FENCE)) return mtl_wait(f, timeout_ns);
+    if (!(f & ASYNC_FENCE)) return nvn_backend_fence_wait(f, timeout_ns);
     uint64_t id = f & ~ASYNC_FENCE, t0 = now_ns();
     if (job_wait(id, timeout_ns) < 0) return 0;
     pthread_mutex_lock(&g_job_mu); uint64_t real = g_job_done - id < JOB_RING ? g_job_fence[id % JOB_RING] : mtl_last_fence(); pthread_mutex_unlock(&g_job_mu);
-    uint64_t used = now_ns() - t0; int r = mtl_wait(real, timeout_ns == ~0ull ? ~0ull : timeout_ns > used ? timeout_ns - used : 0);
+    uint64_t used = now_ns() - t0; int r = nvn_backend_fence_wait(real, timeout_ns == ~0ull ? ~0ull : timeout_ns > used ? timeout_ns - used : 0);
     if (r && timeout_ns && g_tl_end > g_tl_start && g_tl_enq) { uint64_t now = now_ns();   // the frame's timeline (see g_tl_enq)
         if (g_tl_wret && g_tl_enq > g_tl_wret) { g_tl_jobs += g_job_enq - g_tl_lastjob; g_tl_sum[0] += g_tl_enq - g_tl_wret; g_tl_sum[1] += g_tl_start - g_tl_enq; g_tl_sum[2] += g_tl_end - g_tl_start; g_tl_sum[3] += now - g_tl_end; g_tl_n++; }
         g_tl_wret = now; g_tl_lastjob = g_job_enq;

@@ -66,6 +66,11 @@ int g_vk_bind_cache = 1, g_vk_bind_verify;   // DM_VK_BIND_CACHE=0: A/B; DM_VK_C
 uint64_t g_pipe_hot_hits;
 static int32_t g_pass_bb[4];   // bounding box of the scissors the open pass's draws used (x0 y0 x1 y1)
 static int g_cb_draws;   // draws in the command buffer being recorded (vk_cmd_split after DM_VK_CB_DRAWS draws, 0 = never)
+static int g_tail_draws; // DM_VK_TAIL_DRAWS: after this submission has sent its first part
+static int draw_batch_limit(int head) {
+    if (head <= 0 || g_tail_draws <= 0 || !vk_sub_sent_early()) return head;
+    return g_tail_draws;
+}
 static int g_psplit, g_psplit_depth, g_psplit_now, g_ord_parts, g_setsplit;   // DM_VK_PASS_SPLIT / _DEPTH (prepare_draw); g_psplit_now: the pass being begun goes on with the one just ended (begin_pass cuts before it);
                                                                     // g_ord_parts: ordinary DM_VK_CB_DRAWS cuts in this submission, kept to the old 15 (MAIN_CBS was 16): the extra parts are for pass splits
 static int g_var_now;   // the bisection's change for the draw being recorded (see g_bis_var)
@@ -97,6 +102,7 @@ static int depth_clone_mode(void) {
     return mode > 2 ? 2 : mode > 0 ? mode : 0;
 }
 static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
+static int g_cmp_constant_on;
 static int g_x_nosetmemo, g_x_setverify;   // DM_VK_X_NOSETMEMO=1 (live, A/B): no per-stage set memo; DM_VK_X_SETVERIFY=1 (live): one memo hit in 64 checked (see stage_set)
 static int g_rd_touch = 1, g_x_rdkeep, g_x_nskipvs; static uint64_t g_x_skipvs[8];   // DM_VK_RD_TOUCH, DM_VK_X_RDKEEP, DM_VK_X_SKIPVS (see prepare_draw)
 static char g_x_tracesize[40], g_x_traceframe[40]; static int g_x_traceframe_on;
@@ -154,9 +160,12 @@ static void x_read(int continuation) { const char *c = getenv("DM_VK_CB_DRAWS");
     g_lrz_touch = !((e = getenv("DM_VK_LRZ_TOUCH")) && !atoi(e)); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_depth_clone = depth_clone_mode();
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 128;
+    g_tail_draws = (e = getenv("DM_VK_TAIL_DRAWS")) ? atoi(e) : 0;
+    if (g_tail_draws < 32 || g_tail_draws > 512) g_tail_draws = 0;
     g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e);
     g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) ? atoi(e) : -1;   // auto; 0 keeps depth passes whole, 1 forces the diagnostic path
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
+    g_cmp_constant_on = (e = getenv("DM_VK_CMP_CONSTANT")) && atoi(e);
     g_x_nskipvs = 0; for (const char *q = getenv("DM_VK_X_SKIPVS"); q && *q && g_x_nskipvs < 8;) { char *n; uint64_t v = strtoull(q, &n, 16); if (n == q) break; if (v) g_x_skipvs[g_x_nskipvs++] = v; q = *n ? n + 1 : n; } }
 // ---------------- conditional rendering (profile render_cond) ----------------
 // As nvn_mtl.m (OP_RENDER_COND): SetRenderEnableConditional draws while the 64-bit counters of the reports at addr and addr + 16 are equal / differ, until SetRenderEnable(true).
@@ -654,7 +663,7 @@ rebuild_views:;
     // depth written back (lrz_touch), the transfer write that made Adreno drop a stale LRZ for Xenoblade Chronicles 3 (DM_VK_LRZ_TOUCH=0 leaves it out)
     static uint64_t g_cuts; int cut_touch = 0;
     vkimg_t *dim = NULL; if (da.imageView) vk_tex_view(&S.rt_dep, S.rt_has_dview ? &S.rt_dview : NULL, 0xff, 0, 1, &dim);
-    if (psplit || (g_x_cbdraws > 0 && g_cb_draws >= g_x_cbdraws && (!dim || dim->depth_sub != g_set_epoch || g_x_cutany))) {   // (a pass split: prepare_draw checked the depth rule and the part budget)
+    if (psplit || (g_x_cbdraws > 0 && g_cb_draws >= draw_batch_limit(g_x_cbdraws) && (!dim || dim->depth_sub != g_set_epoch || g_x_cutany))) {   // (a pass split: prepare_draw checked the depth rule and the part budget)
         void vk_cmd_split(void); if (g_x_landcut) vk_ubd_land(vk_cmd());
         if (psplit) vk_cmd_split(); else if (g_ord_parts < 15) { vk_cmd_split(); g_ord_parts++; }   // ordinary cuts as before MAIN_CBS 32 (refused past 15; g_cuts still counts, as it did)
         g_cb_draws = 0; cb = vk_cmd(); g_cuts++;   // no pass is open here; deferred uniform updates stay deferred (draws read their shadows)
@@ -1013,6 +1022,7 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
     int tid = (int)(h & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL;
     int compare = !storage && use == VK_SAMPLE_COMPARE;
     ii->imageLayout = VK_IMAGE_LAYOUT_GENERAL; ii->sampler = storage ? VK_NULL_HANDLE : fixed_sampler ? fixed_sampler : samp_for(st, b, h, use); ii->imageView = VK_NULL_HANDLE;
+    if (compare && g_cmp_constant_on && vk_samp_compare_constant(ii->sampler)) compare = 2;
     unsigned ck = ((unsigned)tid * 2654435761u ^ (unsigned)b->dim * 97u ^ (unsigned)(b->flags & 1) ^ (unsigned)compare * 193u) % TVC;
     if (tid && g_var_now != 3 && !g_tracing && g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == g_tex_gen && g_tvc[ck].tid == tid && g_tvc[ck].dim == b->dim && g_tvc[ck].arr == (b->flags & 1) && g_tvc[ck].compare == compare) {
         ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) g_tvc[ck].im->last_use = mtl_last_fence() + 1;
@@ -1020,7 +1030,7 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
     }
     int num = 0;
     if (tid && g_var_now != 3 && vk_tex_by_id(tid, &v, &t) && t) {
-        vkimg_t *im = NULL; ii->imageView = compare ? vk_tex_compare_view(t, v, b->dim, b->flags & 1, &im) : vk_tex_view(t, v, b->dim, b->flags & 1, 0, &im);
+        vkimg_t *im = NULL; ii->imageView = compare ? vk_tex_compare_view_mode(t, v, b->dim, b->flags & 1, &im, compare == 2) : vk_tex_view(t, v, b->dim, b->flags & 1, 0, &im);
         if (storage && im) { im->gpu_w = 1; storage_image_note(st, im); }
         if (g_tracing) VKLOG("  texture handle %#llx id %d: %ux%u nvn format %#x target %d serial %llu pool %p+%#llx size %#llx → image %p (%ux%u fmt %d layers %u levels %u) view %p", (unsigned long long)h, tid, t->d.width, t->d.height, t->d.format, t->d.target,
                              (unsigned long long)t->serial, (const void *)t->pool, (unsigned long long)t->off, (unsigned long long)t->L.size, (void *)im, im ? im->w : 0, im ? im->h : 0, im ? im->fmt : 0, im ? im->layers : 0, im ? im->levels : 0, (void *)ii->imageView);
@@ -1088,7 +1098,7 @@ static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescrip
 // buffers are marked written), nor for a shader that reads handles or addresses from uniform buffer memory (that memory changes under the same bindings).
 // DM_VK_X_NOSETMEMO=1 (live): always collected. DM_VK_X_SETVERIFY=1 (live): one hit in 64 is collected anyway and compared, [RED] on a difference
 enum { MEMO_CB = 16 };
-typedef struct { vkshader_t *s; uint64_t epoch, bind, ubo, ubd, tex, samp, h, um, im; uint32_t pool, binst, dofs[96]; int ncb; uint8_t ci[MEMO_CB], cpos[MEMO_CB]; VkDescriptorBufferInfo cd[MEMO_CB]; VkDescriptorSet set; } set_memo_t;
+typedef struct { vkshader_t *s; uint64_t epoch, bind, ubo, ubd, tex, samp, h, um, im; uint32_t pool, binst, dofs[96]; int ncb, cmp_constant; uint8_t ci[MEMO_CB], cpos[MEMO_CB]; VkDescriptorBufferInfo cd[MEMO_CB]; VkDescriptorSet set; } set_memo_t;
 static set_memo_t g_smemo[3]; static uint64_t g_bind_gen[6], g_ubo_gen[6];   // a stage's handles or storage buffers changed (bind_handles_rec, OP_BIND_SSBO), its uniform buffers (OP_BIND_UBO)
 uint64_t g_set_memo, g_set_memo_bad;   // memo hits, and differences the verify mode found
 extern uint64_t g_ubd_gen; uint32_t vk_pool_gen(void);
@@ -1114,7 +1124,7 @@ static void db_memo_patch(int st, vkshader_t *s, set_memo_t *m) {
 }
 static int set_memo_get(int st, vkshader_t *s, uint32_t *dofs) {
     set_memo_t *m = &g_smemo[st];
-    if (m->s != s || m->epoch != g_set_epoch || m->bind != g_bind_gen[st] || m->tex != g_tex_gen || m->samp != __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE) || m->pool != vk_pool_gen() || m->binst != g_draw_binst) return 0;
+    if (m->cmp_constant != g_cmp_constant_on || m->s != s || m->epoch != g_set_epoch || m->bind != g_bind_gen[st] || m->tex != g_tex_gen || m->samp != __atomic_load_n(&g_samp_gen, __ATOMIC_ACQUIRE) || m->pool != vk_pool_gen() || m->binst != g_draw_binst) return 0;
     if (m->ubo != g_ubo_gen[st] || m->ubd != g_ubd_gen) {   // the constant buffers again: most draws move only their offsets
         if (V.descriptor_buffer) db_memo_patch(st, s, m);
         else for (int c = 0; c < m->ncb; c++) { VkDescriptorBufferInfo d; cbuf_desc(st, s, &s->b[m->ci[c]], &d);
@@ -1245,7 +1255,7 @@ static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
                             (unsigned long long)h, (unsigned long long)g_smemo[st].h, (unsigned long long)g_num_um, (unsigned long long)vum, (unsigned long long)g_num_im, (unsigned long long)vim, memcmp(vd, dofs, sizeof *dofs * (size_t)s->ndyn) ? "differ" : "same"); }
     if (memo) { set_memo_t *m = &g_smemo[st];   // (set_memo_ok: at most MEMO_CB constant buffers)
         m->s = s; m->epoch = g_set_epoch; m->bind = g_bind_gen[st]; m->ubo = g_ubo_gen[st]; m->ubd = g_ubd_gen; m->tex = gtex; m->samp = gsamp; m->pool = gpool; m->binst = g_draw_binst;
-        m->h = h; m->um = g_num_um; m->im = g_num_im; m->set = set; memcpy(m->dofs, dofs, sizeof *dofs * (size_t)s->ndyn); m->ncb = ncb; memcpy(m->ci, mci, (size_t)ncb); memcpy(m->cd, mcd, sizeof *mcd * (size_t)ncb);
+        m->cmp_constant = g_cmp_constant_on; m->h = h; m->um = g_num_um; m->im = g_num_im; m->set = set; memcpy(m->dofs, dofs, sizeof *dofs * (size_t)s->ndyn); m->ncb = ncb; memcpy(m->ci, mci, (size_t)ncb); memcpy(m->cd, mcd, sizeof *mcd * (size_t)ncb);
         for (int c = 0; c < ncb; c++) { m->cpos[c] = 0xff; for (int j = 0; j < nd; j++) if (dp[j].i == mci[c]) m->cpos[c] = (uint8_t)j; } }
     return set;
 }
@@ -1347,12 +1357,12 @@ static int prepare_draw(int prim, int indexed) {
     // write-back of a depth texel (lrz_touch) before the second part. The pipeline, dynamic state, sets and buffers are bound again (vk_end_pass, g_cmd_gen); deferred
     // uniform updates stay deferred (the draws read their shadows), as at any cut. Only while vk_cmd_split can still begin a part: otherwise the pass would be cut for nothing
     int depth_split_ok = !S.daspect || g_psplit_depth > 0 || (g_psplit_depth < 0 && S.pass_open == 1 && pass_split_depth_auto());
-    if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)g_psplit && !S.rast_discard && !g_tf_on && depth_split_ok) {
+    if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)draw_batch_limit(g_psplit) && !S.rast_discard && !g_tf_on && depth_split_ok) {
         // Reserve room for all remaining ordinary cuts. Additional pass cuts
         // must not exhaust slots that the old between-pass path could use.
         int vk_cmd_parts_left(void); if (vk_cmd_parts_left() > 15 - g_ord_parts) { { static int n; if (n++ < 3) VKLOG("pass split: pass %d (%ux%u) after %llu draws, depth %d", g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, S.dfmt); }
             vk_end_pass(); g_psplit_now = 1; } }
-    else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)g_psplit && S.daspect && !depth_split_ok) {
+    else if (g_psplit > 0 && S.pass_open == 1 && g_pass_draws == (uint64_t)draw_batch_limit(g_psplit) && S.daspect && !depth_split_ok) {
         static int n; if (n++ < 3) { const vkimg_t *im = P_att[8].im;
             VKLOG("pass split: pass %d (%ux%u) keeps depth format %d whole: image %ux%u, %u levels, %u layers (%u in view), %u samples, type %d, aspect %#x, usage %#x",
                 g_sub_pass - 1, S.pass_w, S.pass_h, S.dfmt, im ? im->w : 0, im ? im->h : 0, im ? im->levels : 0,

@@ -61,6 +61,21 @@ typedef struct {
 extern vkdev_t V;
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
 void vk_init(void);   // once, from mtl_init or the first use
+void vk_encode_init(void);
+void vk_encode_begin(void);
+void vk_encode_end(void);
+void vk_encode_drain(void);
+void vk_encode_report(void);
+// Internal backend operations: ordinary Vulkan PFNs keep synchronous results.
+// This state belongs to a persistent submission slot, until its final drain.
+typedef struct {
+    int end_error, last_sent;
+    uint64_t cpu_first;
+} vk_deferred_part_state;
+int vk_encode_deferred_parts(void);
+void vk_encode_begin_checked(VkCommandBuffer cb, const VkCommandBufferBeginInfo *info);
+void vk_encode_defer_part(VkQueue queue, VkCommandBuffer main, VkCommandBuffer up,
+                          int main_count, int stamp, vk_deferred_part_state *state);
 
 // ---- memory pools (gfx_vk_core.c): the guest's pool memory is GPU memory (AHardwareBuffer mapped over it) ----
 typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceMemory mem; void *ahb; int zero_copy; uint8_t *shadow; uint64_t serial, base, end; int flags, synced; uint64_t stamp, stamp0; const void *span; } vkpool_t;   // serial: unique per pool made (caches of views over a pool's buffer key on it); [base, end): the game's pool, of which [lo, hi) is one chunk (ZC_CHUNK); flags: the NVN pool's (vk_pool_set_flags); synced, stamp, stamp0, span: a copied pool's incremental sync
@@ -137,7 +152,9 @@ void vk_watch(const vkimg_t *im, const char *what);   // DM_VK_WATCH (gfx_vk_exe
 vkimg_t *vk_tex_by_id(int tid, const view_t **view_out, const tex_t **tex_out);   // registered texture ID → image (NULL if none)
 VkSampler vk_samp_by_id(int sid);
 VkSampler vk_samp_by_id_mode(int sid, int plain);
+int vk_samp_compare_constant(VkSampler sampler);
 VkImageView vk_tex_compare_view(const tex_t *t, const view_t *v, int dim, int arrayed, vkimg_t **out);
+VkImageView vk_tex_compare_view_mode(const tex_t *t, const view_t *v, int dim, int arrayed, vkimg_t **out, int constant);
 void vk_tex_written(vkimg_t *im);    // invalidate comparison snapshots after an ordered image write
 extern __thread VkFormat vk_view_fmt; extern __thread uint32_t vk_view_layers, vk_view_width, vk_view_height;   // metadata of the view vk_tex_view last returned on this thread
 extern __thread VkImageUsageFlags vk_view_usage; // the view's inherited usage, which an imageless framebuffer must match
@@ -186,6 +203,7 @@ VkBuffer vk_zero_buffer(void);
 void vk_exec_reset(void);   // per submission
 void vk_exec_continue(void);   // internal submission boundary: retain conditional-render state
 void vk_end_pass(void);     // close an open render pass
+int vk_sub_sent_early(void); // current physical submission has already sent work to the queue
 
 // ---- presentation (gfx_vk_present.c) ----
 void vk_present_init(void);

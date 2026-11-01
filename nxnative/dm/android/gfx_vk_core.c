@@ -74,6 +74,7 @@ void vk_init(void) {
     void *lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
     if (!lib) die("[vk] libvulkan.so: %s", dlerror());
     p_vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+    if (!p_vkGetInstanceProcAddr) die("[RED] [vk] driver has no vkGetInstanceProcAddr");
     vkCreateInstance = (PFN_vkCreateInstance)p_vkGetInstanceProcAddr(NULL, "vkCreateInstance");
     const char *iext[] = {"VK_KHR_surface", "VK_KHR_android_surface", "VK_EXT_debug_utils"};
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "dmhost", 1, "nxnative", 1, VK_API_VERSION_1_3};
@@ -212,6 +213,7 @@ void vk_init(void) {
     VK_DEV_FNS(VK_LOADD)
     vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
     vk_db_init();
+    vk_encode_init();
     VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     char path[1024]; const char *root = getenv("DM_ROOT"); void *data = NULL; size_t dn = 0;
     if (root && !getenv("DM_VK_NOPCACHE")) { snprintf(path, sizeof path, "%s/vk_pipeline_cache.bin", root); FILE *f = fopen(path, "rb");   // DM_VK_NOPCACHE=1: start empty
@@ -546,6 +548,7 @@ struct vksub {
     VkCommandPool pool; VkCommandBuffer up, main; int up_used;
     VkCommandBuffer mains[MAIN_CBS]; int nmain_alloc, nmain_used, cb_err;
     VkCommandBuffer ups[MAIN_CBS]; int nup_alloc, nup_used; int nmain_sent;   // upload command buffers in order (one per part sent early), main buffers already submitted   // the submission's main command buffers in order (vk_cmd_split); main = the one being recorded
+    vk_deferred_part_state deferred_part; int deferred_pending;
     uint64_t fence;   // the fence this slot last committed with (0 = never)
     uint64_t cpu_begin, cpu_ready, cpu_first;   // optional segment attribution, all CLOCK_MONOTONIC
     int ncq;          // timestamp counter queries used in this submission (g_cq)
@@ -677,8 +680,26 @@ static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_fence;   // fence of the last commit
 static VkSemaphore g_timeline;
 static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_done;
+static uint64_t g_done; // Retired: internal slots and resources still use this boundary.
+static pthread_mutex_t g_guest_done_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_guest_done_cv = PTHREAD_COND_INITIALIZER;
+static uint64_t g_guest_done; // GPU completion plus every CPU-visible post operation.
+static _Atomic uint64_t g_guest_wait_calls, g_guest_wait_ahead;
+static int guest_notify_enabled(void) {
+    static _Atomic int cached;
+    int v = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (!v) { const char *e = getenv("DM_VK_GUEST_NOTIFY"); v = e && atoi(e) > 0 ? 1 : 2; atomic_store_explicit(&cached, v, memory_order_relaxed); }
+    return v == 1;
+}
+static void completion_notify_guest(uint64_t fence) {
+    if (!guest_notify_enabled()) return;
+    pthread_mutex_lock(&g_guest_done_mu);
+    if (fence > g_guest_done) g_guest_done = fence;
+    pthread_cond_broadcast(&g_guest_done_cv);
+    pthread_mutex_unlock(&g_guest_done_mu);
+}
 static void slots_init(void) {
+    if (guest_notify_enabled()) VKLOG("guest fence visibility precedes command-buffer retirement (DM_VK_GUEST_NOTIFY)");
     VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
     VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti};
     VKCHK(vkCreateSemaphore(V.dev, &si, NULL, &g_timeline));
@@ -772,13 +793,43 @@ static vksub_t *cur(void) { if (g_cur < 0) die("[vk] no open submission"); retur
 int vk_sub_open(void) { return g_cur >= 0; }
 // A long submission is recorded into several command buffers, submitted together in order: Adreno's driver refuses a command buffer past some size at
 // vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY), which NEO's handheld frames reached at about the 712th draw. The caller has ended the render pass.
+// Producer-only bookkeeping. Worker results are observed only after its drain.
+static void split_advance_upload(vksub_t *s) {
+    if (s->up_used) {
+        if (s->nup_used == s->nup_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+            VKCHK(vkAllocateCommandBuffers(V.dev, &ai, &s->ups[s->nup_alloc])); s->nup_alloc++; }
+        s->up = s->ups[s->nup_used++]; s->up_used = 0;
+    }
+}
+static void split_collect(vksub_t *s) {
+    if (!s->deferred_pending) return;
+    vk_encode_drain();
+    s->cb_err |= s->deferred_part.end_error;
+    if (s->deferred_part.last_sent > s->nmain_sent) s->nmain_sent = s->deferred_part.last_sent;
+    if (!s->cpu_first) s->cpu_first = s->deferred_part.cpu_first;
+    s->deferred_pending = 0;
+}
+static int split_defer(vksub_t *s, int send) {
+    if (!send || s->cb_err || !vk_encode_deferred_parts()) return 0;
+    if (s->up_used) { vk_img_barrier_all(s->up); upload_segment_mark(s, 1); }
+    // This still precedes every GPU submit, including ones on the worker.
+    ucopy_drain();
+    vk_encode_defer_part(V.q, s->main, s->up_used ? s->up : VK_NULL_HANDLE,
+                         s->nmain_used, g_segment_q != VK_NULL_HANDLE, &s->deferred_part);
+    s->deferred_pending = 1;
+    split_advance_upload(s);
+    return 1;
+}
 void vk_cmd_split(void) {
     vksub_t *s = cur(); if (s->nmain_used == MAIN_CBS || s->nup_used == MAIN_CBS) return;
     segment_mark(s, 1);
+    const char *se = getenv("DM_VK_SUBMIT_SPLIT"); int send = !(se && !atoi(se));
+    if (split_defer(s, send)) goto next_main;
+    split_collect(s);
     if (vkEndCommandBuffer(s->main) < 0) { s->cb_err = 1; static int n; if (n++ < 3) VKLOG("[RED] a part of a long submission was refused at its end (part %d)", s->nmain_used); }
     // what is recorded so far goes to the GPU now, as a submission of its own (with its uploads first): Adreno refuses a single submission past about
     // 700 draws (NEO's handheld frames: VK_ERROR_OUT_OF_HOST_MEMORY at vkEndCommandBuffer whatever the draws were, and in one command buffer or several)
-    const char *se = getenv("DM_VK_SUBMIT_SPLIT"); int send = !(se && !atoi(se));   // on unless DM_VK_SUBMIT_SPLIT=0
+
     if (send && !s->cb_err) {
         VkCommandBuffer cbs[2]; uint32_t n = 0;
         if (s->up_used) { vk_img_barrier_all(s->up); upload_segment_mark(s, 1); if (vkEndCommandBuffer(s->up) < 0) s->cb_err = 1; cbs[n++] = s->up; }
@@ -792,26 +843,24 @@ void vk_cmd_split(void) {
             if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
             { static int n; if (n++ < 3) VKLOG("a long submission: part %d sent early", s->nmain_used); }
             s->nmain_sent = s->nmain_used;
-            if (s->up_used) {   // the next part records its uploads into a fresh upload buffer
-                if (s->nup_used == s->nup_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
-                    VKCHK(vkAllocateCommandBuffers(V.dev, &ai, &s->ups[s->nup_alloc])); s->nup_alloc++; }
-                s->up = s->ups[s->nup_used++]; s->up_used = 0;
-            }
+            split_advance_upload(s);
         }
     }
+next_main:
     if (s->nmain_used == s->nmain_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         VKCHK(vkAllocateCommandBuffers(V.dev, &ai, &s->mains[s->nmain_alloc])); s->nmain_alloc++; }
     s->main = s->mains[s->nmain_used++];
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vk_encode_begin_checked(s->main, &bi); g_cmd_gen++;
     segment_mark(s, 0);
 }   // outside a submission nothing may be recorded (present, a pool finalized between frames)
 VkCommandBuffer vk_cmd(void) { return cur()->main; }
 int vk_cmd_parts_left(void) { vksub_t *s = cur(); return MAIN_CBS - (s->nmain_used > s->nup_used ? s->nmain_used : s->nup_used); }   // parts vk_cmd_split can still begin (gfx_vk_exec.c pass splits)
+int vk_sub_sent_early(void) { return g_cur >= 0 && (g_slot[g_cur].nmain_sent > 0 || g_slot[g_cur].deferred_pending); }
 uint64_t g_up_gen;   // upload command buffers begun (gfx_vk_tex.c lin_copy: once per upload buffer)
 VkCommandBuffer vk_upload_cmd(void) {
     vksub_t *s = cur();
     if (!s->up_used) {
-        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHK(vkBeginCommandBuffer(s->up, &bi)); s->up_used = 1; g_up_gen++;
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vk_encode_begin_checked(s->up, &bi); s->up_used = 1; g_up_gen++;
         // Uploads execute before their main part. Their query pool must be
         // reset here, not by the first main buffer after the uploads ran.
         if (g_upload_segment_q && s->nup_used == 1) vkCmdResetQueryPool(s->up, g_upload_segment_q, (uint32_t)(g_cur * MAIN_CBS * 2), MAIN_CBS * 2);
@@ -999,11 +1048,13 @@ static void sub_begin(int continuation) {
     // for the one before to finish on the GPU, which kept the replay of a frame from overlapping the GPU work of the last)
     static int next; g_cur = next; next = (next + 1) % NSLOT; vksub_t *s = &g_slot[g_cur];
     slot_recycle(s);
+    vk_encode_begin();
     s->cpu_begin = cpu_begin; s->cpu_ready = s->cpu_first = 0;
     s->npost = 0; s->up_used = 0; s->writes.count = 0;
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->up = s->ups[0]; s->nup_used = 1; s->nmain_sent = 0;
-    VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++;
+    s->deferred_pending = 0; memset(&s->deferred_part, 0, sizeof s->deferred_part);
+    vk_encode_begin_checked(s->main, &bi); g_cmd_gen++;
     // copied pools: what the game wrote before submitting goes into the GPU copy before any part of the submission can reach the GPU (DM_VK_CB_DRAWS sends
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
     pthread_rwlock_rdlock(&g_pool_mu); int shadow = 0; for (int i = 0; i < g_npool; i++) shadow |= g_pool[i]->shadow != NULL; pthread_rwlock_unlock(&g_pool_mu);
@@ -1216,6 +1267,12 @@ double vk_gpu_ms_recent(void) {   // the latest finished frame's GPU time among 
     for (uint64_t k = 2; k < 8 && k <= f; k++) { double g = mtl_gpu_ms(f - k); if (g >= 0) return g; }
     return -1;
 }
+// Internal completion protects command-pool host access and slot reuse.
+static void completion_retire(cpend *c) {
+    if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];
+        if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
+    pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
+}
 static void *completion_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "dm-vk-complete");
     for (;;) {
@@ -1275,10 +1332,10 @@ static void *completion_main(void *a) {
             // render_cond: a timestamp report's counter field is 0, as on the GPU (gfx_vk_exec.c render_cond evaluates conditions on it)
             uint64_t rec[2] = {o->type == 0 || o->type == 0x10 ? (DM_GAME_RENDER_COND ? 0 : ts) : o->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (1u << 20) : 0, ts}; memcpy((void *)(uintptr_t)o->addr, rec, sizeof rec);
         }
+        // All guest-visible effects above are complete. Internal retirement stays later.
+        completion_notify_guest(c->fence);
         pthread_mutex_lock(&g_cmu); g_ch = c->next; if (!g_ch) g_ct = NULL; pthread_mutex_unlock(&g_cmu);
-        if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];   // its command buffers reset here (slot_recycle); the slot is not taken before g_done passes this fence
-            if (s->fence == c->fence) { for (int i = 0; i < s->nmain_alloc; i++) vkResetCommandBuffer(s->mains[i], 0); for (int i = 0; i < s->nup_alloc; i++) vkResetCommandBuffer(s->ups[i], 0); } }
-        pthread_mutex_lock(&g_done_mu); if (c->fence > g_done) __atomic_store_n(&g_done, c->fence, __ATOMIC_RELEASE); pthread_cond_broadcast(&g_done_cv); pthread_mutex_unlock(&g_done_mu);
+        completion_retire(c);
         free(c->pmeta); free(c->ops); free(c);
     }
     return NULL;
@@ -1289,7 +1346,7 @@ uint64_t mtl_sub_commit(void) {
     vk_end_pass_land();
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
     segment_mark(s, 1);
-    VkResult er = vkEndCommandBuffer(s->main); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkResult er = vkEndCommandBuffer(s->main); split_collect(s); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
     if (er < 0) {   // the driver refused something recorded in it: logged with what the submission held, then it is dropped and the game goes on
         extern uint32_t g_sub_ops[64]; char ops[600]; int o = 0;
         for (int i = 0; i < 64 && o < (int)sizeof ops - 16; i++) if (g_sub_ops[i]) o += snprintf(ops + o, sizeof ops - (size_t)o, " %d:%u", i, g_sub_ops[i]);
@@ -1301,7 +1358,7 @@ uint64_t mtl_sub_commit(void) {
             vkResetCommandPool(V.dev, s->pool, 0); VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
             s->main = s->mains[0]; s->nmain_used = 1; s->cb_err = 0; s->no_ts = 1;   // no timestamps: the slot's queries still hold an older submission's
             if (s->nup_used > 1) { s->up = s->ups[0]; s->nup_used = 1; }
-            VKCHK(vkBeginCommandBuffer(s->main, &bi)); g_cmd_gen++; s->up_used = 0; vk_ubd_land_drop();
+            vk_encode_begin_checked(s->main, &bi); g_cmd_gen++; s->up_used = 0; vk_ubd_land_drop();
             VKCHK(vkEndCommandBuffer(s->main));
         }
     }
@@ -1341,6 +1398,7 @@ uint64_t mtl_sub_commit(void) {
     if (s->npost) { c->ops = malloc(s->npost * sizeof *c->ops); memcpy(c->ops, s->post, s->npost * sizeof *c->ops); }
     pthread_mutex_lock(&g_cmu); if (g_ct) g_ct->next = c; else g_ch = c; g_ct = c; pthread_cond_signal(&g_ccv); pthread_mutex_unlock(&g_cmu);
     s->npost = 0; g_cur = -1;
+    vk_encode_end();
     pthread_mutex_unlock(&g_sub_lock);
     return f;
 }
@@ -1353,6 +1411,28 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     while (g_done < fence) if (pthread_cond_timedwait(&g_done_cv, &g_done_mu, &dl)) break;
     int ok = g_done >= fence; pthread_mutex_unlock(&g_done_mu);
     return ok;
+}
+// NVN SyncWait only needs its submitted work and CPU-visible effects complete.
+// Backend drain/readback/slot reuse retain mtl_wait's stronger retirement boundary.
+int vk_guest_wait(uint64_t fence, uint64_t timeout_ns) {
+    if (!guest_notify_enabled()) return mtl_wait(fence, timeout_ns);
+    atomic_fetch_add_explicit(&g_guest_wait_calls, 1, memory_order_relaxed);
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+    uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600ull * 1000000000ull ? 3600ull * 1000000000ull : timeout_ns);
+    dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
+    pthread_mutex_lock(&g_guest_done_mu);
+    while (g_guest_done < fence) if (pthread_cond_timedwait(&g_guest_done_cv, &g_guest_done_mu, &dl)) break;
+    int ok = g_guest_done >= fence; pthread_mutex_unlock(&g_guest_done_mu);
+    if (ok && fence > vk_fence_done()) atomic_fetch_add_explicit(&g_guest_wait_ahead, 1, memory_order_relaxed);
+    return ok;
+}
+void vk_guest_notify_report(void) {
+    if (!guest_notify_enabled()) return;
+    pthread_mutex_lock(&g_guest_done_mu); uint64_t visible = g_guest_done; pthread_mutex_unlock(&g_guest_done_mu);
+    VKLOG("guest fence notification (cumulative): visible %llu, retired %llu, %llu waits, %llu observations before retirement",
+          (unsigned long long)visible, (unsigned long long)vk_fence_done(),
+          (unsigned long long)atomic_load_explicit(&g_guest_wait_calls, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&g_guest_wait_ahead, memory_order_relaxed));
 }
 void mtl_finish(void) { mtl_wait(g_fence, ~0ull); }
 void mtl_drain(void) { mtl_finish(); vk_pipeline_cache_save(); }

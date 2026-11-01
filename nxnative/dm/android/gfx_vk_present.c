@@ -763,6 +763,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vkimg_t *im = vk_tex(t);
     static uint64_t no_img, undrawn, shown;
     if (n % 600 == 0) {
+        void vk_guest_notify_report(void); vk_guest_notify_report();
         extern struct { uint64_t draws, skip_prog, skip_rt, skip_pipe, passes, folded, dispatches, pipes_built, rt_kept, ns_exec, ns_desc, ns_pipe, max_pass_draws; } g_vkst; extern uint64_t g_ubd_landed, g_ubd_superseded, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_gpu_ns, g_pkg_n, g_pkg_bytes, g_pkg_ns, g_set_hits, g_set_new, g_ubd_racy, g_ns_set_build, g_ns_set_hash, g_ns_set_new, g_set_memo, g_set_memo_bad;
         static uint64_t psb, psh, psn, pe, pd, pp, ps, pb, pdr, pg, pkn, pkb, pkt, psm;
         VKLOG("replay up to present %llu: draws %llu, skipped (no program %llu, no target %llu, no pipeline %llu), passes %llu, clears folded %llu, dispatches %llu, pipelines %llu; presents shown %llu, no image %llu, never drawn %llu; uniform updates landed %llu (superseded %llu, shadows %llu, CPU reads racing a GPU write %llu), same targets kept %llu, most draws in one pass %llu",
@@ -787,6 +788,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
           VKLOG("color compatibility: %llu images widened, %llu failed promotions (cumulative)",
               (unsigned long long)g_color_promotions, (unsigned long long)g_color_promotion_failures); }
         void vk_segment_report(void); vk_segment_report();
+        vk_encode_report();
         { extern uint64_t g_pipe_hot_hits; VKLOG("binding fast paths: pipelines %llu reused", (unsigned long long)g_pipe_hot_hits); }
         { extern uint64_t g_snapshot_copies, g_snapshot_fallbacks, g_snapshot_wait_ns;
           VKLOG("present snapshots: %llu copied, %llu ordinary fallbacks, %.2f s capacity wait (cumulative)",
