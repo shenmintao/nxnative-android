@@ -26,6 +26,8 @@ Tested on **TB323FU, SM8850P / Adreno 840, Android 16, balanced mode**, using th
 
 The final package passed 150 unit tests, Vulkan validation with zero errors (three unused-output warnings), and a release save/load smoke test. The user waived the final 30-minute soak; it was **not run**. Full-game compatibility is unverified and a lower-leg ground-occlusion issue remains, so BotW stays **work in progress**. These results do not establish native internal 1080p or the performance of another device. [Acceptance and experiment record](docs/perf-plan-2.md).
 
+**Subsequent user-play regression (2026-11-02):** a different Great Plateau route still stutters. A 120 s diagnostic capture measured 58.004 fps, 33 intervals over 50 ms and 12 over 100 ms (maximum 241.680 ms). Surrounding runtime checkpoints show 388 additional graphics pipeline creations after startup prewarm; their per-frame cost has not yet been isolated. The short acceptance route does not cover this behavior. Release packaging/publication is held for investigation.
+
 ## Hardware compatibility
 
 The ARM64 runtime and generic lock rule are shared across SoCs. This fork's final BotW measurements are specific to SM8850P; upstream separately tested an Adreno 830 device. A Snapdragon 8 Elite / SM8750 needs its own performance check.
