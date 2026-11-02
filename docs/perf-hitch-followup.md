@@ -14,6 +14,7 @@ For a standalone review brief with version identities, raw-artifact locations an
 - The user explicitly waived OFF/ON/ON/OFF for this follow-up on 2026-11-02. Build on production 44a337e0, validate source checks, unchanged rendering/input and zero Vulkan errors, then run one bounded moving smoke in the owned seed. Record presentation metrics as observations only; performance gain remains unquantified. Do not restart comparative or long-running performance loops.
 - Finish with appropriate unit checks, zero Vulkan validation errors, release smoke, original preferences and unchanged primary saves. Implementation groups restore production APK 44a337e0; the completed release smoke promotes bcd840c1 below as the next production baseline. Future groups must restore the new baseline. Final 30-minute soak remains waived unless the user asks for it.
 - After rc2 packaging, the user requested one original-version measurement against the existing new-build observation. Run the retained pre-prefetch debug F416 (production equivalent 44a337e0), the same owned seed, driver/key cache, six-second route, balanced mode and 1080p output / stock internal DRS, 60 s warmup plus 120 s actual-present capture. Compare fps, >17.5 ms / >50 ms / >100 ms intervals, maximum interval, sampled main-pass size and thermal/cap observations. Restore production bcd840c1 and verify unchanged primary saves/preferences. This authorizes one baseline, not a restarted four-window loop; a single historical pair does not satisfy repeatability acceptance.
+- The user subsequently approves the proposed H1 diagnostic: one 120 s moving run after 60 s warmup using the same F416 APK/cache/seed/route as original run192400, with only `DM_VK_PACE=0` added. Compare consecutive >50 ms second gaps and their excess over16.667 ms, plus >100 ms count, compile-demand time, mean/p99, resolution and health. Supporting signature: material first compile stalls remain while second-gap count/excess falls at least50% from the original five /741.7 ms; without material first stalls the outcome is inconclusive. This is a diagnostic, not permission to ship pacing disabled or a repeated acceptance loop. Restore current bcd840c1, preferences and primary saves.
 
 ## Starting evidence
 
@@ -54,6 +55,27 @@ After packaging, the user requested one run of the pre-prefetch implementation. 
 | Maximum interval | 308.350416 ms | 200.010937 ms |
 
 The +0.200639 fps (+0.34%) difference is inside the ~1% noise floor. The p99 is unchanged; maximum interval and >100 ms count are lower, while >50 ms count is higher. This single historical pair provides no clear performance improvement and is not repeated acceptance. Original audio/PID/presentation gates pass with 127 latency matches and RED0. Current production bcd840c1, original preferences and primary saves were verified/restored; app stopped/display OFF. No additional comparison windows or code/default changes followed this requested measurement.
+
+## Approved H1 pacing-off diagnostic
+
+After the offline review, the user approved one120 s diagnostic. Run `20261102-211447-H1-pace-off-once` uses the exact F416 APK, cache inputs, owned seed and route from the original192400 run, with60 s warmup. After excluding private isolation paths, `DM_VK_PACE=0` is the only environment difference. Logs confirm pacing is disabled before the window.
+
+| Metric | Original pacing on | Diagnostic pacing off |
+|---|---:|---:|
+| Average fps | 58.934487 | 59.498442 |
+| Intervals >17.5 ms | 1.300537% | 8.695043% |
+| p99 interval | 25.001354 ms | 25.001458 ms |
+| Intervals >50 / >100 ms | 14 / 6 | 10 / 3 |
+| Maximum interval | 308.350416 ms | 158.342031 ms |
+| Consecutive second >50 ms gaps | 5 | 0 |
+| Second-gap excess above16.667 ms | 741.712292 ms | 0 ms |
+| Total >50 ms excess above16.667 ms | 1508.429376 ms | 733.382913 ms |
+| Timed graphics demand records / wall time | 51 / 945.985879 ms | 47 / 838.435050 ms |
+| Mean draws in periodic samples | 4450.417 | 4449.167 |
+
+Six demand clusters of at least50 ms remain in the off run; disappearance of the second gaps is not explained by the absence of first-use stalls. This meets the predeclared H1 diagnostic signature, supporting pacing amplification. It is one historical pair, with differing compile work and no deterministic game replay, rather than proof of a production fix or general FPS gain. The large increase in ordinary late intervals makes pacing-off unsuitable as the retained solution.
+
+Both sample internal1600x900 before/after, output1920x1080, prewarm1209, identical balanced CPU caps and CPU/GPU/skin severity0. Audio/PID/trace gates pass with126 latency crosschecks and RED0. `BENCH/H1-pace-off-comparison.json` retains the rows, pair intervals, compile-demand evidence and matching-condition checks; helpers are `pace_off_once.py` and `summarize_pace_off.py`. Current production bcd840c1, original preferences and primary saves are verified/restored, app stopped/display OFF. No runtime/default change is promoted. Next proposal: retain pacing while correcting the GPU-budget estimate, then validate with bounded injected stalls before route acceptance.
 
 ## Previous GPL experiment
 

@@ -10,6 +10,8 @@ Graphics-pipeline creation explains part of the observed stalls. We adapted upst
 
 The latest requested comparison is one old-version run against an earlier new-version observation. The new observation is only 0.201 fps higher, inside the approximately 1% run-to-run noise floor. Its >50 ms interval count is higher, while its maximum interval and >100 ms count are lower. Actual periodic draw counts differ, so this is not a deterministic workload comparison.
 
+A subsequent approved H1 diagnostic supports presentation-pacing amplification: with the same original F416 APK and only pacing disabled, second consecutive >50 ms gaps fall from5 to0 while substantial compile stalls remain. Ordinary late intervals worsen from1.30% to8.70%, so pacing-off is not retained. See the approved diagnostic below; the new prefetch mechanism still has no established performance benefit.
+
 This file requests analysis by another AI. It does not authorize further device runs, changes to defaults, another four-window loop, or publication of a stable release.
 
 ## 2. Exact scope and constraints
@@ -85,6 +87,12 @@ The user waived OFF/ON/ON/OFF, then requested only this one old-version measurem
 - Expanded diagnostic `20261102-154141-P2-wide-route-trace`: 59.186944 fps, 11 intervals >50 ms, four >100 ms, maximum 166.675938 ms. Timed attribution maps 7104/7104 presentation intervals to host frames and classifies graphics creation as primary in 6/11 long intervals. It records 42 runtime graphics-creation calls, zero compute-creation calls, 635.342 ms graphics-creation wall time in total, and a largest individual interval of 64.077 ms. Diagnostic attribution is evidence of a partial contributor, not a counterfactual proof or complete explanation.
 - Old plan 2 short-route results (fixed 59.895 fps, moving 59.830 fps, no >50 ms intervals) cover a different, simpler route. Do not use those numbers to declare this broader user-play problem resolved.
 
+### Subsequent approved H1 diagnostic: same APK, pacing off
+
+Run `20261102-211447-H1-pace-off-once` repeats the original192400 F416 setup with only `DM_VK_PACE=0` changed. Second consecutive >50 ms gaps fall5 ->0, their excess above16.667 ms falls741.712292 ->0 ms, >100 ms intervals6 ->3, maximum308.350416 ->158.342031 ms. Six demand clusters >=50 ms remain (47 graphics-demand records /838.435050 ms, versus51 /945.985879 ms). Total >50 ms excess falls1508.429376 ->733.382913 ms. This supports H1's repeated-reservation mechanism, with the limits of one historical pair and non-identical compile work.
+
+Ordinary cadence worsens: >17.5 ms intervals1.300537% ->8.695043%, while mean fps58.934487 ->59.498442 and p99 stays approximately25.001 ms. Pacing-off is diagnostic only. Resolution, caps, thermal levels and prewarm match; periodic mean draws4450.417 ->4449.167. Current production bcd840c1 and the original preferences/primary saves were verified/restored; no runtime/default change was made. The appropriate next candidate would retain pacing while resisting elapsed submission gaps in its GPU estimate, rather than disable pacing in production.
+
 ## 5. What is implemented, and known limitations
 
 Source was adapted from nxnative `c646d43d567fbd1b96777ff7f3bd6d9aabb1a36a` (`mtl_prog_prefetch`, pending builds, `pso_predict_rest`). The reviewed nx2android reference was `8e030b41`, already an ancestor of this branch. These were targeted upstream reviews, not a complete audit of all Metal features. A future fix should fetch and search the relevant upstream functions again before inventing a replacement.
@@ -146,6 +154,7 @@ C:\Users\shenmintao\Downloads\KUANYE.part1\publish\ROOM\01007EF00011E000_build\a
 |---|---|
 | `original-once-comparison.json` | Both CSV rows, matching-condition checks, deltas and comparison caveats |
 | `runs/20261102-192400-original-pre-prefetch-once/` | Requested original run |
+| `runs/20261102-211447-H1-pace-off-once/`, `H1-pace-off-comparison.json` | Approved pacing-off diagnostic, compared with the same original F416 APK |
 | `runs/20261102-182822-prefetch-moving-observation/` | Earlier new-build observation |
 | `runs/20261102-154141-P2-wide-route-trace/` | Earlier expanded-route diagnostic with component tracing |
 | `runs/20261102-151653-user-live-hitch/` | User's original manual-play diagnostic |
@@ -153,6 +162,7 @@ C:\Users\shenmintao\Downloads\KUANYE.part1\publish\ROOM\01007EF00011E000_build\a
 | `runs/20261102-190024-coverage/` | Current release isolated save/load and 30 s smoke |
 | `wide-route-attribution.log`, `attribute_late_frames.py` | Attribution invocation/results index and analysis implementation |
 | `compare_original_once.py`, `summarize_original_once.py` | The latest single original run and offline summary; the first script controls the device, do not import/run casually |
+| `pace_off_once.py`, `summarize_pace_off.py` | Approved H1 diagnostic and offline paired-gap summary; the first controls the device |
 | `prefetch_smoke.py`, `prefetch_common.py`, `diagnose_route_hitches.py`, `bench.py`, `present_trace.py` | Previous new observation, scene checks, route, isolation/restoration and actual-presentation extraction |
 | `groups/<timestamp>/` | Original env/settings, primary-save hash archives, restore APK identity and restoration audit |
 
@@ -167,4 +177,4 @@ For each ordinary run, begin with `result.csv`, `env.txt`, `before.png`, `after.
 - [Plan 2](perf-plan-2.md): prior short-route acceptance and lock investigation, distinct from this broader hitch problem.
 - [Architecture](ARCHITECTURE.md), root `AGENTS.md`, `.claude/skills/nx2android-dev/` and `.claude/skills/switch-android-port/`: collaboration, source boundaries and device rules.
 
-No further experiment has been selected. Keep the current release/primary saves intact while reviewing. Device takeover/unlock authorization is session-specific; no unlock credentials are in this file. The next useful result is an evidence-based review of the paths above, rather than another assertion that an upstream mechanism must improve this device.
+The approved one-run pacing-off diagnostic is complete. A pacing-preserving GPU-estimate fix and its validation have not been implemented or selected. Keep the current release/primary saves intact while reviewing. Device takeover/unlock authorization is session-specific; no unlock credentials are in this file. The next useful result is a bounded design and validation for the repeated-reservation mechanism, rather than another assertion that an upstream mechanism must improve this device.
