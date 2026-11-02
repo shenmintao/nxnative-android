@@ -1888,3 +1888,20 @@ Readable vendor thermal/performance configurations are archived with source path
 - The approved sixty-second warmup/two-minute WideRouteBench run was not started after the same locked-device blocker. No candidate route FPS, cadence, demand-time or trim result is claimed.
 - Offline context re-derived from retained captures: 182822/192400/211447 second gaps6/5/0, second-gap excess550.036/741.712/0 ms; >17.5 ms1.112990/1.300537/8.695043%. These are historical results, not candidate observations.
 - Tried / conclusion / next: BENCH/summarize_pace_budget.py writes the blocked JSON and historical tables without adb. BENCH/pace_budget_validate.py is only the blocked preflight/recovery recorder; V/A/B execution was not implemented after the stop condition. Await supervisor direction; no promotion.
+
+### Pacing Test V after manual unlock, 2026-11-02
+- User authorizes stage2b: finish local V/A/B execution/summary helpers, poll keyguard read-only every5 s up to30 min, then run immediately after manual unlock. Group20261102-231644 observes unlock at23:31:01; no credentials, unlock action or lock/system-setting changes.
+- Approved cooling deviation: display stays ON between groups; require three consecutive CPU/GPU/skin severity0 observations,5 s apart. V passes admission. Foreground caps1996800/2438400 kHz and before/after severity0 match history; higher idle caps while stopped are retained in raw telemetry.
+- runs/20261102-233104-pace-budget-V: validation2 APK e6013986, owned seed/cache/prewarm1209,60 s fixed warmup, fixed/moving smoke. Output1920x1080, stock internal1280x720 before/after; audio/PID/trace gates pass,124 latency matches. Screenshots inspected; not performance evidence.
+- Both 150 ms one-shot requests complete: presents 4907/5461, actual sleeps 152.352/151.907 ms, delayed GPU spans at frames 4906/5460: 197.9/192.6 ms. Budget 0/1 appears in 600-frame logs; bracketing trim deltas 0/1 and 0/112.797 ms. No natural demand record overlaps either 1 s injection window; counters are cumulative brackets, not exact per-event attribution.
+- Strict V gate FAIL: validation errors0, RED3, all three identical unused-output validation warnings already present in182026-coverage. Do not silently exempt warnings or claim zero RED. No engine/default/APK change or further experiment; A/B not started.
+- Production bcd840c1 restored; env/settings SHA-256s and all34 primary-save file hashes match originals. App stopped/display OFF, owned route/recorder/keepawake threads ended. No relock or adb timeout/retry. Evidence: BENCH/pace-budget-validation.json, group restoration.json and the V run.
+- Tried / conclusion / next: injected spans reproduce the elapsed gap and live controls work under validation; the literal zero-RED criterion blocks acceptance. Await supervisor review of warning classification before A/B or stage3; no promotion, push or merge.
+
+### Pacing Test A stage2b not started, 2026-11-02
+- OFF/ON/ON/OFF acceptance remains unmeasured: stop after V's three RED-prefixed warnings under the approved zero-RED gate. No A phases, injections or cadence samples; criteria0-3 are not evaluated, criterion4 fails its V component.
+- Prepared execution and offline per-injection/cadence/criteria logic remain in BENCH/pace_budget_validate.py and summarize_pace_budget.py. No substituted run, changed threshold or claimed performance gain. Next: supervisor review.
+
+### Pacing Test B stage2b not started, 2026-11-02
+- Route confirmation was not launched after the V gate failure; candidate route metrics and pass/fail are unavailable. The existing182822/192400/211447 historical table is retained unchanged in the JSON.
+- Tried / conclusion / next: device and primary data restored, test session ended. Resolve the V warning gate before the approved single route run; production installation/promotion and handoff/status changes remain outside this stage.
