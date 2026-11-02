@@ -1,5 +1,7 @@
-# 0.3.0rc2: program prefetch + bounded pipeline prediction; 156 source tests; Vulkan 0 errors / 3 unused-output warnings.
-# Single 120 s observation: 59.135 fps, 16 >50 ms intervals; no comparative gain claim. Release bcd840c1 smoke passed.
+# 2026-11-03 TB323FU / Adreno 840: median pacing budget; release 06e382a5 isolated save/load + 30 s smoke passed.
+# User ships despite A criterion2 FAIL: ON/OFF excess 0.609797 > 0.6, miss 3.348 ms; second gaps OFF12/12 -> ON0/12.
+# B single run: second gaps0, late1.361%; no general FPS gain claim. Source162=159 pass/3 optional skips; V reused, 0 errors/3 baseline warnings.
+# 0.3.0rc2 prefetch/prediction remains; no measured benefit.
 # Plan 2 historical baseline follows; it does not measure the first-use follow-up.
 # TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-02.
 # Balanced mode, owned Great Plateau save; 60 s warmup + 120 s actual-present windows.
@@ -14,7 +16,7 @@
 # Release 44a337e0 save/load smoke passed. Existing lower-leg ground occlusion remains.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-02: balanced mode; docked 1080p output, stock DRS sampled at 1600x900; Plan 2 baseline fixed 59.895 fps / moving 59.830 fps; 0.3.0rc2 program prefetch and bounded pipeline prediction, 156 source tests, Vulkan zero errors / three unused-output warnings, release bcd840c1 isolated save/load smoke pass; single 120 s moving observation 59.135 fps / 16 intervals >50 ms, comparative gain unquantified; real gyro direction/stability confirmed and rumble verified; final 30-minute soak waived; lower-leg ground occlusion and hitches remain, full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-03: balanced, docked 1080p output, stock DRS sampled1600x900; median pacing budget release06e382a5 isolated save/load and30 s smoke pass, RED0; A second gaps OFF12/12 to ON0/12, cadence/correctness pass but criterion2 FAIL (excess ratio0.609797>0.6, miss3.348 ms), user explicitly approves shipping override; single120 s B second gaps0, late1.361%, general FPS gain unproven; source162=159 pass/3 optional skips, Vulkan V reused0 errors/3 matched baseline warnings; prefetch/prediction has no measured benefit, first compile stalls remain; real gyro/rumble verified,30-minute soak waived, lower-leg ground occlusion/full gameplay unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn

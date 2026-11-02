@@ -4,7 +4,30 @@ Authorized by the user on 2026-11-02 after the manual-play report and upstream r
 
 For a standalone review brief with version identities, raw-artifact locations and specific code questions, see the [AI handoff](ai-handoff-botw-hitches.md).
 
+## Current pacing correction and user-approved production, 2026-11-03
+
+Candidate2 (`4a6b5c1e`) keeps pacing enabled and separates its scheduling estimate from raw `vk_gpu_ms_recent()` timing. With at least three known spans (up to eight), detect `latest > max(2*median, game_period)` and replace only that outlier with the median. Raw timing/ADPF, the game-period cadence,4 ms floor, shaders, PPE2 ABI and prefetch/prediction are unchanged. `DM_VK_PACE_BUDGET` defaults ON; debug can toggle it live, and cumulative trim counts/ms are appended to the existing600-frame display-timing line. The debug injection is excluded from release.
+
+| Fixed-view acceptance | Candidate1: cap replacement / debug2 | Candidate2: median replacement / debug3 |
+|---|---:|---:|
+| OFF / ON second gaps | 12/12 /6/12 | 12/12 /0/12 |
+| OFF / ON median excess | 345.875489 /216.706390 ms | 341.708864 /208.373140 ms |
+| ON/OFF ratio, required<=0.6 | 0.626545: fail | 0.609797: fail |
+| Criteria0/1/2/3/4 | pass/fail/fail/pass/pass | pass/pass/fail/pass/pass |
+
+**The pre-declared acceptance test did not pass.** Candidate2 exceeds its205.025319 ms ON limit by3.347822 ms. After reviewing this miss, the user explicitly accepted candidate2 and authorized local release smoke and production promotion. This shipping decision is an override, not a changed threshold or a retrospective test pass. Both ON phase medians are below both OFF phase medians; ordinary cadence passes. V233104 is reused without rerun because only arithmetic changed; errors0 and exactly three unused-output baseline warnings match182026, with no regression RED. Full tables and supplementary requested-period estimates/bounds are in `BENCH/pace-budget-validation.json`; those supplementary metrics do not affect acceptance.
+
+Candidate2 B `20261103-002509-pace-budget-C2-B`:59.371859 fps, late>17.5 ms1.361021%,p99 25.001354 ms,>50/>100 counts6/3,max166.675886 ms, second gaps0 and total>50 ms excess466.697867 ms. B passes second gaps<=1 and late<=1.8%; candidate1 had1/1.506830%, historical182822 had6/1.112990%. This is a single historical route comparison with differing draw/compile work, not a general FPS-gain claim. A/B sample internal1600x900, output1080p, balanced caps1996800/2438400 kHz and severity0; screen-on idle cooling with three zero-severity observations is the approved deviation.
+
+Release smoke `20261103-004043-coverage` uses an isolated owned seed:30 s gameplay, manual save and reload of the newly written slot, stable PID4685, RED0,1209 prewarm keys and38 display-timing checkpoints with `budget_on=1`. The isolated `save/2/game_data.sav` changes; all34 primary-save hashes and original env/settings hashes remain unchanged. Production is `pace-budget-release3.apk`, SHA-256 `06e382a5ecab44af72236bba948f14544c74a2e8089f8ec9fc44f293689b041c`, also exported to the existing private `ROOM/ZeldaBreathOfTheWild.apk`. App stopped/display OFF; data/modules and app version are unchanged.
+
+Rollback retains `BENCH/prefetch-rc2-release.apk` and `ROOM/ZeldaBreathOfTheWild-prefetch-bcd840c1.apk`, both SHA-256 `bcd840c1a9a3427e6dbe4f46c5caa041d6caf5f9e0fb941243e2ca42ddcc988d`; the existing data path and earlier rollback backups remain intact. `BENCH/pace-budget-promotion.json` indexes the decision, installed/exported/rollback identities and recovery evidence in group20261103-004026. `current-production.json` and `production_runtime.py` select hash-verified release3 in the shared harness constructor and restore path, overriding stale historical defaults; an offline mocked restore verifies this without device actions. Historical scripts still require inspection and new authorization before use.
+
+Pacing6/6 and full source162=159 passed/3 optional native Yaz0 skips; debug3/release3 each build144 sources. Next: first synchronous pipeline-creation stalls remain the main open hitch source; prediction has no measured frame-time benefit. No third pacing candidate, further device experiment, version bump, release notes, GitHub release, push or merge is authorized here; supervisor reviews and merges local main separately.
+
 ## Scope and acceptance
+
+The following scope and implementation history predates the current pacing production above; its earlier restore targets are historical identities.
 
 - BotW 1.9.0 (v1114112), TB323FU / SM8850P / Adreno 840 / Android 16, balanced mode.
 - Docked 1920x1080 output, stock 1280x720..1600x900 internal DRS, target 60, HOLD off. No quality, vendor mode, or system performance changes.
@@ -12,7 +35,7 @@ For a standalone review brief with version identities, raw-artifact locations an
 - First diagnose one 120-second route after 60-second warmup: align actual present intervals with timed graphics/compute pipeline creation, texture work, submission waits, and GPU segment/gap observations. Diagnostic trace overhead is recorded and its fps is not an acceptance result.
 - Implement only a cause shown to explain a material portion of long frames. Check the two upstreams first. Do not skip draws or alter shader precision.
 - The user explicitly waived OFF/ON/ON/OFF for this follow-up on 2026-11-02. Build on production 44a337e0, validate source checks, unchanged rendering/input and zero Vulkan errors, then run one bounded moving smoke in the owned seed. Record presentation metrics as observations only; performance gain remains unquantified. Do not restart comparative or long-running performance loops.
-- Finish with appropriate unit checks, zero Vulkan validation errors, release smoke, original preferences and unchanged primary saves. Implementation groups restore production APK 44a337e0; the completed release smoke promotes bcd840c1 below as the next production baseline. Future groups must restore the new baseline. Final 30-minute soak remains waived unless the user asks for it.
+- Finish with appropriate unit checks, zero Vulkan validation errors, release smoke, original preferences and unchanged primary saves. Those implementation groups restored44a337e0 and their release smoke promoted bcd840c1. That baseline is now superseded by release3 above; future groups restore current production through the registry. Final30-minute soak remains waived unless the user asks for it.
 - After rc2 packaging, the user requested one original-version measurement against the existing new-build observation. Run the retained pre-prefetch debug F416 (production equivalent 44a337e0), the same owned seed, driver/key cache, six-second route, balanced mode and 1080p output / stock internal DRS, 60 s warmup plus 120 s actual-present capture. Compare fps, >17.5 ms / >50 ms / >100 ms intervals, maximum interval, sampled main-pass size and thermal/cap observations. Restore production bcd840c1 and verify unchanged primary saves/preferences. This authorizes one baseline, not a restarted four-window loop; a single historical pair does not satisfy repeatability acceptance.
 - The user subsequently approves the proposed H1 diagnostic: one 120 s moving run after 60 s warmup using the same F416 APK/cache/seed/route as original run192400, with only `DM_VK_PACE=0` added. Compare consecutive >50 ms second gaps and their excess over16.667 ms, plus >100 ms count, compile-demand time, mean/p99, resolution and health. Supporting signature: material first compile stalls remain while second-gap count/excess falls at least50% from the original five /741.7 ms; without material first stalls the outcome is inconclusive. This is a diagnostic, not permission to ship pacing disabled or a repeated acceptance loop. Restore current bcd840c1, preferences and primary saves.
 
@@ -22,7 +45,7 @@ Manual route diagnostic `20261102-151653-user-live-hitch`: 120.112 s, 58.004 fps
 
 Publication and Dimensity 9400 experiments were held during this investigation. The first-use mechanisms below form candidate 0.3.0rc2; Dimensity experiments remain deferred. The accepted short-route plan 2 measurements stay in `perf-plan-2.md`; they are not evidence for the broader route.
 
-## Latest direction
+## Earlier prefetch direction
 
 The user approved program-creation shader prefetch and bounded upcoming-command pipeline compilation, then waived the four-run performance comparison. Implement these on the production-derived branch, with ordinary full pipelines and correct synchronous fallback whenever preparation is incomplete. The failed GPL experiment is checkpointed separately at `experiment/gpl-resident-20261102` / `16600918`; it is excluded from this implementation. Keep balanced mode, stock DRS, save isolation and the production rollback procedure above.
 
@@ -54,7 +77,7 @@ After packaging, the user requested one run of the pre-prefetch implementation. 
 | Intervals >100 ms | 6 | 5 |
 | Maximum interval | 308.350416 ms | 200.010937 ms |
 
-The +0.200639 fps (+0.34%) difference is inside the ~1% noise floor. The p99 is unchanged; maximum interval and >100 ms count are lower, while >50 ms count is higher. This single historical pair provides no clear performance improvement and is not repeated acceptance. Original audio/PID/presentation gates pass with 127 latency matches and RED0. Current production bcd840c1, original preferences and primary saves were verified/restored; app stopped/display OFF. No additional comparison windows or code/default changes followed this requested measurement.
+The +0.200639 fps (+0.34%) difference is inside the ~1% noise floor. The p99 is unchanged; maximum interval and >100 ms count are lower, while >50 ms count is higher. This single historical pair provides no clear performance improvement and is not repeated acceptance. Original audio/PID/presentation gates pass with 127 latency matches and RED0. Then-current production bcd840c1, original preferences and primary saves were verified/restored; app stopped/display OFF. No additional comparison windows or code/default changes followed this requested measurement.
 
 ## Approved H1 pacing-off diagnostic
 
@@ -75,7 +98,7 @@ After the offline review, the user approved one120 s diagnostic. Run `20261102-2
 
 Six demand clusters of at least50 ms remain in the off run; disappearance of the second gaps is not explained by the absence of first-use stalls. This meets the predeclared H1 diagnostic signature, supporting pacing amplification. It is one historical pair, with differing compile work and no deterministic game replay, rather than proof of a production fix or general FPS gain. The large increase in ordinary late intervals makes pacing-off unsuitable as the retained solution.
 
-Both sample internal1600x900 before/after, output1920x1080, prewarm1209, identical balanced CPU caps and CPU/GPU/skin severity0. Audio/PID/trace gates pass with126 latency crosschecks and RED0. `BENCH/H1-pace-off-comparison.json` retains the rows, pair intervals, compile-demand evidence and matching-condition checks; helpers are `pace_off_once.py` and `summarize_pace_off.py`. Current production bcd840c1, original preferences and primary saves are verified/restored, app stopped/display OFF. No runtime/default change is promoted. Next proposal: retain pacing while correcting the GPU-budget estimate, then validate with bounded injected stalls before route acceptance.
+Both sample internal1600x900 before/after, output1920x1080, prewarm1209, identical balanced CPU caps and CPU/GPU/skin severity0. Audio/PID/trace gates pass with126 latency crosschecks and RED0. `BENCH/H1-pace-off-comparison.json` retains the rows, pair intervals, compile-demand evidence and matching-condition checks; helpers are `pace_off_once.py` and `summarize_pace_off.py`. Then-current production bcd840c1, original preferences and primary saves were verified/restored, app stopped/display OFF. The diagnostic promoted no change. Its proposed pacing-budget correction was subsequently implemented, tested and shipped by user override as recorded above.
 
 ## Previous GPL experiment
 
