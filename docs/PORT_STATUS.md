@@ -1,6 +1,6 @@
 # Games
 
-Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830). The device's GPU must read BC-compressed textures (Adreno, Xclipse; not Mali or PowerVR).
+Upstream records below are primarily from a Lenovo Legion Y700 (Snapdragon 8 Elite / Adreno 830). Local BotW verification is listed separately. Mali / Immortalis is under investigation on a separate branch and is not a verified release target.
 
 | | |
 |:---:|:---:|
@@ -18,6 +18,6 @@ Which games each release has been checked to port: [RELEASE_CHECK.md](RELEASE_CH
 
 | Game | Title ID | Status |
 |---|---|---|
-| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | **work in progress**: 1.9.0 on TB323FU (SM8850P / Adreno 840, Android 16); docked 1920x1080 output, dynamic internal resolution, 60 fps target, HOLD off. Final debug averages 58.177 fps fixed / 57.780 moving; 30-minute soak has no restart or RED, last 5 minutes 55.567 fps with thermal/frequency interference. Performance and cold-cache hitch criteria remain unmet; 111 tests, Vulkan validation and release save-load smoke pass. Release `a1178870…` installed; full gameplay unverified. |
+| The Legend of Zelda: Breath of the Wild | `01007EF00011E000` | **work in progress**: 1.9.0 on TB323FU (SM8850P / Adreno 840, Android 16), balanced mode; docked 1920x1080 output, stock DRS sampled at 1600x900. Final debug pooled fixed 59.895 fps / moving 59.830 fps, first-start moving 59.875 fps; all five windows have zero >50 ms intervals. 150 tests, Vulkan validation (zero errors), real gyro, rumble and release save/load smoke pass. Release `44a337e0…` installed. Final 30-minute soak waived by user; full gameplay unverified and lower-leg ground occlusion remains. |
 
-Performance results and historical experiments: [perf-log.md](perf-log.md); current acceptance: [perf-plan.md](perf-plan.md).
+Performance results and historical experiments: [perf-log.md](perf-log.md); completed acceptance: [perf-plan-2.md](perf-plan-2.md).

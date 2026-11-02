@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = Path(SPECPATH).parent
 NOT_STDLIB = {'tkinter', 'turtle', 'turtledemo', 'idlelib', 'test', 'lib2to3', 'ensurepip', 'venv', 'pydoc_data', 'antigravity', 'this', '__phello__'}
-hidden = collect_submodules('porter') + collect_submodules('gui')
+hidden = collect_submodules('porter') + collect_submodules('gui') + collect_submodules('nxnative_android')
 for m in sorted(sys.stdlib_module_names - NOT_STDLIB):
     if m.startswith('_') and m not in ('__future__',): hidden.append(m); continue
     hidden += collect_submodules(m, filter=lambda n: not any(p in NOT_STDLIB or p in ('tests', 'test') for p in n.split('.'))) or [m]
@@ -20,6 +20,6 @@ a = Analysis([str(ROOT / 'packaging/nx2android.py')], pathex=[str(ROOT)], binari
              excludes=sorted(NOT_STDLIB - {'test'}), noarchive=False)
 pyz = PYZ(a.pure)
 # u: unbuffered, so the GUI gets each progress line as it is printed; X utf8: the engine's tools write their tables with open() and no encoding
-exe = EXE(pyz, a.scripts, [('u', None, 'OPTION'), ('X utf8', None, 'OPTION')], exclude_binaries=True, name='nx2android', console=True, upx=False,
+exe = EXE(pyz, a.scripts, [('u', None, 'OPTION'), ('X utf8', None, 'OPTION')], exclude_binaries=True, name='nxnative-android', console=True, upx=False,
           icon=str(ROOT / 'packaging/nx2android.ico') if sys.platform == 'win32' else None)   # the Mac bundle is a folder, not an .app: no icon there
-coll = COLLECT(exe, a.binaries, a.datas, name='nx2android', upx=False)
+coll = COLLECT(exe, a.binaries, a.datas, name='nxnative-android', upx=False)

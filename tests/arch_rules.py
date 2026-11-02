@@ -136,7 +136,7 @@ check('requirements.txt has lz4, capstone, pillow, PySide6', all(m in req for m 
 
 # 10b. Distribution: the launcher only dispatches (to the GUI, `-m porter`, or a tool's script), and the bundle takes only committed nxnative files
 launcher = (R / 'packaging/nx2android.py').read_text(encoding='utf-8')
-check('packaging/nx2android.py only dispatches', not ({i.split('.')[0] for i in imports('packaging/nx2android.py')} - {'multiprocessing', 'os', 'runpy', 'sys', 'ctypes', 'gui'}))
+check('packaging/nx2android.py only dispatches', not ({i.split('.')[0] for i in imports('packaging/nx2android.py')} - {'multiprocessing', 'os', 'runpy', 'sys', 'ctypes', 'gui', 'nxnative_android'}))
 check('the bundle copies only committed nxnative files', "tracked('nxnative')" in (R / 'packaging/build_bundle.py').read_text(encoding='utf-8'))
 check('frozen porter finds nxnative beside the executable', "frozen" in (R / 'porter/paths.py').read_text(encoding='utf-8'))
 

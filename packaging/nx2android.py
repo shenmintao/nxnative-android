@@ -1,7 +1,7 @@
 # The bundle's one executable (packaging/build_bundle.py). With no arguments it is the desktop app; otherwise it is the Python the tool runs its parts with,
 # since a bundle has no python.exe:
-#   nx2android -m porter …        the port process the GUI starts (gui/runner.py)
-#   nx2android <script.py> …      the engine's tools the pipeline runs (patch_nso.py, shader_split.py, dm/android/build.py …), as `python <script.py>`
+#   nxnative-android -m porter …   the port process the GUI starts (gui/runner.py)
+#   nxnative-android <script.py> … the engine's tools the pipeline runs (patch_nso.py, shader_split.py, dm/android/build.py …), as `python <script.py>`
 import multiprocessing, multiprocessing.spawn, os, runpy, sys
 
 
@@ -19,12 +19,12 @@ def main():
         sys.path.insert(0, os.path.dirname(os.path.abspath(a[0])))   # as python does: the script's folder first (the tools import their neighbours)
         runpy.run_path(a[0], run_name='__main__')
     else:
-        if os.name == 'nt':   # opened by double-click, the console window is the app's alone: hide it (from a terminal it stays)
+        if os.name == 'nt' and (not a or a == ['gui']):   # hide only the GUI's own console; CLI output stays visible
             import ctypes
             k = ctypes.windll.kernel32; ids = (ctypes.c_uint * 4)()
             if k.GetConsoleProcessList(ids, 4) == 1: ctypes.windll.user32.ShowWindow(k.GetConsoleWindow(), 0)
-        from gui.app import main as gui
-        sys.exit(gui(sys.argv))
+        from nxnative_android.__main__ import main as app
+        sys.exit(app(a))
 
 
 if __name__ == '__main__':

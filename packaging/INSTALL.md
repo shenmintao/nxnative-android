@@ -1,27 +1,27 @@
-# Installing nx2android
+# Installing nxnative-android
 
-nx2android ports your own Nintendo Switch games to Android. This folder is the whole app: there is nothing to install with pip, and you need no programming. You need:
+nxnative-android ports your own Nintendo Switch games to Android. This folder is the whole app: there is nothing to install with pip, and you need no programming. You need:
 
 - a Windows PC, or a Mac with Apple silicon (M1 or later), with about 30 GB free (the tools take 4 GB, a port about twice the game's size);
-- an Android device whose GPU is an **Adreno** (Snapdragon) or **Xclipse** (Exynos 2200 and later). Mali and PowerVR GPUs cannot run these games;
+- an Android device whose GPU is an **Adreno** (Snapdragon) or **Xclipse** (Exynos 2200 and later). Mali / Immortalis and PowerVR are not verified release targets; the Dimensity 9400 work is on a separate branch;
 - the game's files dumped from your own Switch (the base game NSP or XCI, its update and DLC, in one folder) and your **`prod.keys`** from the same Switch. The tool reads NSP and XCI files, and NSZ and XCZ files, which it decompresses while it ports (they need that much more free space for a while).
 
 ## 1. Start the app
 
-Unzip `nx2android-<version>-windows-x64.zip` anywhere (a short path such as `C:\nx2android` is best) and start **nx2android.exe**. Windows may warn about an unknown app: choose *More info* → *Run anyway*.
+Unzip `nxnative-android-<version>-windows-x64.zip` anywhere (a short path such as `C:\nxnative-android` is best) and start **nxnative-android.exe**. Windows may warn about an unknown app: choose *More info* → *Run anyway*.
 
-On a Mac, unzip `nx2android-<version>-macos-arm64.zip` (double-click it in Finder). The app is not signed by Apple, so macOS stops it: in Terminal, clear the download mark once, then start it:
+On a Mac, unzip `nxnative-android-<version>-macos-arm64.zip` (double-click it in Finder). The app is not signed by Apple, so macOS stops it: in Terminal, clear the download mark once, then start it:
 
 ```
-xattr -dr com.apple.quarantine ~/Downloads/nx2android
-~/Downloads/nx2android/nx2android
+xattr -dr com.apple.quarantine ~/Downloads/nxnative-android
+~/Downloads/nxnative-android/nxnative-android
 ```
 
-A few antivirus engines may flag `nx2android.exe` (on VirusTotal, 3 of 69 flagged v0.1.1, with generic labels such as "Trojan.Stealer" or "BehavesLike.Injector"; Microsoft Defender, Kaspersky, ESET, BitDefender and the other large engines did not). It is a false positive: the app is a Python program packed with PyInstaller, whose small launcher unpacks a compressed archive of the program and runs it, which heuristic scanners mistake for a packed trojan. The app is not code-signed yet, which adds to the score. Its source is on the project's GitHub page, and you can build the same bundle yourself with `python packaging/build_bundle.py`.
+A few antivirus engines may flag `nxnative-android.exe` (on VirusTotal, 3 of 69 flagged v0.1.1, with generic labels such as "Trojan.Stealer" or "BehavesLike.Injector"; Microsoft Defender, Kaspersky, ESET, BitDefender and the other large engines did not). It is a false positive: the app is a Python program packed with PyInstaller, whose small launcher unpacks a compressed archive of the program and runs it, which heuristic scanners mistake for a packed trojan. The app is not code-signed yet, which adds to the score. Its source is on the project's GitHub page, and you can build the same bundle yourself with `python packaging/build_bundle.py`.
 
 ## 2. Setup tab (once)
 
-1. Click **Download missing tools**. The app downloads the Android NDK, the .NET SDK and Android platform-tools from Google and Microsoft (about 1 GB) into your nx2android folder. They come under their makers' licenses, which the dialog links to. If you already have them installed, set their paths instead.
+1. Click **Download missing tools**. The app downloads the Android NDK, the .NET SDK and Android platform-tools from Google and Microsoft (about 1 GB) into tools/player beside the executable (NX2A_HOME can override it). They come under their makers' licenses, which the dialog links to. If you already have them installed, set their paths instead.
 2. Set **prod.keys** to your keys file and click **Save and check**.
 3. Every line should now have a green ✓.
 
@@ -43,4 +43,4 @@ The log at the bottom of the Port tab says why; lines in red are errors. Ask on 
 
 **A touch game does not take some touches.** The on-screen gamepad takes the touches on its buttons and sticks and near them, at the sides of the screen. Open the pause menu (the button at the top centre) and turn the gamepad off: every touch then goes to the game, except a touch on the menu button. For a new port, tick **Touch game** on the Port tab (`--touch`): the gamepad starts hidden. If the game still takes no touch, choose handheld mode in the pause menu: some games read touches only in handheld mode, as on the Switch.
 
-The command line is the same program: `nx2android.exe -m porter -h` (`./nx2android -m porter -h` on a Mac).
+The command line is the same program: `nxnative-android.exe -m porter -h` (`./nxnative-android -m porter -h` on a Mac).

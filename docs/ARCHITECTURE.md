@@ -21,7 +21,7 @@ nxnative/  (our fork of seedds/nxnative + the Android port)
 | Layer | Where | Holds | Must not hold |
 |---|---|---|---|
 | **Core, shared** | `nxnative/dm/{host,gfx,tools,third_party}` | What every game and both platforms need. Android differences behind `DM_ANDROID` / `__APPLE__` / `DM_TARGET`. | Game-specific branches. |
-| **Core, Android runtime** | `nxnative/dm/android/` | Vulkan replay backend (`gfx_vk_*`), the NativeActivity front end (on-screen gamepad, pause menu, settings, the save manager's export and import, text entry with an on-screen keyboard, haptics, shaking the device as shaking the controller, audio, performance hints), the NDK build (`build.py`), the APK writer (`apk/mkapk.py`), the Vulkan shader bundle (`tools/shader_vk.py`), the profile's Android header (`tools/android_profile.py`), the gamepad's layouts (`overlay_default.tsv`: tablet and phone) and its themes (`themes/`: a sprite pack per design, and `themes.tsv`, the table of which game wears which; `themes/README.md`). | Code that depends on a game: no title IDs, game names or per-game branches in code (comments may name the game a rule was found with, as upstream's do). A game that needs something different gets a profile key. |
+| **Core, Android runtime** | `nxnative/dm/android/` | Vulkan replay backend (`gfx_vk_*`), the NativeActivity front end (on-screen gamepad, pause menu, settings, the save manager's export and import, text entry with an on-screen keyboard, haptics, calibrated device gyro/accelerometer input with a shake fallback, audio, performance hints), the NDK build (`build.py`), the APK writer (`apk/mkapk.py`), the Vulkan shader bundle (`tools/shader_vk.py`), the profile's Android header (`tools/android_profile.py`), the gamepad's layouts (`overlay_default.tsv`: tablet and phone) and its themes (`themes/`: a sprite pack per design, and `themes.tsv`, the table of which game wears which; `themes/README.md`). | Code that depends on a game: no title IDs, game names or per-game branches in code (comments may name the game a rule was found with, as upstream's do). A game that needs something different gets a profile key. |
 | **Game profile** | `nxnative/dm/games/<title ID>/` | Data only: `game.tsv` (upstream keys), shader tables, `patches.py` (per-build rewriter cuts), and `android.tsv` (Android keys, below). | Code paths. |
 | **Port pipeline** | `porter/` | The stages that turn game files into the APK and data pack; the toolchain check; the profile registry; installing over adb. Runs headless. | UI. |
 | **GUI** | `gui/` | Screens over `porter`: setup check, game folder, profile status, options, progress, install. | Pipeline logic: everything it does, the CLI does too. |
@@ -67,6 +67,8 @@ Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patch
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
 
 The rewriter's generic spin-wait search includes lock-protected polls: every returning path must balance acquisition/release on the same address, carry no changed live register, and limit stores to invariant addresses and values beside an observed load. Paths that advance a work cursor remain outside the wait. These loops use the existing register-preserving spin gate and host back-off; no game ID or fixed instruction address is required.
+
+The Android input thread registers the calibrated gyro and accelerometer at 200 Hz after the data pack environment is loaded. `motion_android.h` maps the natural-device axes through `Display.getRotation()`, converts acceleration to gravity in G, and translates BOOTTIME sample timestamps to the host monotonic clock. The shared upstream `motion_fusion.h` integrates rotation and corrects tilt toward gravity; `hle_hid.c` exposes the result through player 1's controller six-axis states. Sensors stop in the background and their pose is cleared before sampling resumes. `DM_MOTION=0` disables live motion; `DM_PHONE_MOTION=auto` (the default) lets another live controller source take priority. `DM_MOTION_LOG=1` records mapped samples and actual guest read counts for validation; keep it off for performance measurements.
 
 The importer reads CNMT metadata with LibHac to distinguish an Application from its Patch and AddOnContent, including combined XCI/NSP containers. Selecting a file limits sibling discovery to its game family. Cached metadata is keyed by the container, keys-file metadata and extractor sources.
 
@@ -117,14 +119,14 @@ Events: with `--progress json`, every line on stdout is one JSON object, the pro
 
 ## What the player installs
 
-The player gets the bundle (`dist/nx2android-<version>-<os>-<cpu>.zip` from `python packaging/build_bundle.py`, for Windows and macOS): unzip, start `nx2android.exe` (`nx2android` on a Mac), nothing to install with pip. It does not ship toolchains; the Setup tab (`nx2android.exe -m porter doctor`, or `python -m porter doctor` from the repository) checks them and the free disk space, and its **Download missing tools** button (`porter tools --download`, `porter/fetch.py`) fetches the missing NDK, .NET SDK and platform-tools from Google's SDK repository and Microsoft's release list, checks each archive against the checksum its list gives, and unpacks them into the player's nx2android folder (`toolchains/`), which the finders search:
+The player gets the bundle (`dist/nxnative-android-<version>-<os>-<cpu>.zip` from `python packaging/build_bundle.py`, for Windows and macOS): unzip, start `nxnative-android.exe` (`nxnative-android` on a Mac), nothing to install with pip. It does not ship toolchains; the Setup tab (`nx2android.exe -m porter doctor`, or `python -m porter doctor` from the repository) checks them and the free disk space, and its **Download missing tools** button (`porter tools --download`, `porter/fetch.py`) fetches the missing NDK, .NET SDK and platform-tools from Google's SDK repository and Microsoft's release list, checks each archive against the checksum its list gives, and unpacks them into the player's nx2android folder (`toolchains/`), which the finders search:
 - **Android NDK r27c** (`ANDROID_NDK_HOME`, the configured path, or the usual install folders). No Android SDK or JDK: `mkapk.py` writes and signs the APK itself.
 - **.NET SDK 10**: builds `nx_extract` and the shader translator, and runs them.
-- From the repository instead of the bundle: **Python 3.11+** with `requirements.txt` (`lz4`, `capstone`, `pillow`, `fonttools`, and `PySide6` for the GUI): the port runs the engine's own Python tools (the rewriter, the shader split). The bundle carries that Python.
+- From the repository instead of the bundle: **Python 3.12+** with `requirements.txt` (`lz4`, `capstone`, `pillow`, `fonttools`, and `PySide6` for the GUI): the port runs the engine's own Python tools (the rewriter, the shader split). The bundle carries that Python.
 - **adb** (platform-tools), only to install from the tool.
 - Their own **prod.keys**. Keys and game files are never copied into the repository or the app.
 
-The player's settings, APK signing key and built translator live in their nx2android folder: `%APPDATA%\nx2android` on Windows, `~/Library/Application Support/nx2android` on a Mac, `~/.config/nx2android` elsewhere (`NX2A_HOME` overrides it). An app keeps the same signer across ports, so updates install over it.
+The fork entry point defaults settings, APK signing key and built translator to `tools/player/` beside the executable or source checkout. `NX2A_HOME` overrides it. Direct `python -m porter` keeps the upstream defaults: `%APPDATA%\nx2android` on Windows, `~/Library/Application Support/nx2android` on a Mac, `~/.config/nx2android` elsewhere (`NX2A_HOME` overrides it). An app keeps the same signer across ports, so updates install over it.
 
 ## Repository layout
 
@@ -142,7 +144,7 @@ nx2android/
   RESEARCH.md            feasibility study
 ```
 
-The engine is our own fork since 2026-10-29: no subtree pull from upstream, and no `upstream` remote ([DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md#nxnative)).
+The engine is maintained here. `upstream` tracks shirai91/nx2android for reviewed merges; selected seedds/nxnative fixes retain their source commit in the log. Do not perform an unreviewed subtree pull.
 
 ## Adding a game
 

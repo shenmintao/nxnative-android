@@ -1,26 +1,40 @@
 # nxnative-android
 
-本项目基于 [shirai91/nx2android](https://github.com/shirai91/nx2android) 的 Android 原生移植和 [seedds/nxnative](https://github.com/seedds/nxnative) 创建，保留其运行时、游戏配置和 MIT 许可。新增直接导入 NSP/XCI 文件、按所选游戏匹配更新/DLC，以及项目启动入口。
+Port your own Nintendo Switch games to Android. The game's ARM64 code runs natively, with Horizon services provided by the host and NVN graphics replayed through Vulkan. This fork builds on [shirai91/nx2android](https://github.com/shirai91/nx2android) and [seedds/nxnative](https://github.com/seedds/nxnative), retaining their attribution and MIT license.
 
-**[中文使用说明](README.zh-CN.md)** · 双击 `nxnative-android.cmd` 启动，或运行 `python scripts/build_apk_from_nsp.py <NSP文件或游戏目录> -k <prod.keys>`。
+**[中文说明](README.zh-CN.md)** · [Downloads](https://github.com/shenmintao/nxnative-android/releases) · [Game status](docs/PORT_STATUS.md) · [Install guide](packaging/INSTALL.md)
 
-默认产物为包含游戏数据的 **单个 APK**；大型游戏可选择 `--data-mode external`，生成 **APK + 游戏数据目录**。当前单 APK 写入器使用 ZIP32，完整 APK 必须小于 4 GiB。NSP、XCI 均可直接导入；兼容性取决于逐个适配的 Android 游戏配置。支持触屏虚拟手柄、系统屏幕键盘和蓝牙手柄；连接实体手柄时自动隐藏虚拟手柄，断开后恢复用户的显示设置。以下保留 nx2android 的原始使用和开发说明，具体新增用法见中文说明。
+The current candidate is **0.3.0rc1**. The Windows bundle starts with `nxnative-android.exe`; a source checkout starts with `nxnative-android.cmd` or `python -m nxnative_android`. It includes no games or keys.
 
-## nx2android upstream
-<h1 align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.svg">
-    <img alt="nx2android" src="docs/images/logo.svg" height="140">
-  </picture>
-</h1>
+## What this fork adds
 
-Port your own Nintendo Switch games to Android, natively: the game's own arm64 code runs on the device, with the Switch's system services stood in for by a host and NVN graphics replayed on Vulkan. Pick the game's folder, click **Port**, and get an APK plus the game's data, installed on your device if you like. Bring your own game files and keys; nothing from any game is in this repository.
+- Direct NSP/XCI import, matching updates and DLC to the selected game; upstream NSZ/XCZ decompression remains available.
+- A single APK by default, or `--data-mode external` for large games. The complete standalone APK must be smaller than 4 GiB (ZIP32).
+- Touch controls, controller detection, Android text input, game rumble and real device gyro/accelerometer input. BotW's scope direction and stability were checked on the physical tablet.
+- Graphics **and compute** pipeline prewarming, upstream lock-poll spin waits, and the retained Vulkan performance stack. The extra sync-caller affinity experiment is disabled; asynchronous compilation that skips draws stays disabled by default.
+- Upstream rendering fixes and ADPF hints, including GPU workload reporting where the Android API supports it.
 
-This is the Android port of [nxnative](https://github.com/seedds/nxnative), which does the same on iPhone and iPad. Supported games: [Games](#games).
+## BotW 1.9.0: verified scope
+
+Tested on **TB323FU, SM8850P / Adreno 840, Android 16, balanced mode**, using the owned Great Plateau save. Docked output is **1920×1080**; the game retains its **1280×720–1600×900** dynamic internal resolution (1600×900 in the measured scenes).
+
+| Final debug measurement | Average fps | Late intervals (>17.5 ms) | Intervals >50 ms |
+|---|---:|---:|---:|
+| Fixed view, two 120 s windows | 59.895 | 0.647% | 0 |
+| Moving route, two 120 s windows | 59.830 | 0.829% | 0 |
+| First start, moving, one 120 s window | 59.875 | 0.751% | 0 |
+
+The final package passed 150 unit tests, Vulkan validation with zero errors (three unused-output warnings), and a release save/load smoke test. The user waived the final 30-minute soak; it was **not run**. Full-game compatibility is unverified and a lower-leg ground-occlusion issue remains, so BotW stays **work in progress**. These results do not establish native internal 1080p or the performance of another device. [Acceptance and experiment record](docs/perf-plan-2.md).
+
+## Hardware compatibility
+
+The ARM64 runtime and generic lock rule are shared across SoCs. This fork's final BotW measurements are specific to SM8850P; upstream separately tested an Adreno 830 device. A Snapdragon 8 Elite / SM8750 needs its own performance check.
+
+**Dimensity 9400 / Immortalis-G925 is under investigation on a separate branch.** The connected device reports ASTC support but no BC texture sampling or descriptor-buffer extension. The renderer has CPU BC decoding and descriptor-set fallbacks, but the current installer still enforces profiles' `bcn` requirement. Mali is not yet a verified release target. CPU BC decoding also increases texture memory; no Mali fps claim is made here.
 
 ## Games
 
-These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830). The device's GPU must read BC-compressed textures (Adreno, Xclipse; not Mali or PowerVR).
+The gallery below preserves **upstream nx2android test records**, primarily from a Lenovo Legion Y700 (Snapdragon 8 Elite / Adreno 830). They are not a fresh test of every game in this fork. BotW's local results and limitations are recorded above and in [PORT_STATUS.md](docs/PORT_STATUS.md).
 
 | | |
 |:---:|:---:|
@@ -40,11 +54,11 @@ These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite,
 
 The tag (`v0.1.3`) is the latest nx2android version the game was tested on. Older games are not tested again for each release: if a later version breaks one, a patch release fixes it. A tag newer than the [latest release](https://github.com/shirai91/nx2android/releases/latest) is the next release, and the game needs the development checkout until it ships.
 
-A game that is not in this table is not supported yet. The games we look at next, and the ones done: [docs/PORT_CHECKLIST.md](docs/PORT_CHECKLIST.md).
+A game without an Android profile is experimental. The games we look at next, and the ones done: [docs/PORT_CHECKLIST.md](docs/PORT_CHECKLIST.md).
 
 ## For players: port a game without programming
 
-1. Download `nx2android-<version>-windows-x64.zip` (Windows) or `nx2android-<version>-macos-arm64.zip` (Mac with Apple silicon) from [Releases](https://github.com/shirai91/nx2android/releases/latest), unzip it and start **nx2android** (on a Mac, see [packaging/INSTALL.md](packaging/INSTALL.md#1-start-the-app) first).
+1. Download `nxnative-android-<version>-windows-x64.zip` from this fork's [Releases](https://github.com/shenmintao/nxnative-android/releases), unzip it and start **nxnative-android.exe**. The build scripts also support macOS, but this candidate's local bundle verification covers Windows only.
 2. **Setup** tab: click **Download missing tools** (the Android NDK, the .NET SDK and platform-tools, about 1 GB, from Google and Microsoft), then set your **prod.keys**. Every line turns green.
 3. **Port** tab: choose the folder with the game's NSP, XCI, NSZ or XCZ files (base game, update, DLC) and click **Port**.
 4. Tick **Install on the device when done** with the device plugged in and USB debugging on, or copy the APK and the data folder yourself.
@@ -69,9 +83,7 @@ Running from the repository, the command line, the repository layout, building t
 
 ## Keys and game files
 
-nx2android decrypts your game files with your `prod.keys` while it ports them, as Switch emulators do. This repository and its releases contain no keys, no game files and nothing extracted from them, and the tool never downloads either. Dump both from your own Switch, and don't share them or the APKs and data packs built from them.
-
-Nintendo's takedown notices so far have gone to whoever hosts a project (13 Switch emulator repositories on GitHub in February 2026), not to players. Whether decrypting your own games for your own use is allowed depends on where you live.
+nxnative-android reads your own game files with your `prod.keys` while it ports them. This repository and its releases contain no keys or game files, and the tool never downloads either. Keep generated game APKs and data packs private.
 
 ## License
 

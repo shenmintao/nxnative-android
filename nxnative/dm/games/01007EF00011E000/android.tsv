@@ -1,15 +1,17 @@
-# TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-01.
-# Owned Great Plateau save, 60 s warmup + 120 s actual-present windows.
-# Docked 1920x1080 output with the game's 1280x720..1600x900 dynamic rendering.
-# Final debug: fixed 58.224/58.130 fps, moving 57.867/57.692; 60 fps thresholds not met.
-# 30-minute soak: same PID, no RED, last 5 minutes 55.567 fps with thermal/frequency interference.
-# 1199 graphics keys packaged; cold-cache hitch criterion not met. Release save/load smoke passed.
-# 2026-11-02: generic upstream lock-poll spin waits remove fixed-view long frames.
-# Sync-caller pinning also helped the old modules, but adds no benefit to the new rule;
-# retain the generic polling fix without an extra affinity restriction.
+# TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-02.
+# Balanced mode, owned Great Plateau save; 60 s warmup + 120 s actual-present windows.
+# Docked 1920x1080 output, stock 1280x720..1600x900 DRS (1600x900 in sampled scenes).
+# Final debug: fixed 59.930/59.861 fps; moving 59.777/59.883; no >50 ms intervals.
+# First-start moving 59.875 fps; late 0.751%; no >50 ms intervals.
+# PPE2: 1199 graphics + 10 compute keys; warm moving has zero runtime compute creation.
+# Generic upstream lock-poll spin waits retained; extra sync-caller pinning disabled.
+# Final 30-minute soak waived by the user; full gameplay remains unverified.
+# 150 unit tests; Vulkan validation zero errors, three unused-output warnings.
+# Real gyro direction/stability confirmed by user; game/touch rumble verified.
+# Release 44a337e0 save/load smoke passed. Existing lower-leg ground occlusion remains.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-01: Chinese menus, save/load, controller/touch, CPU mapping and HOME restoration checked; final debug docked 1080p output at 1600x900 internal in sampled scenes, fixed mean 58.177 fps and moving 57.780 fps; 30-minute soak same PID and no RED, last 5 minutes 55.567 fps with thermal/frequency interference; performance and cold-cache hitch criteria not met; 111 unit tests and Vulkan validation pass, release a1178870 save/load smoke passed; standing lower-leg ground occlusion remains reproducible, full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-02: balanced mode; docked 1080p output, stock DRS sampled at 1600x900; final debug fixed 59.895 fps and moving 59.830 fps pooled, first-start moving 59.875 fps, all five windows have zero >50 ms intervals; graphics+compute prewarm, warm moving runtime compute creation zero; 150 unit tests, Vulkan validation zero errors and release 44a337e0 save/load smoke pass; real gyro direction/stability confirmed and rumble verified; final 30-minute soak waived by user; lower-leg ground occlusion remains, full gameplay unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn
