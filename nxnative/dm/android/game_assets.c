@@ -96,7 +96,7 @@ int dm_pipeline_keys_seed(AAssetManager *manager, const char *root) {
     if (size > 8 && size <= 64 * 1024 * 1024 && (data = malloc((size_t)size)) &&
         !asset_read(asset, data, (size_t)size)) {
         uint32_t stride = u32(data + 4);
-        if (u32(data) == 0x31455050u && stride && stride <= 65536 && !((size - 8) % stride))
+        if ((u32(data) == 0x31455050u || u32(data) == 0x32455050u) && stride && stride <= 65536 && !((size - 8) % stride))
             result = write_atomic(tmp, path, data, (size_t)size) ? -1 : 1;
     }
     free(data); AAsset_close(asset);

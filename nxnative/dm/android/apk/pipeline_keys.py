@@ -12,6 +12,6 @@ def read_keys(path):
         raise ValueError('invalid pipeline key list size')
     data = path.read_bytes()
     magic, stride = struct.unpack_from('<II', data)
-    if magic != 0x31455050 or not 0 < stride <= 65536 or (len(data) - 8) % stride:
-        raise ValueError('invalid or truncated PPE1 pipeline key list')
+    if magic not in (0x31455050, 0x32455050) or not 0 < stride <= 65536 or (len(data) - 8) % stride:
+        raise ValueError('invalid or truncated PPE1/PPE2 pipeline key list')
     return data

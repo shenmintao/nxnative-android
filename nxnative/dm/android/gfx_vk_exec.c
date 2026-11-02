@@ -822,11 +822,12 @@ typedef struct {
     uint32_t nbind; struct { uint32_t binding, stride, rate, divisor; } bind[17];
     uint32_t ncol, cfmt[8], dfmt, samples, a2c, blend_en, logic_en, logic_op, wmask[8];
     struct { uint32_t src, dst, srca, dsta, eq, eqa; } bl[8];
-    uint32_t clip_neg1, alt, fdz, fdz_pad;   // fdz: the fragment shader's variant that writes gl_FragDepth = gl_FragCoord.z (fdz below)
+    uint32_t clip_neg1, alt, fdz, kind;   // kind: PPE2 graphics=0 / compute=1; fdz: the fragment variant writing gl_FragDepth
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
     uint64_t vin;           // actual vertex fetch classes, three bits per NVN attribute location
 } pkey;
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
+static nvn_hmap g_cpipes = {.klen = 24};   // {compute shader, unsigned / signed integer-texel bindings}; also under g_pipe_mu
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
 // Debug acceptance runs count runtime creation calls, a conservative upper bound
@@ -841,6 +842,27 @@ static uint64_t pipeline_observe_start(void) {
 static void pipeline_observe_end(const char *kind, uint64_t start) {
     if (start) VKLOG("runtime pipeline %s: start_ns=%llu end_ns=%llu", kind,
                      (unsigned long long)start, (unsigned long long)tnow());
+}
+static VkPipeline compute_pipeline(vkshader_t *cs, VkPipelineLayout layout, const uint64_t ck[3], int record) {
+    pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_cpipes, ck); pthread_mutex_unlock(&g_pipe_mu);
+    if (p) return p == (void *)1 ? VK_NULL_HANDLE : p;
+    DM_SYNC_SCOPE("work: build compute pipeline");
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, ck[1], ck[2], 0, 0), "main", NULL}, layout, VK_NULL_HANDLE, -1};
+    if (V.descriptor_buffer) ci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    uint64_t observed = record ? pipeline_observe_start() : 0;
+    if (vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p)) { LOG("[RED] [vk] compute pipeline failed: %016llx", (unsigned long long)cs->key); p = (VkPipeline)1; }
+    pipeline_observe_end("compute", observed);
+    pthread_mutex_lock(&g_pipe_mu);
+    VkPipeline had = nvn_hm_get(&g_cpipes, ck);
+    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }
+    else {
+        nvn_hm_put(&g_cpipes, ck, p);
+        // Compute dispatches can compile for >100 ms too. Preserve all three
+        // key words: a shader's integer-view variants are distinct pipelines.
+        if (record && p != (void *)1) { pkey k = {.kind = 1}; k.key[0] = ck[0]; k.um[0] = ck[1]; k.im[0] = ck[2]; pipe_record(&k); }
+    }
+    pthread_mutex_unlock(&g_pipe_mu);
+    return p == (void *)1 ? VK_NULL_HANDLE : p;
 }
 // The last key and its pipeline (the replay thread's only; pipelines are never dropped): runs of draws with one pipeline skip the 992-byte hash and the lock
 static pkey g_last_k; static VkPipeline g_last_p;
@@ -863,7 +885,8 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
 // ---- pipeline prewarm: every pipeline the game needed is recorded (DM_ROOT/vk_pipelines.bin) and made again at the next boot on background
 // threads, before the game reaches it, so a scene seen once never stalls a frame on a pipeline compile again (the driver's compile, not the
 // pipeline cache's lookup, is the cost: tens of milliseconds per pipeline on Adreno). DM_VK_NOPREWARM=1 turns it off.
-#define PIPE_MAGIC 0x31455050u   // "PPE1"; the header also holds sizeof(pkey), so a changed key layout starts a new file
+#define PIPE_MAGIC 0x32455050u   // "PPE2": same record size, with an explicit graphics/compute kind; PPE1 remains readable
+#define PIPE_MAGIC_V1 0x31455050u
 static FILE *g_prec;
 static void pipe_record(const pkey *k) {   // under g_pipe_mu
     if (!g_prec || k->alt) return;   // DM_VK_SPV_ALT's pipelines are a debugging run's own
@@ -881,6 +904,13 @@ static void *prewarm_thread(void *arg) {
         size_t i = __atomic_fetch_add(&g_pw_next, 1, __ATOMIC_RELAXED); if (i >= g_pw_n) break;
         DM_SYNC_SCOPE("work: prewarm pipeline");
         const pkey *k = &g_pw[i];
+        if (k->kind == 1) {
+            vkshader_t *cs = vk_shader(k->key[0], 5); if (!cs) continue;
+            VkDescriptorSetLayout dsl[5] = {cs->dsl}; uint64_t ck[3] = {k->key[0], k->um[0], k->im[0]};
+            compute_pipeline(cs, vk_pipeline_layout(dsl, 1), ck, 0);
+            prewarm_progress(); continue;
+        }
+        if (k->kind) continue;   // Unknown record kinds never enter graphics creation.
         pthread_mutex_lock(&g_pipe_mu); int have = nvn_hm_get(&g_pipes, k) != NULL; pthread_mutex_unlock(&g_pipe_mu);
         // Runtime creation can win the race; this key is ready either way.
         if (have) { prewarm_progress(); continue; }
@@ -902,9 +932,12 @@ static void prewarm_start(void) {
     char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
     uint32_t hdr[2] = {PIPE_MAGIC, (uint32_t)sizeof(pkey)}, fh[2] = {0};
     FILE *f = fopen(path, "rb");
-    if (f && fread(fh, sizeof fh, 1, f) == 1 && fh[0] == hdr[0] && fh[1] == hdr[1]) {
+    if (f && fread(fh, sizeof fh, 1, f) == 1 && (fh[0] == hdr[0] || fh[0] == PIPE_MAGIC_V1) && fh[1] == hdr[1]) {
         fseek(f, 0, SEEK_END); long n = (ftell(f) - (long)sizeof fh) / (long)sizeof(pkey); fseek(f, sizeof fh, SEEK_SET);
-        if (n > 0) { g_pw = malloc((size_t)n * sizeof(pkey)); g_pw_n = fread(g_pw, sizeof(pkey), (size_t)n, f); }
+        if (n > 0 && (size_t)n <= 64u * 1024 * 1024 / sizeof(pkey)) {
+            g_pw = malloc((size_t)n * sizeof(pkey)); if (g_pw) g_pw_n = fread(g_pw, sizeof(pkey), (size_t)n, f);
+            if (fh[0] == PIPE_MAGIC_V1) for (size_t i = 0; i < g_pw_n; i++) g_pw[i].kind = 0;
+        }
     }
     if (f) fclose(f);
     // rewrite the file with the records read (dropping a torn last record), then append to it
@@ -1703,7 +1736,6 @@ static void draw_idx(const p_draw_idx *d) {
     bc_index(cb, ib, io, it);
     if (!(dbg_draw() & 1) && g_ok) { int xf = xfb_begin(cb); vkCmdDrawIndexed(cb, (uint32_t)d->count, inst, 0, d->base_vertex, (uint32_t)d->base_instance); if (xf) xfb_end(cb, prim, (uint32_t)d->count, inst); }
 }
-static nvn_hmap g_cpipes = {.klen = 24};   // {shader, its integer-texel bindings}
 static void dispatch(const p_dispatch *d) {
     vkshader_t *cs = S.sh[5];
     if (!cs) { VKRED_ONCE(60, "dispatch with no compute shader in the bundle: skipped"); return; }
@@ -1717,17 +1749,8 @@ rebind_compute_views:;
     uint32_t dofs[96]; VkDescriptorSet set = stage_set(5, cs, dofs);
     if (image_gen != g_vk_image_gen) goto rebind_compute_views;
     uint64_t ck[3] = {cs->key, g_num_um, g_num_im};
-    VkPipeline p = nvn_hm_get(&g_cpipes, ck);
-    if (!p) {
-        DM_SYNC_SCOPE("work: build compute pipeline");
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, vk_shader_module(cs, ck[1], ck[2], 0, 0), "main", NULL}, layout, VK_NULL_HANDLE, -1};
-        if (V.descriptor_buffer) ci.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
-        uint64_t observed = pipeline_observe_start();
-        if (vkCreateComputePipelines(V.dev, V.pcache, 1, &ci, NULL, &p)) { LOG("[RED] [vk] compute pipeline failed: %016llx", (unsigned long long)cs->key); p = (VkPipeline)1; }
-        pipeline_observe_end("compute", observed);
-        nvn_hm_put(&g_cpipes, ck, p);
-    }
-    if (p == (void *)1) return;
+    VkPipeline p = compute_pipeline(cs, layout, ck, 1);
+    if (!p) return;
     vk_img_barrier_all(cb);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     if (V.descriptor_buffer) vk_db_bind(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 1, &set);

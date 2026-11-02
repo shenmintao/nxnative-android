@@ -23,6 +23,9 @@ class PipelineKeys(unittest.TestCase):
             good = struct.pack('<II', 0x31455050, 1000) + bytes(2000)
             path.write_bytes(good)
             self.assertEqual(read_keys(path), good)
+            version2 = struct.pack('<II', 0x32455050, 1000) + bytes(2000)
+            path.write_bytes(version2)
+            self.assertEqual(read_keys(path), version2)
             for bad in (good[:-1], b'bad!' + good[4:], good[:8], struct.pack('<II', 0x31455050, 0) + b'x'):
                 path.write_bytes(bad)
                 with self.assertRaises(ValueError): read_keys(path)
@@ -53,8 +56,11 @@ class PipelineKeys(unittest.TestCase):
             path.write_text(preamble + helpers + checks, encoding='utf8')
             result = subprocess.run([cc, '-std=gnu11', '-O2', '-Wall', '-Wextra', '-Werror', str(path), '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            result = subprocess.run([str(exe)], cwd=temp, capture_output=True, text=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for version in ('1', '2'):
+                directory = Path(temp) / version
+                directory.mkdir()
+                result = subprocess.run([str(exe), version], cwd=directory, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__': unittest.main()

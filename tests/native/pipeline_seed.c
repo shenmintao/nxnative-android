@@ -31,9 +31,10 @@ static int AAsset_read(AAsset *a, void *out, size_t size) {
 }
 static void AAsset_close(AAsset *a) { assert(a == &manager.asset); manager.closed++; }
 /* PRODUCTION HELPERS */
-int main(void) {
+int main(int argc, char **argv) {
+    assert(argc == 2);
     const char *dst = "vk_pipelines.bin";
-    uint32_t header[2] = {0x31455050u, 16};
+    uint32_t header[2] = {atoi(argv[1]) == 2 ? 0x32455050u : 0x31455050u, 16};
     memcpy(manager.asset.data, header, 8); manager.asset.size = manager.asset.limit = 40;
     memset(manager.asset.data + 8, 0x93, 32);
     manager.missing = 1;
