@@ -1866,3 +1866,25 @@ Readable vendor thermal/performance configurations are archived with source path
 - Both sample internal1600x900 before/after, output1920x1080, prewarm1209, balanced caps1996800/2438400 kHz and thermal severity0. Periodic mean draws4450.417 ->4449.167. Off log confirms zero pacer resyncs and DM_VK_PACE=0; audio/PID/trace gates pass,126 latency matches, RED0.
 - Conclusion: pacing can amplify compile stalls into a second display gap; simply disabling it worsens ordinary cadence and is not retained. Source/APK/defaults unchanged. Current bcd840c1, original preferences/main saves verified/restored, app stopped/display OFF, no control loop remains.
 - Evidence: BENCH/H1-pace-off-comparison.json, pace_off_once.py, summarize_pace_off.py and the run above. Next proposal: preserve pacing and make the GPU estimate resistant to already elapsed submission gaps, then validate with bounded injected stalls; no additional experiment has started.
+
+### Pacing budget review fix and stage-2 builds, 2026-11-02
+- Supervisor accepts the estimator, raw-statistic separation, counters and release exclusion; requires removing debug injection's per-draw getenv scan before device time.
+- Fix 8ed6db5a reads DM_VK_X_STALL_MS once in x_read per submission; draws inspect only the pending value, and consume/unset it when a split part has reached the GPU. Repeated identical requests re-arm at the next submission. All additions remain under DM_RELEASE guards.
+- Pacing suite6/6; complete source suite162 total =159 passed/3 optional DM_YAZ0_LIB skips. Fresh debug build144 sources/0 failures; new pace-budget-debug2.apk SHA17df9345 and validation2 SHAe6013986. Stage-1 APKs preserved.
+- Release-visible hashes of all four runtime C/header files match 76f7a4c5 after removing DM_RELEASE-conditioned debug blocks; retain pace-budget-release.apk SHA59b6c7f8 without rebuilding. BENCH/pace-budget-build.json retains stage-1 provenance and new hashes/commands.
+- Tried / conclusion / next: debug measurement overhead fixed; device acceptance remains unmeasured. Resolve the locked-device blocker below before resuming approved V/A/B; no stage-3 production promotion, push or merge.
+
+### Pacing Test V correctness smoke blocked before launch, 2026-11-02
+- Read-only TB323FU/HA2PCY7Y preflight reports secure=true, showing=true and mIsShowing=true. User explicitly requires stopping on a locked device, with no unlock attempt; no test APK was installed and no game launched.
+- runs/20261102-230003-pace-budget-locked-preflight verifies installed current production bcd840c1a9a3427e6dbe4f46c5caa041d6caf5f9e0fb941243e2ca42ddcc988d; env/settings before/after SHA-256s match, application stopped and physical display OFF. Primary saves were never accessed; fresh primary-save hashes are unavailable under the retained non-debuggable release.
+- Tried / conclusion / next: Test V not run; RED/validation counts and injection checks are unmeasured, not a pass. No unlock, install or launch retry. Evidence and package checks are in BENCH/pace-budget-validation.json.
+
+### Pacing Test A fixed-view acceptance not run, 2026-11-02
+- Approved OFF/ON/ON/OFF, four60 s phases with six150 ms injections each, was not started because Test V preflight hit the locked-device stop condition.
+- No injections, phase captures, GPU-span observations or cadence tables exist. Criteria0-4 are not evaluated; there is no measured estimate benefit or failure against those thresholds.
+- Tried / conclusion / next: preserve the approved protocol and device state; resume only after the lock blocker is resolved. No substitute experiment or changed threshold.
+
+### Pacing Test B route confirmation not run, 2026-11-02
+- The approved sixty-second warmup/two-minute WideRouteBench run was not started after the same locked-device blocker. No candidate route FPS, cadence, demand-time or trim result is claimed.
+- Offline context re-derived from retained captures: 182822/192400/211447 second gaps6/5/0, second-gap excess550.036/741.712/0 ms; >17.5 ms1.112990/1.300537/8.695043%. These are historical results, not candidate observations.
+- Tried / conclusion / next: BENCH/summarize_pace_budget.py writes the blocked JSON and historical tables without adb. BENCH/pace_budget_validate.py is only the blocked preflight/recovery recorder; V/A/B execution was not implemented after the stop condition. Await supervisor direction; no promotion.
