@@ -3,7 +3,7 @@
 //   libdmhost.so in the app (a NativeActivity with a Java IME bridge): ANativeActivity_onCreate resolves the game's files in the app's external files folder
 //   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/, shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
 //   internal storage, and starts the host on a thread of its own. The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
-//   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; shaking the device shakes player 1's controller;
+//   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; the tablet's gyro/accelerometer feed its six-axis sensor;
 //   leaving and coming back pauses as on iOS.
 #include "dm.h"
 #include "front.h"
@@ -11,6 +11,7 @@
 #include "overlay_layout.h"
 #include "game_assets.h"
 #include "saves_android.h"
+#include "motion_android.h"
 #include <math.h>
 #include <time.h>
 #include <android/asset_manager.h>
@@ -48,7 +49,8 @@ static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
 static ANativeWindow *g_win;
 ANativeWindow *dm_front_window(void) { pthread_mutex_lock(&g_win_mu); ANativeWindow *w = g_win; pthread_mutex_unlock(&g_win_mu); return w; }
 __attribute__((weak)) void vk_window_lost(void) {}   // the backend lets go of the window's swapchain before the window goes
-static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); }
+static void motion_rotation_update(void);
+static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; pthread_mutex_lock(&g_win_mu); g_win = w; pthread_mutex_unlock(&g_win_mu); motion_rotation_update(); }
 static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; pthread_mutex_unlock(&g_win_mu); vk_window_lost(); }
 
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
@@ -112,7 +114,7 @@ static void hold_sync(void) {
     if (want != g_held) { g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
     pthread_mutex_unlock(&g_hold_mu);
 }
-static void shake_sensor(int on);   // the accelerometer, off in the background (input, below)
+static void shake_sensor(int on);   // device sensors, off in the background (input, below)
 static void go_background(void) { int was = atomic_exchange(&g_bg, 1); if (!atomic_load(&g_running) || was) return; dm_focus_set(2); dm_focus_set(3);   // through OutOfFocus, as a game sees HOME and then the suspension (front_mac.m does the same)
     hold_sync(); dm_gfx_suspend(1); shake_sensor(0); }
 static void go_foreground(void) { int was = atomic_exchange(&g_bg, 0); if (!atomic_load(&g_running) || !was) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
@@ -133,7 +135,7 @@ static void act_finish(ANativeActivity *a) {
     if (c) (*E)->DeleteLocalRef(E, c);
     if (attached) (*a->vm)->DetachCurrentThread(a->vm);
 }
-static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } go_foreground(); }
+static void on_resume(ANativeActivity *a) { if (g_quit) { act_finish(a); return; } motion_rotation_update(); go_foreground(); }
 static void on_destroy(ANativeActivity *a) { (void)a; _exit(0); }   // one game per process
 
 // ---- input ----
@@ -864,48 +866,119 @@ static int on_input(int fd, int events, void *data) {
     }
     return 1;
 }
-// ---- shaking the device: the controller is shaken (DM_BTN_SHAKE: its six-axis sensor, hle_hid.c; Super Mario Odyssey's cap throw), as the iOS front end does with the phone ----
-// The accelerometer at 60 Hz on the input thread's looper (no permission needed): gravity is followed by a slow low-pass (about 0.8 s), and a sample whose acceleration beyond it
-// exceeds DM_SHAKE_G (1.5 G by default; env.txt overrides) is a hit. The controller is shaken until 120 ms after the last hit: a flick is one shake (the host finishes it as a whole
-// cycle) and shaking on keeps it going. It goes through player 1's controller path, so it adds to the on-screen gamepad and a controller alike. Off while the app is in the background
-static ASensorEventQueue *g_sq; static const ASensor *g_accel;
+// ---- device motion: raw accelerometer + calibrated gyro, fused by the shared upstream HID implementation ----
+// Sensors belong to player 1's phone/tablet source. They stop in the background; queued old events cannot restore a cleared pose.
+// A device without a gyro keeps the original accelerometer-driven shake input.
+static ASensorEventQueue *g_sq; static const ASensor *g_accel, *g_gyro;
+static pthread_mutex_t g_sensor_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_sensor_on, g_motion_device, g_have_acc, g_sensor_rotation;
+static float g_sensor_acc[3];
+static double g_shake_gx, g_shake_gy, g_shake_gz; static int g_shake_init;
+static int64_t g_shake_last = -1;
+static void motion_rotation_update(void) {
+    if (!g_act) return;
+    JNIEnv *e = NULL; int detach = 0, rotation = -1;
+    if ((*g_act->vm)->GetEnv(g_act->vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*g_act->vm)->AttachCurrentThread(g_act->vm, &e, NULL) != JNI_OK) return;
+        detach = 1;
+    }
+    jclass ac = (*e)->GetObjectClass(e, g_act->clazz), wc = NULL, dc = NULL;
+    jobject wm = NULL, display = NULL;
+    jmethodID m = ac ? (*e)->GetMethodID(e, ac, "getWindowManager", "()Landroid/view/WindowManager;") : NULL;
+    if (m) wm = (*e)->CallObjectMethod(e, g_act->clazz, m);
+    if (wm && !(*e)->ExceptionCheck(e)) wc = (*e)->GetObjectClass(e, wm);
+    m = wc ? (*e)->GetMethodID(e, wc, "getDefaultDisplay", "()Landroid/view/Display;") : NULL;
+    if (m) display = (*e)->CallObjectMethod(e, wm, m);
+    if (display && !(*e)->ExceptionCheck(e)) dc = (*e)->GetObjectClass(e, display);
+    m = dc ? (*e)->GetMethodID(e, dc, "getRotation", "()I") : NULL;
+    if (m) rotation = (*e)->CallIntMethod(e, display, m);
+    if ((*e)->ExceptionCheck(e)) { (*e)->ExceptionClear(e); rotation = -1; }
+    if (dc) (*e)->DeleteLocalRef(e, dc); if (display) (*e)->DeleteLocalRef(e, display);
+    if (wc) (*e)->DeleteLocalRef(e, wc); if (wm) (*e)->DeleteLocalRef(e, wm);
+    if (ac) (*e)->DeleteLocalRef(e, ac);
+    if (detach) (*g_act->vm)->DetachCurrentThread(g_act->vm);
+    if (rotation >= 0 && rotation <= 3) {
+        pthread_mutex_lock(&g_sensor_mu);
+        if (g_sensor_rotation != rotation) { g_sensor_rotation = rotation; dm_motion_clear_switch(); }
+        pthread_mutex_unlock(&g_sensor_mu);
+    }
+}
 static void shake_sensor(int on) {
-    if (!g_sq || !g_accel) return;
-    // the rate goes with the registration: enableSensor + setEventRate left it at the default 200 ms on the Y700 (dumpsys sensorservice), too slow for a flick
-    if (on) ASensorEventQueue_registerSensor(g_sq, g_accel, 16667, 0); else ASensorEventQueue_disableSensor(g_sq, g_accel);
+    pthread_mutex_lock(&g_sensor_mu);
+    g_sensor_on = on != 0;
+    if (!on) { g_have_acc = g_shake_init = 0; g_shake_last = -1; dm_motion_clear_switch(); }
+    pthread_mutex_unlock(&g_sensor_mu);
+    if (!g_sq) return;
+    // registerSensor carries the period; enableSensor + setEventRate left the Y700 at 200 ms.
+    if (g_accel) {
+        if (on) ASensorEventQueue_registerSensor(g_sq, g_accel, g_motion_device ? 5000 : 16667, 0);
+        else ASensorEventQueue_disableSensor(g_sq, g_accel);
+    }
+    if (g_motion_device) {
+        if (on) {
+            int r = ASensorEventQueue_registerSensor(g_sq, g_gyro, 5000, 0);
+            if (r < 0) LOG("front end: gyroscope registration failed (%d)", r);
+        } else ASensorEventQueue_disableSensor(g_sq, g_gyro);
+    }
 }
 static int on_sensor(int fd, int events, void *data) {
     (void)fd; (void)events; (void)data;
-    static double thr, gx, gy, gz, peak; static int64_t last = -1; static int init;
+    static double thr, peak;
     if (!thr) { const char *e = getenv("DM_SHAKE_G"); thr = e && atof(e) > 0 ? atof(e) : 1.5; }
     ASensorEvent ev[16]; ssize_t n;
     while ((n = ASensorEventQueue_getEvents(g_sq, ev, 16)) > 0) for (ssize_t i = 0; i < n; i++) {
-        if (ev[i].type != ASENSOR_TYPE_ACCELEROMETER) continue;
-        double x = ev[i].acceleration.x / ASENSOR_STANDARD_GRAVITY, y = ev[i].acceleration.y / ASENSOR_STANDARD_GRAVITY, z = ev[i].acceleration.z / ASENSOR_STANDARD_GRAVITY;
-        if (!init) { gx = x; gy = y; gz = z; init = 1; }
-        double dx = x - gx, dy = y - gy, dz = z - gz, g = sqrt(dx * dx + dy * dy + dz * dz);
-        gx += (x - gx) * 0.02; gy += (y - gy) * 0.02; gz += (z - gz) * 0.02;
-        if (g > thr) { if (last < 0) peak = 0; last = ev[i].timestamp; peak = fmax(peak, g); }
-        int on = last >= 0 && ev[i].timestamp - last < 120000000;
-        if (!on && last >= 0) { LOG("front end: device shaken (peak %.1f G)", peak); last = -1; }
-        uint64_t want = on ? DM_BTN_SHAKE : 0;
-        if (want != g_shake_btn) { g_shake_btn = want; pad_publish(); }
+        pthread_mutex_lock(&g_sensor_mu);
+        if (!g_sensor_on || atomic_load(&g_bg)) { pthread_mutex_unlock(&g_sensor_mu); continue; }
+        if (ev[i].type == ASENSOR_TYPE_GYROSCOPE && g_motion_device && g_have_acc) {
+            float acc[3], gyro[3];
+            if (motion_android_vectors(g_sensor_rotation, g_sensor_acc, ev[i].data, acc, gyro)) {
+                struct timespec bt; clock_gettime(CLOCK_BOOTTIME, &bt);
+                uint64_t boot = (uint64_t)bt.tv_sec * 1000000000ull + (uint64_t)bt.tv_nsec;
+                uint64_t t = motion_android_time(now_ns(), boot, ev[i].timestamp);
+                if (t) dm_motion_set_switch_at(0, acc, gyro, t);
+            }
+        } else if (ev[i].type == ASENSOR_TYPE_ACCELEROMETER) {
+            memcpy(g_sensor_acc, ev[i].data, sizeof g_sensor_acc); g_have_acc = 1;
+            // Real motion supplies its own acceleration; avoid adding a synthetic yaw while aiming.
+            if (!g_motion_device) {
+                double x = ev[i].acceleration.x / ASENSOR_STANDARD_GRAVITY, y = ev[i].acceleration.y / ASENSOR_STANDARD_GRAVITY, z = ev[i].acceleration.z / ASENSOR_STANDARD_GRAVITY;
+                if (!g_shake_init) { g_shake_gx = x; g_shake_gy = y; g_shake_gz = z; g_shake_init = 1; }
+                double dx = x - g_shake_gx, dy = y - g_shake_gy, dz = z - g_shake_gz, g = sqrt(dx * dx + dy * dy + dz * dz);
+                g_shake_gx += (x - g_shake_gx) * 0.02; g_shake_gy += (y - g_shake_gy) * 0.02; g_shake_gz += (z - g_shake_gz) * 0.02;
+                if (g > thr) { if (g_shake_last < 0) peak = 0; g_shake_last = ev[i].timestamp; peak = fmax(peak, g); }
+                int on = g_shake_last >= 0 && ev[i].timestamp - g_shake_last < 120000000;
+                if (!on && g_shake_last >= 0) { LOG("front end: device shaken (peak %.1f G)", peak); g_shake_last = -1; }
+                uint64_t want = on ? DM_BTN_SHAKE : 0;
+                if (want != g_shake_btn) { g_shake_btn = want; pad_publish(); }
+            }
+        }
+        pthread_mutex_unlock(&g_sensor_mu);
     }
     return 1;
 }
 static void shake_start(void) {
     ASensorManager *m = ASensorManager_getInstanceForPackage(NULL);
     g_accel = m ? ASensorManager_getDefaultSensor(m, ASENSOR_TYPE_ACCELEROMETER) : NULL;
-    if (!g_accel) { LOG("front end: no accelerometer, shaking the device does nothing"); return; }
+    g_gyro = m ? ASensorManager_getDefaultSensor(m, ASENSOR_TYPE_GYROSCOPE) : NULL;
+    const char *motion = getenv("DM_MOTION"), *phone = getenv("DM_PHONE_MOTION");
+    g_motion_device = g_accel && g_gyro && !(motion && !atoi(motion)) && !(phone && !strcmp(phone, "0"));
+    if (!g_accel) { LOG("front end: no accelerometer, device motion unavailable"); return; }
     g_sq = ASensorManager_createEventQueue(m, g_ilooper, 2, on_sensor, NULL);
-    const char *e = getenv("DM_SHAKE_G");
-    LOG("front end: shaking the device shakes the controller (threshold %.2f G)", e && atof(e) > 0 ? atof(e) : 1.5);
+    if (!g_sq) { LOG("front end: cannot create device sensor queue"); return; }
+    motion_rotation_update();
+    LOG("front end: device motion %s (accel %s, gyro %s, display rotation %d); sensors stop in background",
+        g_motion_device ? "enabled at 200 Hz" : "shake only", ASensor_getName(g_accel), g_gyro ? ASensor_getName(g_gyro) : "none", g_sensor_rotation);
     shake_sensor(!atomic_load(&g_bg));
 }
 static void *input_thread(void *a) {
     (void)a; g_ilooper = ALooper_prepare(0);
-    shake_start();
-    for (;;) { ALooper_pollOnce(-1, NULL, NULL, NULL); apply_input_resets(); }
+    int sensors_started = 0;
+    for (;;) {
+        // The data pack's environment arrives on the host thread. Do not latch
+        // DM_MOTION / its diagnostics before that thread has loaded it.
+        if (!sensors_started && !atomic_load(&g_preparing)) { shake_start(); sensors_started = 1; }
+        ALooper_pollOnce(-1, NULL, NULL, NULL); apply_input_resets();
+    }
     return NULL;
 }
 static void apply_input_resets(void) {
@@ -979,6 +1052,7 @@ static void *host_thread(void *a) {
     settings_load(); dm_haptics_android_start(g_act, atomic_load(&g_set_rumble));
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, g_act->vm)) pthread_detach(w); }
     atomic_store(&g_preparing, 0);
+    if (g_ilooper) ALooper_wake(g_ilooper);
     char mods[PATH_MAX]; snprintf(mods, sizeof mods, "%s/mods", g_data_root);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);

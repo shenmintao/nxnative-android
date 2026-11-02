@@ -305,6 +305,24 @@
 - 两个无效尝试已排除：Windows shell 二进制传输截断为原文件前 470 字节，已留证并逐文件恢复；改用 `adb push -Z` 暂存且先校验后替换。另一次解锁状态查询超时，完整恢复后重试；未把工具失败计作性能实验。
 - 合并后重新生成 main/subsdk0/sdk，与实验上游模块的二进制、fixups、gates、cuts、sites 全部一致；`plan2-merged-module-verification.json`。完整单测 147/147、0 跳过；最终 debug `ebf2c2c7…`、release `df622600…` 与验证层包已构建，数据包另存 `<BENCH>/final-export/`，最终实机验收开始。
 
+## 2026-11-02：合并后的 Vulkan 与震动回归
+- 最终验证层包（与 debug `ebf2c2c7…` 同一主机代码）在自有存档完成暖启动、移动 60 s、跳跃/攀爬/落地；`runs/20261102-125208-coverage/validation-result.json`。
+- Vulkan 验证层确认启用，0 错误；3 条片元输出无对应颜色附件的未使用输出警告。输出 1920×1080，该诊断时游戏 DRS 采样 1280×720；带验证层的时序不参与性能验收。
+- ADPF 日志确认 Android 16 的 GPU 时间上报与负载增加通知可用；不代表已解除均衡模式的频率上限，也没有修改系统设置。
+- 触控震动在 Android 服务记录为本包 UID 的已完成事件（14 ms、幅度 0.55）；游戏落地触发 `first rumble from the game: strength 11/255`，服务收到 600 ms、幅度 0.04/0.09 的更新，期间无 JNI 异常。`vibrator-before.txt`/`vibrator-after.txt` 留证，平板触控与游戏震动通路通过。
+- 陀螺仪缺口保持：没有真实 Android gyro → 游戏六轴数据通路；用户已明确延期，本轮未新增传感器功能。
+- 完成后正式版、原设置、主存档和原模块逐项恢复，熄屏；接着以最终 debug、不带验证层、上游规则且不额外绑核做阶段 3 性能验收。
+
+## 2026-11-02：按用户新要求合入真实陀螺仪
+- 用户把延期安排改为本轮一起合并；验收为 TB323FU 的真实 gyro/accelerometer 进入 BotW 1.9.0 六轴返回值，横屏方向和单位正确，后台停采样且恢复正常，震动和最终性能另做回归。
+- 最新 nxnative `99330eb81c873c3aafe9fc92194c9687d77fcdbb` 已有实时 motion：移植 `motion_fusion.h`、`t_motion.c` 及 HID 的 live-motion 部分；不合并该上游的其他无关变化。nx2android main 复查仍为已合并的 `8e030b41`。
+- Android 新增 200 Hz 校准 gyro + 加速度采集，按 Display rotation 转到屏幕坐标，将 m/s² 比力转换为重力 G；沿用上游 rad/s → rev/s、角速度积分、重力校正与 300 ms 过期回退，补齐 BOOTTIME → MONOTONIC 样本时间和后台清空。
+- 传感器等数据包环境加载后才启用，避免提前锁定 `DM_MOTION` 配置；默认 auto 使用平板输入，可用 `DM_MOTION=0` 关闭实时输入。无 gyro 的设备保留原有 shake 回退；其他平台/控制器来源保持上游选择规则。
+- 新增方向/单位/时钟及真实 HID 返回值测试，完整 unittest 150/150、0 跳过、119.976 s；NDK 调试及验证层包构建成功。`plan2-gyro-unit.log`、`plan2-gyro-build.log`。
+- `runs/20261102-132433-coverage/`：LSM6DSV 实时输入被游戏读取，平放重力约 (0.02,0,−1) G，转动峰值 0.3 rev/s；用户用望远镜实测确认“方向正确，放稳后稳定”。
+- 服务实测前台 gyro 连接 1、后台 0；恢复后 guest reads 从 14,759 增到 15,361。结果文件编码名笔误已修正，从原始日志/服务快照/用户回复恢复 JSON 并保留说明；实际检查均已执行，正式版、原设置、主存档及模块恢复通过。
+- 先前最终四窗在首轮预热时按用户新增范围主动结束，未取得测量窗口，不计入验收；下一步用含 gyro 的最终包重新跑 VVL、四窗性能、首次移动、30 分钟浸泡与 release 冒烟。
+
 ## 历史
 
 以下为原 docs/PORT_STATUS.md 中的 BotW 实验记录，原样迁移；当时的设置、分支和结论不代表本计划的最终状态。
