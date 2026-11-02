@@ -18,19 +18,21 @@ static void check(double latest, const double *spans, int count, double period, 
 }
 int main(void) {
     const double steady[] = {13,13,13,13,13,13,13,13}; check(13,steady,8,16.7,13);
-    const double spike[] = {170,13,14,12,13,13,14,12}; check(170,spike,8,16.7,26);
-    const double first[] = {203,13,13,13,13,13,13,13}; check(203,first,8,16.7,26);
-    const double second[] = {68,203,13,13,13,13,13,13}; check(68,second,8,16.7,26);
+    const double spike[] = {170,13,14,12,13,13,14,12}; check(170,spike,8,16.7,13);
+    check(170,spike,8,33.3,13);  // interval 2 changes detection, not the typical GPU work
+    const double period_boundary[] = {33.3,13,13}; check(33.3,period_boundary,3,33.3,33.3);
+    const double first[] = {203,13,13,13,13,13,13,13}; check(203,first,8,16.7,13);
+    const double second[] = {68,203,13,13,13,13,13,13}; check(68,second,8,16.7,13);
     const double heavy[] = {30,30,30,30,30,30,30,30}; check(30,heavy,8,16.7,30);
     const double low[] = {5,2,2,2,2,2,2,2}; check(5,low,8,16.7,5);
     const double short_history[] = {170,13};
     for (int n = 0; n < 3; n++) check(170,short_history,n,16.7,170);
     check(-1,steady,8,16.7,-1); check(-7,NULL,0,16.7,-7);
-    const double period_cap[] = {170,2,2}; check(170,period_cap,3,16.7,16.7);
-    const double even[] = {170,11,12,13,14,15,16,17}; check(170,even,8,16.7,29);
+    const double period_cap[] = {170,2,2}; check(170,period_cap,3,16.7,2);
+    const double even[] = {170,11,12,13,14,15,16,17}; check(170,even,8,16.7,14.5);
     const double boundary[] = {26,13,13}; check(26,boundary,3,16.7,26);
     const double missing[] = {170,-1,13,-1}; check(170,missing,4,16.7,170);
-    assert(vk_pace_budget_estimate(170,spike,8,16.7,NULL) == 26);
+    assert(vk_pace_budget_estimate(170,spike,8,16.7,NULL) == 13);
     return 0;
 }
 #endif
@@ -52,12 +54,12 @@ int main(void) {
     fresh(); mtl_set_frame(100); sample(100,999); sample(99,999); sample(98,13);
     assert(vk_gpu_ms_budget(16.7,&trimmed) == vk_gpu_ms_recent() && trimmed == 0);
     sample(98,170); sample(96,13); sample(90,13);  // sparse known spans, including history beyond f-7
-    assert(vk_gpu_ms_recent() == 170 && vk_gpu_ms_budget(16.7,&trimmed) == 26 && trimmed == 144);
+    assert(vk_gpu_ms_recent() == 170 && vk_gpu_ms_budget(16.7,&trimmed) == 13 && trimmed == 157);
     fresh(); sample(92,13); sample(90,13); sample(89,13);  // only old entries: raw latest is still unknown
     assert(vk_gpu_ms_recent() == -1 && vk_gpu_ms_budget(16.7,&trimmed) == -1 && trimmed == 0);
     fresh(); sample(98,170);
     for (int i = 3; i <= 9; i++) sample(100 - (uint64_t)i,13);
-    sample(90,999); assert(vk_gpu_ms_budget(16.7,&trimmed) == 26 && trimmed == 144);
+    sample(90,999); assert(vk_gpu_ms_budget(16.7,&trimmed) == 13 && trimmed == 157);
     sample(98 - 64,999);  // stale ring slot must not count as frame 98
     assert(vk_gpu_ms_recent() == 13 && vk_gpu_ms_budget(16.7,&trimmed) == 13);
     for (uint64_t f = 0; f < 200; f++) {
@@ -152,7 +154,7 @@ int main(void) {
     fresh(); mtl_set_frame(100); for (uint64_t k = 2; k < 10; k++) sample(100 - k,13);
     uint64_t normal = pace_desired(1.0 / 60,0); assert(normal && g_pace_budget_on && budget_calls == 1 && !raw_calls && !g_pace_trimmed);
     pace_reset(); sample(98,170); uint64_t capped = pace_desired(1.0 / 60,0);
-    assert(capped < normal + 20000000 && g_pace_trimmed == 1 && g_pace_trimmed_ms == 144);
+    assert(capped < normal + 20000000 && g_pace_trimmed == 1 && g_pace_trimmed_ms == 157);
     budget_env = "0"; g_pace_n = 29; pace_desired(1.0 / 60,0); assert(g_pace_budget_on);
     pace_reset(); uint64_t legacy = pace_desired(1.0 / 60,0); assert(!g_pace_budget_on && raw_calls == 1 && legacy > capped + 100000000);
     budget_env = "1"; g_pace_n = 60; pace_reset(); pace_desired(1.0 / 60,0); assert(g_pace_budget_on);
@@ -164,6 +166,9 @@ int main(void) {
     assert(strstr(log_line,"budget_trimmed_ms="));
     pace_env = "0"; g_pace_n = 600; calls = budget_calls;
     assert(!pace_desired(1.0 / 60,0) && budget_calls == calls);
+    pace_env = "1"; g_pace_n = 630; pace_reset();
+    uint64_t half = pace_desired(1.0 / 30,0), next = pace_desired(1.0 / 30,0);
+    assert(next >= half + 30000000);  // an outlier replacement still honours interval 2
     return 0;
 }
 #endif

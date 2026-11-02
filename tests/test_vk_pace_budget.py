@@ -73,6 +73,10 @@ class VulkanPaceBudget(unittest.TestCase):
         self.assertIn("['-DDM_RELEASE=1'] if a.release else []", build)
 
     def test_raw_spans_still_feed_frame_cost_and_timing(self):
+        estimate = (ANDROID / 'vk_pace_budget.h').read_text(encoding='utf8')
+        self.assertIn('if (latest <= cap) return latest;', estimate)
+        self.assertIn('*trimmed_ms = latest - median;', estimate)
+        self.assertIn('return median;', estimate)
         core = (ANDROID / 'gfx_vk_core.c').read_text(encoding='utf8')
         raw = function(core, 'double vk_gpu_ms_recent(')
         self.assertIn('k = 2; k < 8 && k <= f', raw)
