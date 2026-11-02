@@ -267,6 +267,16 @@
 - 组恢复检查通过：正式版、原设置、主存档不变并熄屏。按用户指示继续第 8a；其对照基线保留已证实的单线程绑核，8a/8b 两项不叠加。
 - 启用配置后的完整 unittest 116/116、0 跳过，178.209 s；`plan2-pin-retained-tests.log`。该项成为保留修复，连续无收益实验计数归零。
 
+## 2026-11-02：计划 2，第 8a 更新的上游规则移植
+- 按用户更新，仅移植 nxnative `2c31212f9d315048a2c1c444adaa06599c0acbfe` 的 “Spin waits” 一节（+88/−10），以及 5 个原有回归测试；不带并行扫描或其他上游改动。
+- 此前 build-ID 定点原型只做了本地构建/测试、未上设备；源码已撤回，留档 `<BENCH>/spin-now-superseded/`，不计作一次性能实验。
+- 新规则通用识别平衡加解锁、内层只读测试和不变地址/值的状态写入，继续使用原 spin gate/主机退避；没有新增游戏专用补丁或主机调用语义。
+- 重写 main/subsdk0/sdk：main spin wait 308 → 310，新增 0xef6354、0xf82230，旧回边均保留；subsdk0 的区域扩展使二进制变化、仍为 10 个；sdk 仍为 3 个且字节完全相同；全部 fixups 布局不变。
+- 完整 unittest 121/121、0 跳过，222.273 s；`plan2-lock-poll-unit-tests.log`。调试包 `db7fbcef…` 和验证层包构建成功，设备验证与收益均待测。
+- 新模块在 `<BENCH>/modules-lock-poll/`，原模块仍在设备和 `<BUILD>/android/patched_v1114112/`；`plan2-upstream-spin-source.json`、`plan2-lock-poll-module-verification.json` 保存来源与差异。
+- 用户纠正比较口径：需要对照原绑核 ON/OFF、判断哪种方案更好；已暂停原定叠加测试。后续先测不绑核时的旧/新模块四窗，再区分原始、仅绑核、仅上游、叠加；应复用原 `0d97537f…` APK 与 1,199-key 条件保持可比。
+- 实机尚未开始，平板保持正式版、原设置与主存档、熄屏；模块恢复工具 27 项检查通过，但开测前还需把 subsdk0 纳入模块备份/恢复范围。
+
 ## 历史
 
 以下为原 docs/PORT_STATUS.md 中的 BotW 实验记录，原样迁移；当时的设置、分支和结论不代表本计划的最终状态。
