@@ -673,10 +673,12 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; stat
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
+__attribute__((weak)) void dm_perf_sync_wait(uint64_t fence) { (void)fence; }   // Android: optional placement of one recurring explicit-sync caller
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     DM_SYNC_FENCE_SCOPE(o->fenced == 2 ? "fence: NVN acquire wait" : o->fenced ? "fence: NVN explicit wait" : "fence: NVN unassigned wait", o->fenced ? o->fence : 0);
     if (!o->fenced) { SEQ("syncwait %p unfenced", (void *)s); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
+    if (o->fenced == 1 && timeout) dm_perf_sync_wait(o->fence);
     if (nvn_fence_wait(o->fence, 0)) { SEQ("syncwait %p kind %u already", (void *)s, o->fenced); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
     uint64_t t0 = now_ns(); int r = nvn_fence_wait(o->fence, timeout);
     SEQ("syncwait %p kind %u timeout %llu waited %.2f ms -> %d", (void *)s, o->fenced, (unsigned long long)timeout, (now_ns() - t0) / 1e6, r);

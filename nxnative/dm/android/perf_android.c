@@ -106,6 +106,40 @@ void dm_perf_replay_thread(void) {
     LOG("[perf] replay thread on CPUs%s (%s, up to %ld MHz)", l, prime ? "prime" : "big", hi);
 }
 
+// An explicit GPU-sync caller can produce the next frame while the presenting
+// thread sleeps. Identify one recurring caller, excluding the presenting thread
+// and repeated polls of the same fence. This experiment never pins all workers.
+static _Atomic int g_perf_frame_tid, g_sync_pin_tid;
+static pthread_once_t g_sync_pin_once = PTHREAD_ONCE_INIT;
+static int g_sync_pin_enabled;
+static void sync_pin_init(void) {
+    const char *e = getenv("DM_PIN_SYNC_THREAD"); g_sync_pin_enabled = e && !strcmp(e, "prime");
+}
+void dm_perf_sync_wait(uint64_t fence) {
+    pthread_once(&g_sync_pin_once, sync_pin_init);
+    if (!g_sync_pin_enabled || !fence || atomic_load_explicit(&g_sync_pin_tid, memory_order_relaxed)) return;
+    int tid = (int)gettid(), frame = atomic_load_explicit(&g_perf_frame_tid, memory_order_relaxed);
+    if (!frame || tid == frame) return;
+    static _Thread_local uint64_t last; static _Thread_local unsigned distinct;
+    if (fence <= last) return;
+    last = fence; if (++distinct < 32) return;
+    int empty = 0;
+    if (!atomic_compare_exchange_strong(&g_sync_pin_tid, &empty, tid)) return;
+    long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
+    long clocks[32] = {0}, hi = 0, lo = 0;
+    for (long c = 0; c < n; c++) {
+        char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "r"); if (f) { if (fscanf(f, "%ld", &clocks[c]) != 1) clocks[c] = 0; fclose(f); }
+        if (clocks[c] > hi) hi = clocks[c];
+        if (clocks[c] && (!lo || clocks[c] < lo)) lo = clocks[c];
+    }
+    if (!hi || hi == lo) { LOG("[perf] sync caller %d: CPU capacities unknown or uniform, not pinned", tid); return; }
+    cpu_set_t set; CPU_ZERO(&set);
+    for (long c = 0; c < n; c++) if (clocks[c] == hi) CPU_SET(c, &set);
+    if (sched_setaffinity(0, sizeof set, &set)) { LOG("[perf] sync caller %d: affinity refused", tid); return; }
+    LOG("[perf] explicit sync caller %d pinned to prime cores after %u distinct fences", tid, distinct);
+}
+
 static int64_t g_work_start;
 static _Atomic uint64_t g_frame_deadline;
 static _Atomic int g_step_owns_pacing;
@@ -219,6 +253,7 @@ static int64_t g_prev_present, g_pace;
 void dm_perf_frame_start(uint64_t pace_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
 void dm_perf_frame(double period) {
+    atomic_store_explicit(&g_perf_frame_tid, (int)gettid(), memory_order_relaxed);
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
     // and the work then never shows the room to step back up (NEO stayed at 30 fps with frames of 31 to 48 ms)
