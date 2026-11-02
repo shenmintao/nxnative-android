@@ -29,6 +29,8 @@ That baseline passed 150 engine tests, Vulkan validation with zero errors (three
 
 **First-use follow-up (2026-11-02):** broader gameplay reproduced stutters outside that route. Timed attribution linked graphics creation to 6 of 11 intervals over 50 ms in an expanded-route diagnostic. This candidate adapts upstream program-creation prefetch and bounded command lookahead to Vulkan, using ordinary full pipelines. It passed 156 source tests and a cold first-use rendering check with zero Vulkan errors and three unused-output warnings. One ordinary 120 s observation records 59.135 fps and 16 intervals over 50 ms; hitches remain. The user waived OFF/ON/ON/OFF, so performance gain is **unquantified**. [Follow-up scope, evidence and limits](docs/perf-hitch-followup.md).
 
+A subsequently requested single original-version baseline records 58.934 fps and 14 intervals over 50 ms. The new observation's +0.201 fps is inside the noise floor, with mixed long-frame results and differing periodic draw counts; **no clear improvement is established**.
+
 ## Hardware compatibility
 
 The ARM64 runtime and generic lock rule are shared across SoCs. This fork's final BotW measurements are specific to SM8850P; upstream separately tested an Adreno 830 device. A Snapdragon 8 Elite / SM8750 needs its own performance check.

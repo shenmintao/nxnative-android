@@ -11,6 +11,7 @@ Authorized by the user on 2026-11-02 after the manual-play report and upstream r
 - Implement only a cause shown to explain a material portion of long frames. Check the two upstreams first. Do not skip draws or alter shader precision.
 - The user explicitly waived OFF/ON/ON/OFF for this follow-up on 2026-11-02. Build on production 44a337e0, validate source checks, unchanged rendering/input and zero Vulkan errors, then run one bounded moving smoke in the owned seed. Record presentation metrics as observations only; performance gain remains unquantified. Do not restart comparative or long-running performance loops.
 - Finish with appropriate unit checks, zero Vulkan validation errors, release smoke, original preferences and unchanged primary saves. Implementation groups restore production APK 44a337e0; the completed release smoke promotes bcd840c1 below as the next production baseline. Future groups must restore the new baseline. Final 30-minute soak remains waived unless the user asks for it.
+- After rc2 packaging, the user requested one original-version measurement against the existing new-build observation. Run the retained pre-prefetch debug F416 (production equivalent 44a337e0), the same owned seed, driver/key cache, six-second route, balanced mode and 1080p output / stock internal DRS, 60 s warmup plus 120 s actual-present capture. Compare fps, >17.5 ms / >50 ms / >100 ms intervals, maximum interval, sampled main-pass size and thermal/cap observations. Restore production bcd840c1 and verify unchanged primary saves/preferences. This authorizes one baseline, not a restarted four-window loop; a single historical pair does not satisfy repeatability acceptance.
 
 ## Starting evidence
 
@@ -36,6 +37,21 @@ The user approved program-creation shader prefetch and bounded upcoming-command 
 Windows x64 bundle built with Python 3.12.10, PySide6 6.12.0 and PyInstaller 6.22.3 in an isolated environment. The PyInstaller source archive matches the SHA-256 published by PyPI; the launchers were compiled locally. Frozen `--help`, `profiles`, `-m porter profiles` and engine `build.py --help` pass. The native Windows Qt platform renders all four tabs with the expected 0.3.0rc2 version and adjacent engine path; the hidden-window screenshot was inspected. An offscreen-platform font artifact does not occur with the native Windows platform. No game assets, keys or toolchains are bundled.
 
 Final source review moved the single-owner replay shadow off guest stacks and kept unsupported stages on the original demand path. The 12 affected queue/replay/host checks were rerun successfully, all 144 release sources build, and the resulting bcd840c1 APK passed the isolated release smoke above. The earlier cold validation and ordinary moving observation used the preceding build of the same two mechanisms.
+
+## Requested single original-version baseline
+
+After packaging, the user requested one run of the pre-prefetch implementation. Retained debug F416 (production equivalent 44a337e0) ran in `20261102-192400-original-pre-prefetch-once`, with the same owned seed, cache inputs, route script, timing switches, 60 s warmup and 120 s capture as the existing new-build observation. Both sample internal 1600x900 before/after, output 1920x1080, prewarm1209, balanced CPU caps 1996800/2438400 kHz and CPU/GPU/skin severity zero. The start screenshots match location/view; the script does not lock weather or simulation phase, and periodic mean draw counts differ (4450.417 original, 3706.750 new).
+
+| Metric | Original baseline | Earlier new-build observation |
+|---|---:|---:|
+| Average fps | 58.934487 | 59.135126 |
+| Late intervals >17.5 ms | 1.300537% | 1.112990% |
+| p99 interval | 25.001354 ms | 25.001354 ms |
+| Intervals >50 ms | 14 | 16 |
+| Intervals >100 ms | 6 | 5 |
+| Maximum interval | 308.350416 ms | 200.010937 ms |
+
+The +0.200639 fps (+0.34%) difference is inside the ~1% noise floor. The p99 is unchanged; maximum interval and >100 ms count are lower, while >50 ms count is higher. This single historical pair provides no clear performance improvement and is not repeated acceptance. Original audio/PID/presentation gates pass with 127 latency matches and RED0. Current production bcd840c1, original preferences and primary saves were verified/restored; app stopped/display OFF. No additional comparison windows or code/default changes followed this requested measurement.
 
 ## Previous GPL experiment
 
