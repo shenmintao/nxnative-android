@@ -17,7 +17,7 @@ For a standalone review brief with version identities, raw-artifact locations an
 
 ## Starting evidence
 
-Manual route diagnostic `20261102-151653-user-live-hitch`: 120.112 s, 58.004 fps, 33 intervals >50 ms, 12 >100 ms, max 241.680 ms. Graphics creation checkpoints 1301 to 1689 after prewarm completed. Android generic `mtl_*` pipeline/upload statistics are fixed-zero stubs and cannot exclude this work; GPU timestamp envelopes include submission gaps.
+Manual route diagnostic `20261102-151653-user-live-hitch`: 120.112 s, 58.004 fps, 33 intervals >50 ms, 12 >100 ms, max 241.680 ms. The periodic pipeline counter rises 1301 to 1689 after prewarm completed. The old graphics demand path increments `pipes_built` once inside `build_pipeline` and once again in `graphics_pipeline`: +388 counter units correspond to approximately 194 demand builds, not 388 distinct creations. Android generic `mtl_*` pipeline/upload statistics are fixed-zero stubs and cannot exclude this work; GPU timestamp envelopes include submission gaps.
 
 Publication and Dimensity 9400 experiments were held during this investigation. The first-use mechanisms below form candidate 0.3.0rc2; Dimensity experiments remain deferred. The accepted short-route plan 2 measurements stay in `perf-plan-2.md`; they are not evidence for the broader route.
 
