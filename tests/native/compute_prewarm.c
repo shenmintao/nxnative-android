@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,7 @@ static void *contend(void *arg) {
 }
 int main(void) {
     assert(sizeof(pkey) == 1000);
+    assert(offsetof(pkey, kind) == 936 && offsetof(pkey, um) == 944 && offsetof(pkey, im) == 968);
     putenv("DM_ROOT=."); putenv("DM_VK_NOPREWARM=1");
     pkey keys[3] = {{.key={17}, .kind=99}, {.key={18}, .kind=1, .um={3}, .im={4}}, {.kind=77}};
     file_with(PIPE_MAGIC_V1, sizeof(pkey), keys, 1, 1);
