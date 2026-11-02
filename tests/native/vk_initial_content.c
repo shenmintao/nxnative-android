@@ -15,7 +15,8 @@ typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;
 typedef struct { uint64_t serial; const uint8_t *mem; pool_t *pool; int64_t off; nvn_texdesc d; nvn_texlayout L; int has_layout; } tex_t;
 typedef struct { uint32_t w,h,d,layers,levels; VkImage img; VkImageAspectFlags aspect; VkImageLayout layout;
     int gpu_w,packaged,pkg_released; uint64_t pkg_stamp,pkg_seen; const void *pkg_span; const uint8_t *pkg_mem; size_t pkg_len; } vkimg_t;
-typedef struct { int vk; uint32_t bw,bh,bpb; } vkfmt_t;
+typedef struct { int vk; uint32_t bw,bh,bpb; int dec,dbpp; } vkfmt_t;
+static void bc_decode(const vkfmt_t *f,const uint8_t *p,size_t pitch,uint32_t w,uint32_t h,uint32_t z,uint8_t *dst) { (void)f;(void)p;(void)pitch;(void)w;(void)h;(void)z;(void)dst; assert(0 && "BC decoding has its own fixture"); }
 static uint8_t storage[2<<20], arena[2<<20], expected[8][8][65536];
 static size_t used, expected_bytes[8][8];
 static int copies, prepares, protected_ranges, span_reads, flush_calls, was_flushed, errors, write_notices;

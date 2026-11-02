@@ -20,6 +20,8 @@ class AdaptiveFrameRate(unittest.TestCase):
         controller = controller.replace(
             '__attribute__((weak)) double dm_nvn_present_hold_ms(void) { return 0; }',
             'static double test_present_hold; double dm_nvn_present_hold_ms(void) { return test_present_hold; }')
+        hint, shown = controller.index('// The frame\'s work to the CPU hint'), controller.index('// The frames\' time on screen')
+        controller = controller[:hint] + controller[shown:]   # without hint_report: the Android hint API (H, g_hint), called only from dm_perf_frame
         harness = r'''
 #include <assert.h>
 #include <stdint.h>

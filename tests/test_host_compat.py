@@ -198,6 +198,16 @@ int main(void) {
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
+#include <stdio.h>
+#define VKLOG(...) ((void)printf(__VA_ARGS__))
+static int g_prof_on;
+static volatile int g_vk_samp_log;
+static uint64_t g_prof_ns[8], g_prof_t0, g_prof_pkg0, g_prof_npkg0, g_prof_pipes0, g_pkg_ns, g_pkg_n, g_tex_frame;
+static struct { uint64_t pipes_built; } g_vkst;
+static uint64_t tick(void) { return 1; }
+static int gettid(void) { return 1; }
+static void compute_warm_start(void) {}
 #define VK_NULL_HANDLE NULL
 static struct { int pass_open; void *bound_pipe; uint64_t logical_state; } S;
 static int g_cb_draws, g_ord_parts, g_psplit_now, g_rc_npend, g_rc_skip;
@@ -422,7 +432,7 @@ int main(void) {
 typedef int qos_class_t;
 enum { QOS_CLASS_UNSPECIFIED, O_THREAD };
 typedef struct thr {
-    int started, exited, host_owned, core, prio, running, wkind, woke, last_svc, yield_pending;
+    int started, exited, host_owned, core, prio, running, wkind, sleeping, woke, last_svc, yield_pending;
     uint32_t handle, qos; uint64_t mask, id, last_lr; int64_t wres;
     pthread_t pt; uintptr_t mport; int *host_work;
     pthread_cond_t cv, pcv; struct thr *all;
@@ -448,7 +458,7 @@ static void wait_unlink(thr_t *t) { (void)t; }
 typedef struct { const char *name; uint8_t *base; } module_t;
 static module_t *module_of(const void *p) { (void)p; return NULL; }
 #define LOG(...) do { if (0) fprintf(stderr, __VA_ARGS__); } while (0)
-''' + function(src, 'int dm_yield_to_core_peers(') + function(src, 'static void wake(') + function(src, 'uint32_t svc_thread_main_init(') + r'''
+''' + src[src.index('typedef struct { thr_t *t; uint32_t handle;'):src.index('static int busy_peer(')] + function(src, 'static int busy_peer(') + function(src, 'int dm_yield_to_core_peers(') + function(src, 'static void wake(') + function(src, 'uint32_t svc_thread_main_init(') + r'''
 static void *finish_peer(void *arg) {
     struct timespec delay = {0, 5000000}; nanosleep(&delay, NULL);
     pthread_mutex_lock(&G); ((thr_t *)arg)->running = 0; pthread_mutex_unlock(&G);

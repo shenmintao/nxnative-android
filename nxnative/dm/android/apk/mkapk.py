@@ -15,6 +15,7 @@ _p.add_argument('--label', default='NX2A Probe'); _p.add_argument('--lib', defau
 _p.add_argument('--extra-so', action='append', default=[], help='another arm64 library packed beside the main one (a Vulkan validation layer)')
 _p.add_argument('--query-package', action='append', default=[], help='make a named package visible to this app (for example an external GPU debug layer); repeatable')
 _p.add_argument('--icon', help='launcher icon (a PNG, used at its own size: nodpi)')
+_p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='a file the app reads with AAssetManager as NAME (assets/NAME in the APK): the gamepad theme')
 _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--data', help='embed a data pack in the APK for automatic first-launch preparation')
 _p.add_argument('--pipeline-keys', help='recorded PPE1 keys for this game build, seeded on first launch')
@@ -220,6 +221,7 @@ def main():
         print(f'new signing key {keyf} ({time.time() - t:.1f} s)')
     entries = [Entry('AndroidManifest.xml', axml(MANIFEST)), Entry('classes.dex', Path(__file__).resolve().parent / 'bridge/classes.dex'), Entry(f'lib/{ARGS.abi}/lib{LIB}.so', Path(so), 16384)]
     entries += [Entry(f'lib/{ARGS.abi}/{os.path.basename(x)}', Path(x), 16384) for x in ARGS.extra_so]
+    entries += [Entry(f'assets/{n}', Path(f)) for n, _, f in (x.partition('=') for x in ARGS.asset)]
     if ARGS.icon: entries += [Entry('resources.arsc', res_table('res/drawable-nodpi-v4/icon.png')), Entry('res/drawable-nodpi-v4/icon.png', Path(ARGS.icon))]
     if ARGS.data:
         data = GamePack(ARGS.data, PKG)

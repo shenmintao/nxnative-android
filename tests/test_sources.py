@@ -83,8 +83,12 @@ class SourceImports(unittest.TestCase):
             sources.resolve(self.folder / 'missing.nsp')
         compressed = self.folder / 'game.nsz'
         compressed.write_bytes(b'anything')
-        with self.assertRaisesRegex(BuildError, 'choose an NSP or XCI'):
+        with self.assertRaisesRegex(BuildError, 'not an NSP/PFS0'):
             sources.resolve(compressed)
+        unsupported = self.folder / 'game.iso'
+        unsupported.write_bytes(b'anything')
+        with self.assertRaisesRegex(BuildError, 'choose an NSP, XCI, NSZ or XCZ'):
+            sources.resolve(unsupported)
 
     def test_ticketless_named_xci(self):
         cartridge = self.folder / 'Game [010043B013C5C000].XCI'

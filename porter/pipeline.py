@@ -1,13 +1,13 @@
-# The port: a game folder (NSP / XCI) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
+# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
 # The steps every platform shares are upstream's (porter.upstream.nsp: scan, extraction, the shader split, stage reuse, progress); the Android ones are here:
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
 # with the Android ones in its android/ folder.
-import os, re, shutil, sys
+import importlib.util, os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, containers, datapack, fpslocker, install, native_tools, paths, prewarm, profiles, sources, toolchain
+from porter import config, containers, datapack, dumps, fpslocker, install, native_tools, paths, prewarm, profiles, sources, toolchain
 from porter.adb import Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say
@@ -34,6 +34,9 @@ class Options:
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
     data_mode: str = 'embedded'         # embedded: one APK; external: APK + data directory for large games
+    touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
+    vercode_offset: int = 0            # added to the APK's versionCode: a rebuild of the same game version installs over a build with a higher one (version_code)
+    alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -42,22 +45,91 @@ def app_stem(g, name):   # the file name of the APK and the data pack: the profi
     return ipa[:-4] if ipa.endswith('.ipa') else ipa
 
 
-def version_code(ver):   # the APK's versionCode: the Switch version number (v196608 → 196609), so an update of the game installs over the base game's port
-    return nsp.vnum(ver) + 1
+# --touch: the pause menu's first-launch defaults for a game played by touch. The gamepad's controls take every touch that goes down on them or near them (front_android.c ctl_at,
+# overlay_layout.h ov_reach: about a quarter of a tablet's screen, at its sides); hidden, only the menu button does and every other touch is the game's, in both modes (hle_hid.c
+# touch_on). As Unpacking's profile (setting overlay=0); the pause menu's Gamepad item shows it again, and a controller works either way
+TOUCH_SETTINGS = {'overlay': '0'}
+
+VERCODE_OFFSET_MAX = 65535   # Switch versions are 65536 apart (v65536, v131072): a rebuild of one, offset by this much at most, stays below the next one's port
+
+
+def version_code(ver, offset=0):
+    """The APK's versionCode: the Switch version number (v196608 → 196609), so an update of the game installs over the base game's port. Android installs an APK over one
+    with the same versionCode, never over a higher one (INSTALL_FAILED_VERSION_DOWNGRADE): offset (porter port --vercode-offset) lifts a rebuild above a build already on
+    the device (an earlier rebuild with an offset, a port of a later version) and keeps its saves, where an uninstall deletes them"""
+    if not 0 <= offset <= VERCODE_OFFSET_MAX: raise BuildError(f'the versionCode offset must be 0 to {VERCODE_OFFSET_MAX} (the next game version\'s port must stay above it): {offset}')
+    return nsp.vnum(ver) + 1 + offset
+
+
+ALIAS_HEADROOM, ALIAS_HEADROOM_MAX = 8 << 30, 48   # the automatic headroom (bytes); the most --alias-headroom takes (GB: a 64 GB block with Engage's 5 GB layout)
+def alias_headroom_gb(gb):   # --alias-headroom checked: None (automatic) or 0 .. ALIAS_HEADROOM_MAX GB
+    if gb is not None and not 0 <= gb <= ALIAS_HEADROOM_MAX: raise BuildError(f'--alias-headroom {gb}: give 0 to {ALIAS_HEADROOM_MAX} GB')
+    return gb
+ALIAS_HINT = ('if it still crashes after "[RED] [mem] AllocateAddressRegion … refused" (0x1803), port again with a larger --alias-headroom '
+              '(the Port tab\'s Extra address space)')
+
+
+def alias_headroom(tsv, gb=None):
+    """A profile's guest block for a game whose profile declares virtual address memory (a sys_resource row, not 0): mem_alias and mem_reserve grow by gb GB (None: ALIAS_HEADROOM,
+    which a derived profile gets; the player's --alias-headroom, for any port), so the heap (the rest of the block, hle_svc.c mem_init) stays as it is. Such a game takes its
+    memory as address regions in the alias region, and how it does depends on its build: the profile's alias region was sized for the tested build. Donkey Kong Country Returns HD on the Y700 (GitHub issue #26): update 1.1.0 reserves about 1.8 GB of regions, up to
+    +2.75 GB of the 4.375 GB alias region; its base game v0 (main 8ac516e8…) first hands pool − used to a StandardAllocator as one 3.14 GB region, which 1.1.0 does not, and then
+    reserves Unity's regions above it. In the 4.375 GB region it was refused (0x1803) a few seconds in and crashed at main+0x829630; with 1 GB more it crashed in the opening movie at
+    +5.37 GB. Unity frees regions and makes new ones higher up, so the highest address keeps rising above the bytes reserved (4.8 GB): +6.26 GB after the movie, +7.01 GB in 1-1,
+    and below +7.25 GB from there to 22 minutes of play with 8 GB more, at 60 fps. A profile without the row (the host then reports 32 MB) is older than the key, and its games set
+    a heap; it is left as it is. The Android host reserves the block with MAP_NORESERVE, so the address space costs no memory (Xenoblade Chronicles 3 runs in a 64 GB alias region).
+    → (old alias, new alias), or None when the profile is left as it is (gb 0 too)"""
+    add = ALIAS_HEADROOM if gb is None else gb << 30
+    lines = tsv.read_text(encoding='utf-8').splitlines()
+    rows = {l.split('\t', 1)[0]: i for i, l in enumerate(lines) if '\t' in l and not l.startswith('#')}
+    val = lambda k, d=None: int(lines[rows[k]].split('\t')[1], 0) if k in rows else d
+    if not add or not val('sys_resource', 0) or 'mem_alias' not in rows or 'mem_reserve' not in rows: return None
+    alias, reserve = val('mem_alias'), val('mem_reserve')
+    lines[rows['mem_alias']], lines[rows['mem_reserve']] = f'mem_alias\t{alias + add:#x}', f'mem_reserve\t{reserve + add:#x}'
+    lines.insert(min(rows['mem_alias'], rows['mem_reserve']), f'# porter: {add >> 30} GB more alias region than the tested build\'s ({alias:#x}), and the block with it, for this build\'s address regions')
+    tsv.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return alias, alias + add
+
+
+def registered_patches():
+    """{build ID: (the file, [the reason of each patch])} of the files the rewriter loads (patch_nso.py "Registered patches": dm/tools/sdk_patches.py and the profiles' patches.py;
+    CUTS and OBS by their reasons, FRAME_STEP as its stubs)"""
+    out = {}
+    for n, p in enumerate([DM / 'tools/sdk_patches.py'] + sorted((DM / 'games').glob('*/patches.py'))):
+        spec = importlib.util.spec_from_file_location(f'porter_patches_{n}', p); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        rel = p.relative_to(DM.parent).as_posix()
+        for kind in ('CUTS', 'OBS', 'FRAME_STEP'):
+            for bid, v in getattr(m, kind, {}).items(): out.setdefault(bid, (rel, []))[1].extend(['frame step stubs'] if kind == 'FRAME_STEP' else [x[3] for x in v])
+    return out
+
+
+def lost_patches(builds, exefs, mods, table=None):
+    """The modules of a derived port whose build has no registered patch while the profile's tested builds of it have some: the rewriter applies a module's patches by its build ID
+    only, so the module runs without them. Unpacking's base game v0 ships sdk 2d369d99… (no cuts until GitHub issue #26) where update 2.01's sdk 357efc19… has the node-area and
+    1 GB alignment cuts, without which Unity's camera target got no address region and the title was white. → ['<module> build … is not the tested …: …'], one per module"""
+    table = registered_patches() if table is None else table
+    out = []
+    for m in mods:
+        if not (exefs / m).is_file(): continue
+        bid, tested = nsp.build_id(exefs / m), sorted({b[m] for b in builds.values() if b.get(m)})
+        lost = [(t, *table[t]) for t in tested if t in table]
+        if bid in tested or bid in table or not lost: continue
+        why = '; '.join(f'{f}: ' + ', '.join(dict.fromkeys(r.split(':')[0] for r in rs)) for _, f, rs in lost)
+        out.append(f'{m} build {bid[:8]}… is not the tested {", ".join(t[:8] + "…" for t in tested)} and has none of its {sum(len(rs) for _, _, rs in lost)} registered patches ({why})')
+    return out
 
 
 def inspect(folder, keys=None):
     """What a game folder holds, without extracting anything: the GUI's game card and `porter inspect`"""
+    keys = keys or config.load().get('keys')
     selected = Path(folder).expanduser().resolve()
-    folder, title_id = sources.resolve(folder)
-    try: app, fam = containers.scan(folder, title_id=title_id, keys=keys, selected=selected)
-    except BuildError:
-        if any(Path(folder).glob('*.ns[zZ]')) or any(Path(folder).glob('*.xc[zZ]')):   # how dumps are often shared: zstd-compressed NCAs the extractor does not read
-            raise BuildError('this folder has only NSZ / XCZ files: decompress them to NSP / XCI first (nsz -D with your prod.keys), then choose the folder with the NSP files') from None
-        raise
+    folder, title_id = sources.resolve(folder, keys=keys)
+    app, fam = containers.scan(folder, title_id=title_id, keys=keys, selected=selected)
     g, ap = profiles.by_title(app)
+    files = [fam['base'], *(p for _, p in fam['updates']), *(p for _, _, p in fam['dlc'])]
     info = dict(title_id=f'{app:016X}', base=fam['base'].name, updates=[{'version': f'v{v}' if v is not None else None, 'file': p.name} for v, p in fam['updates']],
-                dlc=[{'title_id': f'{t:016X}', 'file': p.name} for t, _, p in fam['dlc']], profile=None, android=None, versions=[], pack=None, supported=False, reason='')
+                dlc=[{'title_id': f'{t:016X}', 'file': p.name} for t, _, p in fam['dlc']], profile=None, android=None, versions=[], pack=None, supported=False, reason='',
+                compressed=[p.name for p in files if dumps.compressed(p)])   # NSZ / XCZ: decompressed during the port into the build folder's tmp/, deleted once extracted
     info['experimental'] = not (g and ap)   # a port can still be tried: porter port --experimental
     if not g:
         info['reason'] = f'no game profile for {app:016X}: this game is not supported yet (an experimental port surveys it and guesses a profile; it may not start)'
@@ -71,7 +143,7 @@ def inspect(folder, keys=None):
         info['reason'] = f'{g.get("name", g.id)} has a game profile (iOS) but is not ported to Android yet (an experimental port tries it with that profile)'
         return info
     info.update(android=profiles.entry(g, ap).as_dict(), supported=True)
-    if ap.status == 'wip': info['reason'] = f'{g.get("name", g.id)} is a work in progress: it plays, but parts of it are missing (docs/PORT_STATUS.md says which)'
+    if ap.status == 'wip': info['reason'] = f'{g.get("name", g.id)} is a work in progress: it plays, but parts of it are missing (the Games table in README.md says which)'
     if pack not in builds:
         info['reason'] = (info['reason'] + '; ' if info['reason'] else '') + f'{pack} is not a version the profile was brought up on ({", ".join(builds)}): it is packed from a derived profile, without that version\'s fixes'
     return info
@@ -84,12 +156,14 @@ class Port:
         self.result = {}
         self.input_title_id = None
         self.input_source = opts.folder
+        self.unpacked = {}   # NSZ / XCZ → its NSP in <build folder>/tmp/dumps/, while the port needs it
 
     # ---- the whole port ----
     def run(self):
         o = self.o
         if o.data_mode not in ('embedded', 'external'): raise BuildError('data mode must be embedded or external')
-        o.folder, self.input_title_id = sources.resolve(o.folder)
+        o.folder, self.input_title_id = sources.resolve(o.folder, keys=o.keys or self.cfg.get('keys'))
+        version_code('v0', o.vercode_offset); alias_headroom_gb(o.alias_headroom)
         keys = o.keys or self.cfg.get('keys')
         if not keys: raise BuildError('no prod.keys: give -k / --keys, or set it once with `porter config keys <path>`')
         o.keys = Path(keys).expanduser().resolve()
@@ -98,13 +172,15 @@ class Port:
         o.out = Path(o.out or self.cfg.get('out') or o.folder).expanduser().resolve()
         # the chosen dotnet first on PATH, in this process too: Windows finds a program by the parent's PATH, not the one passed to the child (upstream runs `dotnet` by name)
         os.environ['PATH'] = os.pathsep.join([str(self.tools['dotnet'].parent), os.environ.get('PATH', '')])
-        os.environ['DOTNET_ROOT'] = str(self.tools['dotnet'].parent)   # where nx_extract.exe's apphost looks for the runtime (else the system's, which may lack .NET 10)
+        os.environ['DOTNET_ROOT'] = str(toolchain.dotnet_root(self.tools['dotnet']))   # where nx_extract.exe's apphost looks for the runtime (else the system's, which may lack .NET 10)
         # PYTHONUTF8: the engine's tools write their tables with open() and no encoding, which is the ANSI code page on Windows (shader_split.py's "→" failed)
         self.env = dict(os.environ, J=str(o.jobs), PYTHONIOENCODING='utf-8', PYTHONUTF8='1', DOTNET_CLI_TELEMETRY_OPTOUT='1')
 
-        self.inputs()
-        PROG.plan(1 + len(self.versions) + bool(self.fam['dlc']) + bool(o.fps60) + 6 + bool(o.install))   # nx_extract, the versions, the DLC, 60 fps, rewrite / split / Vulkan shaders / host / APK / data, install
-        self.extract()
+        try:
+            self.inputs()
+            PROG.plan(1 + len(self.versions) + bool(self.fam['dlc']) + bool(o.fps60) + 6 + bool(o.install))   # nx_extract, the versions, the DLC, 60 fps, rewrite / split / Vulkan shaders / host / APK / data, install (unpack adds its own)
+            self.extract()
+        finally: self.drop_unpacked()   # a failed run leaves no decompressed dumps behind either
         self.check_graphics()
         self.fps_unlock()
         self.rewrite()
@@ -118,7 +194,9 @@ class Port:
         self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
                            status=self.ap.status, derived=bool(self.derived), installed=bool(o.install))
         say(f'done: {self.result["apk"]}' + (f' and {self.result["data"]}' if self.result['data'] else ' (game data included)'))
-        if self.derived: say(f'[RED] {self.derived}: the port is built from a derived profile and may not run as the profile\'s tested version does')
+        if self.derived: say(f'[RED] {self.derived}: the port is built from a derived profile and may not run as the profile\'s tested version does'
+                             + (f'; {self.derived_mem}' if self.derived_mem else ''))
+        for x in self.lost: say(f'[RED] {x}')
         return self.result
 
     # ---- inputs: the folder's games and versions, the profile, the version to pack ----
@@ -140,7 +218,7 @@ class Port:
         say(f'game profile: {g.id} {g.get("name", "")} (Android: {ap.status}' + (f', tested on {ap.tested}' if ap.tested else '') + ')')
         builds, need = g.builds(), g.words('shader_versions')
         have = nsp.nsp_versions(self.fam, builds)
-        self.derived = ''
+        self.derived, self.derived_mem, self.lost = '', '', []
         if self.provisional:   # the version the survey saw
             self.pkg_ver = o.version or g.get('package')
             if self.pkg_ver not in builds: raise BuildError(f'the version to pack must be one the provisional profile registers: {", ".join(builds)}')
@@ -163,14 +241,15 @@ class Port:
         Viractal 2.7 of 1.4), less what an earlier port left there, plus a margin"""
         if hasattr(self, 'fam'):
             inputs = {self.fam['base'], *(self.have[v] for v in self.versions if self.have[v]), *(p for _, _, p in self.fam['dlc'])}
-        else: inputs = {f for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower() in ('.nsp', '.xci')}
-        game = sum(f.stat().st_size for f in inputs)
+        else: inputs = {f for f in self.o.folder.iterdir() if f.is_file() and f.suffix.lower()[1:] in dumps.EXTS}
+        game = sum(dumps.size(f) for f in inputs)
+        temp = sum(dumps.size(f) for f in inputs if dumps.compressed(f))
         built = sum(f.stat().st_size for f in self.work.rglob('*') if f.is_file()) if self.work.is_dir() else 0
         versions = getattr(self, 'versions', ())
         marker = self.g.get('romfs_marker') if hasattr(self, 'g') else None
         cached = versions and marker and all((self.work / 'extract' / v / 'ExeFS/main').is_file() and (self.work / 'extract' / v / 'RomFS' / marker).is_file() for v in versions)
         # Reused extractions need no second full copy. DLC may need an atomic rebuild.
-        remaining = sum(f.stat().st_size for f in (self.work / 'aoc').rglob('*') if f.is_file()) if cached else max(0, 2 * game - built)
+        remaining = sum(f.stat().st_size for f in (self.work / 'aoc').rglob('*') if f.is_file()) if cached else max(0, 2 * game + temp - built)
         need, free = remaining + 2**30, shutil.disk_usage(self.o.folder).free
         if free < need: raise BuildError(f'not enough disk space on {self.o.folder.anchor}: the port needs about {need / 2**30:.1f} GB more, {free / 2**30:.1f} GB is free')
 
@@ -187,7 +266,10 @@ class Port:
         if g is None:
             if (d / 'game.tsv').is_file(): say(f'no game profile for {tid}: reusing the provisional profile from the last run ({d}; delete it to survey again)')
             else:
-                facts = nsp.survey(self.o.folder, self.app, self.fam, self.o.keys, NXNATIVE, PY, self.env)
+                ups = [p for _, p in sorted(self.fam['updates'], key=lambda u: u[0] or 0)[-1:]]   # the survey reads the base game and the newest update
+                m = self.unpack([self.fam['base'], *ups])
+                fam = dict(self.fam, base=m[self.fam['base']], updates=[(v, m.get(p, p)) for v, p in self.fam['updates']])
+                facts = nsp.survey(self.o.folder, self.app, fam, self.o.keys, NXNATIVE, PY, self.env)
                 facts['survey'] = f'<NSP folder>/{tid}_survey/survey.md'
                 nsp.write_profile(d, self.app, facts)
             self.provisional = True
@@ -206,8 +288,18 @@ class Port:
         o, g = self.o, self.g
         picks = nsp.pick_nsps(self.fam, self.have, self.versions)
         ex = self.work / 'extract'; ex.mkdir(parents=True, exist_ok=True)
-        need = sum({p.stat().st_size for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6
+        need = sum(dumps.size(p) * (2 if dumps.compressed(p) else 1) for p in {p for b, u in picks.values() for p in (b, u) if p}) / 2**30 + 6
         if nsp.free_gb(self.work) < need and not all((ex / v).exists() for v in self.versions): raise BuildError(f'less than {need:.0f} GB free on the volume of {self.work}')
+        # NSZ / XCZ: only what a stage will read is decompressed, all in one stage before nx_extract runs (a version nsp.extract reuses reads nothing)
+        fresh = lambda v: (ex / v / 'ExeFS/main').exists() and (ex / v / 'RomFS' / g.get('romfs_marker')).exists()   # nsp.extract's reuse test
+        zdlc = [p for _, _, p in self.fam['dlc'] if dumps.compressed(p)]
+        # extract_aoc keys its reuse on the names, sizes and times of the NSPs it reads, decompressed ones here: with NSZ / XCZ DLC, porter keys it on those files instead
+        dkey = nsp.fingerprint(sorted((t, p.name, p.stat().st_size, p.stat().st_mtime_ns) for t, _, p in self.fam['dlc']),
+                               ('files', [NXNATIVE / 'dm/tools/nx_extract' / f for f in ('Program.cs', 'nx_extract.csproj')]))
+        dkf = self.work / 'aoc.dumps.key'
+        dlc_reused = bool(zdlc) and (self.work / 'aoc').is_dir() and nsp.reused(dkf, dkey) is not None
+        m = self.unpack([p for v in self.versions if not fresh(v) for p in picks[v] if p] + ([] if dlc_reused else zdlc))
+        picks = {v: tuple(m.get(p, p) if p else None for p in bu) for v, bu in picks.items()}
         PROG.stage('build nx_extract')
         nx = nsp.build_nx_extract(NXNATIVE, self.work, self.logs, self.env)
         PROG.end()
@@ -220,13 +312,30 @@ class Port:
             say(f'{self.derived}: packing {self.pkg_ver} from a profile derived from it')
             self.versions, self.dirs = [self.pkg_ver], {self.pkg_ver: self.dirs[self.pkg_ver]}
         self.game = self.dirs[self.pkg_ver]
+        nsp.rmtree(self.work / 'profile-mem')   # an earlier run's --alias-headroom copy (mem_profile)
         if self.derived:   # the derived profile (android.tsv included) goes into the build folder, and every tool takes it first
             pdir = self.work / 'profile-derived'   # not profile/: an experimental port's copy there is the profile it derives from
             disp = nsp.derive_profile(g, pdir / g.id, self.pkg_ver, self.game, g.words('modules'))
+            # automatic headroom only for another build: a registered one, derived because the folder lacks a shader version, keeps the layout it was tested with
+            other = self.pkg_ver not in g.builds() or bool(nsp.build_mismatch(self.game, self.pkg_ver, g))
+            gb = self.o.alias_headroom if self.o.alias_headroom is not None else (ALIAS_HEADROOM >> 30 if other else 0)
+            if grown := alias_headroom(pdir / g.id / 'game.tsv', gb):
+                self.derived_mem = f'its alias region has {gb} GB of headroom over the tested build\'s (mem_alias {grown[0]:#x} → {grown[1]:#x}); {ALIAS_HINT}'
+                say(f'derived game profile: {self.derived_mem}' + ('' if self.o.alias_headroom is None else ' (--alias-headroom)'))
             self.use_profile_dir(pdir, first=True)
             self.g = game.load(g.id); self.ap = android_profile.AndroidProfile(self.g)
             say(f'derived game profile for {self.pkg_ver} ({disp}): {self.g.dir}')
-        self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app, self.fam, self.logs)
+            self.lost = [f'{x}: the port may fail where they are needed; register them for this build (dm/tools/nso_fnmap.py carries addresses over) or port a version the '
+                         f'profile registers' for x in lost_patches(g.builds(), self.game / 'ExeFS', g.words('modules'))]
+            for x in self.lost: say(f'[RED] {x}')
+        else: self.mem_profile()
+        if dlc_reused:
+            PROG.stage('extract DLC'); self.aoc = self.work / 'aoc'; PROG.end(f'{len(self.fam["dlc"])} DLC, reused (inputs unchanged)')
+        else:
+            self.aoc = nsp.extract_aoc(nx, o.keys, NXNATIVE, self.work, self.app, dict(self.fam, dlc=[(t, v, m.get(p, p)) for t, v, p in self.fam['dlc']]), self.logs)
+            if zdlc: dkf.write_text(f'{dkey}\n')
+            else: nsp.rmtree(dkf)
+        self.drop_unpacked()   # everything that reads them has run, and the shader stages that follow need the room
         self.base = next((self.dirs[v] for v in self.versions if picks[v][1] is None), self.dirs[self.versions[0]])
         self.app_name = o.app_name or nacp.name(self.base / 'control.nacp') or self.g.get('name', self.g.id)
         self.display = nacp.version(self.game / 'control.nacp') or nacp.version(self.base / 'control.nacp') or '1.0'
@@ -237,14 +346,116 @@ class Port:
         self.lang = nsp.game_language(want, bool(lang_in), have)
         say(f'app: {self.app_name} {self.display} ({self.package}), game language {self.lang}')
 
+    def mem_profile(self):
+        """The player's --alias-headroom on a version the profile was brought up on (or a provisional or experimental profile): a copy of the profile in
+        <build folder>/profile-mem/ with the bigger guest block, which every tool takes first. patches.py stays in dm/games, where patch_nso.py finds it. extract() removes
+        an earlier run's copy before it, so the build folder keeps none without the option"""
+        pdir = self.work / 'profile-mem'
+        if not self.o.alias_headroom: return
+        d = pdir / self.g.id; shutil.copytree(self.g.dir, d, ignore=shutil.ignore_patterns('patches.py', '__pycache__'))
+        grown = alias_headroom(d / 'game.tsv', self.o.alias_headroom)
+        if not grown:
+            nsp.rmtree(pdir); say(f'--alias-headroom {self.o.alias_headroom}: {self.g.get("name", self.g.id)} declares no virtual address memory (sys_resource): its layout stays as it is'); return
+        self.use_profile_dir(pdir, first=True)
+        self.g = game.load(self.g.id); self.ap = android_profile.AndroidProfile(self.g)
+        say(f'alias region: mem_alias {grown[0]:#x} → {grown[1]:#x} (+{self.o.alias_headroom} GB, --alias-headroom): {self.g.dir}')
+
+    # ---- NSZ / XCZ: decompressed for the stages that read the game files (porter.dumps) into <build folder>/tmp/dumps/, deleted once extracted ----
+    def unpack(self, paths):
+        """paths' NSZ / XCZ → NSP, in one stage (a file decompressed earlier in this run is kept); returns {path: the file to read}"""
+        todo = [p for p in dict.fromkeys(paths) if dumps.compressed(p) and p not in self.unpacked]
+        if todo:
+            d = self.work / 'tmp/dumps'; d.mkdir(parents=True, exist_ok=True)
+            sizes = {p: dumps.size(p) for p in todo}; total, n = sum(sizes.values()), [0]
+            if nsp.free_gb(d) < total / 2**30 + 1: raise BuildError(f'decompressing {", ".join(p.name for p in todo)} needs {total / 2**30:.1f} GB on the volume of {d}, which has {nsp.free_gb(d):.1f} GB free')
+            PROG.add(1); PROG.stage('decompress NSZ / XCZ', unit='B', total=total)
+            def done(k): n[0] += k; PROG.set(done=n[0])
+            for p in todo:
+                say(f'decompressing {p.name} ({sizes[p] / 2**30:.2f} GB) → {d}')
+                self.unpacked[p] = dumps.decompress(p, d / dumps.unpacked_name(p), done)
+            PROG.end(f'{len(todo)} file{"s" if len(todo) > 1 else ""}, {nsp.amount(total, "B")}, NCAs checked against their SHA-256 (not in ticketless dumps, whose NCA headers were rewritten)')
+        return {p: self.unpacked.get(p, p) for p in paths}
+
+    def drop_unpacked(self):
+        if getattr(self, 'work', None): nsp.rmtree(self.work / 'tmp/dumps')
+        self.unpacked = {}
+
     def check_graphics(self):
         """What the Android host can run: NVN games whose shaders are all in their files. The other kinds need a step upstream runs on a Mac (booting the game in the Mac host)
         or a graphics layer the Android host does not have yet"""
         src = profile_guess.build_sources(self.game / 'ExeFS', self.game / 'RomFS', self.g.words('modules'))
         gfx = src['graphics'][0]
         if gfx != 'nvn': raise BuildError(f'{self.app_name} renders with {gfx} ({src["graphics"][1]}): the Android host replays NVN only so far')
-        for k in ('glslc_capture', 'ue_decode', 'oodle_packs', 'ue_legacy'):
-            if src[k][0]: raise BuildError(f'{self.app_name} needs a step that boots the game in the Mac host ({src[k][1]}), which a Windows port cannot run yet')
+        # Game Freak's GFPAKs with Oodle entries: decoded by the game's own decoder on the Android device (device_oodle); Trinity and PKZ packs still need the Mac host
+        self.oodle_why = src['oodle_packs'][1] if src['oodle_packs'][0] and 'GFPAK' in src['oodle_packs'][1] else ''
+        if self.oodle_why:
+            try: Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say).pick()
+            except (AdbError, KeyError) as e: raise BuildError(f"{self.app_name}'s shaders are in Oodle-compressed archives ({self.oodle_why}): the port decodes them with the game's own decoder on "
+                                                               f'the Android device, so connect it (adb) and port again ({e})') from e
+        for k in ('glslc_capture', 'ue_decode', 'ue_legacy') + (() if self.oodle_why else ('oodle_packs',)):
+            if src[k][0]: raise BuildError(f'{self.app_name} needs a step that boots the game in the Mac host ({src[k][1]}), which the Android port cannot run yet')
+
+    # ---- the game's own Oodle decoder on the device, for the shader split (Pokémon Legends: Arceus's GFPAKs) ----
+    ODEV = '/data/local/tmp/nx2a-oodle'   # dmhost, the rewritten modules and the job, removed afterwards
+    def device_oodle(self):
+        """The Mac host's Oodle tool mode runs in the Android host as well (dm/host/hle_oodle.c DM_OODLE_JOB): the host built as an executable (build.py --exe) runs on the device
+        with the rewritten modules and decodes with the game's own OodleLZ_Decompress, the same ARM64 code the Switch runs. Every Oodle entry of the GFPAKs goes in one job file
+        (1.6 GB for Pokémon Legends: Arceus), pushed and decoded there in one run; only the entries that hold a BNSH shader come back (DM_OODLE_JOB_BNSH), written as the split's
+        decoded folder (shader_split.py gfpak_decoded). Streaming the entries through an adb forward instead reset the connection whenever both directions were busy.
+        → the split's environment"""
+        import struct
+        adb = self.oodle_adb = Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say); adb.pick()
+        out = self.aw / ('host-debug' if self.o.debug else 'host')   # the host stage's own folder: its objects serve both
+        PROG.set(step="building the host as a tool for the game's Oodle decoder")
+        nsp.run([PY, DM / 'android/build.py', '--game', self.g.id, '--ndk', self.tools['ndk'], '--out', out, '--exe', '--jobs', str(self.o.jobs)] + ([] if self.o.debug else ['--release']),
+                self.logs / 'android_oodle_host.log', env=self.env)
+        PROG.set(step="the game's Oodle entries in a job file")
+        tmp = self.work / 'tmp/oodle'; nsp.rmtree(tmp); tmp.mkdir(parents=True)
+        recs, job = [], tmp / 'job.bin'   # recs: (label, archive size, entry index) of each record, in order
+        with open(job, 'wb') as jf:
+            jf.write(b'DMOJ' + struct.pack('<I', 0))
+            for v in self.versions:
+                rom = self.dirs[v] / 'RomFS'
+                for p in sorted(rom.rglob('*.gfpak')):
+                    d = p.read_bytes()
+                    if d[:8] != b'GFLXPACK': continue
+                    n, _, fo = struct.unpack_from('<IIQ', d, 0x10); label = '/' + p.relative_to(rom).as_posix()
+                    for i in range(n):
+                        ct, usz, csz, off = struct.unpack_from('<2xHII4xQ', d, fo + 0x18 * i)
+                        if ct == 3: jf.write(struct.pack('<II', csz, usz) + d[off:off + csz]); recs.append((label, len(d), i))
+            jf.seek(4); jf.write(struct.pack('<I', len(recs)))
+        PROG.set(step=f"the game's Oodle decoder on the device: {len(recs):,} entries, {job.stat().st_size / 2**30:.1f} GB")
+        adb.shell(f'rm -rf {self.ODEV}; mkdir -p {self.ODEV}/mods', check=False)
+        adb.push_file(out / 'dmhost', f'{self.ODEV}/dmhost'); adb.push_tree(self.patched, f'{self.ODEV}/mods'); adb.push_file(job, f'{self.ODEV}/job.bin')
+        nsp.rmtree(job)
+        # (the device's timeout ends the decoder before adb gives up, so no decoder is left running and holding memory on the device)
+        r = adb.shell(f'chmod 755 {self.ODEV}/dmhost; cd {self.ODEV} && DM_OODLE_JOB={self.ODEV}/job.bin DM_OODLE_JOB_BNSH=1 timeout 3300 ./dmhost mods > job.log 2>&1; echo "exit $?"; '
+                      f'grep -a -e DM_OODLE_JOB -e RED job.log | tail -5', timeout=3600)
+        (self.logs / 'android_oodle_job.log').write_text(r, encoding='utf-8')
+        if 'exit 0' not in r: raise BuildError(f"the game's Oodle decoder on the device failed (see {self.logs / 'android_oodle_job.log'})")
+        adb.run('pull', f'{self.ODEV}/job.bin.out', str(tmp / 'job.out'), timeout=1800)
+        b = (tmp / 'job.out').read_bytes(); nsp.rmtree(tmp / 'job.out')
+        if b[:4] != b'DMOR' or struct.unpack_from('<I', b, 4)[0] != len(recs): raise BuildError("the game's Oodle decoder on the device answered for other entries than it was given")
+        by, o = {}, 8   # label → (size, {index: bytes})
+        for label, size, i in recs:
+            n = struct.unpack_from('<I', b, o)[0]; o += 4
+            ent = by.setdefault(label, (size, {}))[1]
+            if n == 0xffffffff: continue
+            if n == 0: raise BuildError(f"the game's Oodle decoder on the device failed on {label} entry {i}")
+            ent[i] = b[o:o + n]; o += n
+        dec = tmp / 'decoded'; dec.mkdir()
+        for label, (size, ent) in by.items():
+            body = b''.join(struct.pack('<II', i, len(x)) + x for i, x in sorted(ent.items()))
+            (dec / (label.lstrip('/').replace('/', '__') + '.dec')).write_bytes(b'DGFD' + struct.pack('<QI', size, len(ent)) + body)
+        say(f"shaders in Oodle-compressed archives ({self.oodle_why}): {len(recs):,} entries decoded by the game's own decoder on the device, "
+            f"{sum(len(e) for _, e in by.values()):,} of them hold shaders")
+        return {'DM_GFPAK_DECODED': str(dec)}
+    def device_oodle_end(self):
+        adb = getattr(self, 'oodle_adb', None)
+        if not adb: return
+        self.oodle_adb = None
+        try: adb.shell(f'rm -rf {self.ODEV}', check=False)
+        except AdbError as e: say(f'the Oodle decoder left on the device ({e}): {self.ODEV}')
 
     # ---- 60 fps (--fps60): the profile's own cap (fps_target: frame-step stubs or hle_fpslock.c's rows), else the community's FPSLocker config of the build ----
     def fps_unlock(self):
@@ -292,8 +503,10 @@ class Port:
         if decoder: self.env['DM_YAZ0_LIB'] = str(decoder)
         sv = self.versions
         pkg = self.work / 'shader' / 'pkg'
-        nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
-                         aoc=self.aoc)   # DLC with shaders of its own (Xenoblade Chronicles 3's archives)
+        try: nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
+                               oodle=self.device_oodle if self.oodle_why else None,   # Oodle-compressed archives: the game's own decoder on the device
+                               aoc=self.aoc)   # DLC with shaders of its own (Xenoblade Chronicles 3's archives)
+        finally: self.device_oodle_end()
         self.dmsv = self.aw / 'shaders.dmsv'; kf = self.aw / 'shaders.dmsv.key'; cap = self.aw / 'captured_shaders'
         PROG.stage('Vulkan shaders', step='building the translator')
         xlate, xkey = self.translator()
@@ -357,15 +570,27 @@ class Port:
         stem = app_stem(self.g, self.app_name)
         self.apk_path = self.o.out / f'{stem}.apk'; self.o.out.mkdir(parents=True, exist_ok=True)
         icon = self.icon()
+        code = version_code(self.pkg_ver, self.o.vercode_offset)
+        if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
         pipeline_keys = prewarm.find_keys(self.aw, self.game / 'ExeFS/main')
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
-                 '--version-code', str(version_code(self.pkg_ver)), '--version-name', self.display]
+                 '--version-code', str(code), '--version-name', self.display]
                 + (['--data', self.data_path] if self.o.data_mode == 'embedded' else [])
                 + (['--pipeline-keys', pipeline_keys] if pipeline_keys else [])
-                + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + ([] if self.o.debug else ['--release']),
+                + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + self.theme() + ([] if self.o.debug else ['--release']),
                 self.logs / 'android_apk.log', env=self.env)
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
+
+    def theme(self):
+        """The on-screen gamepad's theme: only the game's own pack goes in the APK (dm/android/themes/themes.tsv maps title IDs to packs; a game with no row
+        gets the ergo pack), as assets/overlay/ (theme.tsv and an atlas per layout), which the app reads at its first frame (dm/android/overlay_theme.c)"""
+        pack = android_profile.theme(self.g.id)
+        files = [pack / 'theme.tsv'] + [pack / f'{lay}.png' for lay in android_profile.LAYOUTS]
+        missing = [f.name for f in files if not f.is_file()]
+        if missing: say(f'[RED] the gamepad theme {pack.name} has no {", ".join(missing)}: the app draws its gamepad without a theme'); return []
+        self.result['theme'] = pack.name; say(f'gamepad theme: {pack.name}')
+        return [a for f in files for a in ('--asset', f'overlay/{f.name}={f}')]
 
     def icon(self):   # the game's icon (nx_extract saves the control data's English one as icon.jpg) as a 256 px PNG; None without Pillow or an icon
         src = next((d / 'icon.jpg' for d in (self.game, self.base) if (d / 'icon.jpg').exists()), None)
@@ -382,7 +607,8 @@ class Port:
         font_env, font_files = self.button_font()
         dst = self.aw / 'apk-data' if self.o.data_mode == 'embedded' else self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
-                             aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, files={**self.fps_files, **font_files},
+                             aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, settings=TOUCH_SETTINGS if self.o.touch else None,
+                             files={**self.fps_files, **font_files},
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result.update(data=str(dst) if self.o.data_mode == 'external' else None, data_mode=self.o.data_mode)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

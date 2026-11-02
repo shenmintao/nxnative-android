@@ -42,7 +42,7 @@ static struct {
     struct {int set_format,format;} rt_cview[8];
 } S;
 typedef struct {
-    uint32_t cfmt[8], wmask[8], blend_en;
+    uint32_t cfmt[8], wmask[8], blend_en, fdz, raster_discard;
     struct { uint32_t src, dst, srca, dsta, eq, eqa; } bl[8];
 } pkey;
 static struct { unsigned skip_prog; } g_vkst;

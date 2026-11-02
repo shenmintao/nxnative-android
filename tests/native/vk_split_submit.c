@@ -19,6 +19,7 @@ static PFN_vkBeginCommandBuffer real_vkBeginCommandBuffer;
 static PFN_vkEndCommandBuffer real_vkEndCommandBuffer;
 static PFN_vkAllocateCommandBuffers real_vkAllocateCommandBuffers;
 static PFN_vkQueueSubmit real_vkQueueSubmit;
+int g_prof_on; uint64_t g_prof_ns[8];
 pthread_mutex_t g_vk_queue_mu=PTHREAD_MUTEX_INITIALIZER;
 static const void *g_test_borrowed_info;
 

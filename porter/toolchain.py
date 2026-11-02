@@ -71,10 +71,17 @@ def find_dotnet(cfg=None):
     return next((d for d in found if any(int(s.split('.')[0]) >= DOTNET_MAJOR for s in dotnet_sdks(d))), found[0] if found else None)
 
 
-def dotnet_sdks(dotnet):   # ['10.0.402', ...]
+def dotnet_sdks(dotnet):   # {'10.0.402': '/usr/local/share/dotnet/sdk', ...}
     try: r = subprocess.run([str(dotnet), '--list-sdks'], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired): return []
-    return re.findall(r'^(\d+\.\d+\.\d+)', r.stdout, re.M)
+    except (OSError, subprocess.TimeoutExpired): return {}
+    return dict(re.findall(r'^(\d+\.\d+\.\d+)\S* \[(.+)\]', r.stdout, re.M))
+
+
+def dotnet_root(dotnet):
+    """The folder with dotnet's runtime, where an apphost (nx_extract) looks in DOTNET_ROOT: the SDK folder's parent, not the executable's, which on a Mac is
+    a link or wrapper elsewhere (/usr/local/bin from Microsoft's installer, /opt/homebrew/bin)"""
+    sdks = dotnet_sdks(dotnet)
+    return Path(next(iter(sdks.values()))).parent if sdks else Path(dotnet).resolve().parent
 
 
 def find_adb(cfg=None):
@@ -112,6 +119,8 @@ def checks(cfg=None, keys=None):
     fix = subprocess.list2cmdline(cmd) + ' ' + ' '.join('"' + m + '"' for m in miss) if os.name == 'nt' else shlex.join(cmd + miss)
     out.append(Check('Python modules', not problems, '; '.join(problems) if problems else 'lz4, capstone 5.x, zstd', fix=fix if problems else ''))
     out.append(Check('Pillow', _importable('PIL'), 'the app icon from the game\'s icon' if _importable('PIL') else 'missing: the app gets no icon', required=False, fix='pip install pillow'))
+    aes = _importable('Crypto.Cipher') or _importable('Cryptodome.Cipher')
+    out.append(Check('pycryptodome', aes, 'NSZ / XCZ dumps (porter.dumps)' if aes else 'missing: NSZ / XCZ dumps must be decompressed to NSP / XCI first', required=False, fix='' if aes else 'pip install pycryptodome'))
     out.append(Check('fontTools', _importable('fontTools'), 'the button icons in game text' if _importable('fontTools') else 'missing: button icons in game text draw as "?"', required=False, fix='pip install fonttools'))
     ndk, rev = find_ndk(cfg)
     if not ndk: out.append(Check('Android NDK', False, 'not found', fix=f'Download missing tools, or install NDK {NDK_RELEASE} (developer.android.com/ndk/downloads) and set its folder'))

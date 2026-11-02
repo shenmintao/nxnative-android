@@ -23,6 +23,7 @@
 #   · Trinity packs (Game Freak, Pokémon Legends: Z-A): BNSH inside the files of arc/data.trpfs (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see trpfs_jobs and trinity_shaders
 #   · SPK (Capcom's MT Framework, The Great Ace Attorney Chronicles): the shader package inside an ARC archive (zlib entries), code area + control section per shader, see mtarc_members and mtspk_shaders
 #   · BEA (NintendoWare Bezel Engine archives, Big Brain Academy: Brain vs. Brain): BNSH in the .bfsha entries of the archives (zstd entries), see bea_members
+#   · GFPAK (Game Freak, Pokémon Legends: Arceus): BNSH entries of the archives under bin/archive (Oodle Kraken, decoded by the game's own decoder when DM_OODLE_HOST is set), see gfpak_members
 #   · MGFX (MonoGame effects, Celeste, Bastion): the effects in its XNB files and SpriteBatch's in main, each shader a control section and a code area, see mgfx_effect
 #   · dvdbnd (FromSoftware, Dark Souls Remastered): GLSLC outputs in the BND3 archives (DCX zlib entries) of the .bdt files, indexed by the .bhd5 beside each, see bhd5_entries and bdt_shaders
 #   · data.arc (Super Smash Bros. Ultimate, smash_arc.py): GLSLC outputs in its SSBH shader databases and BNSH in its effects and UI layouts, each of its current files (zstd) scanned, see smash_arc_jobs
@@ -490,6 +491,51 @@ def bea_members(d, label):
             zstd = zstd or zstd_mod(); data = zstd.decompress(data)
         if len(data) != usz: red(f'{label}/{path}: {len(data):#x} bytes, the entry says {usz:#x}')
         yield path, data
+
+GFPAK = b'GFLXPACK'
+def gfpak_members(d, label):
+    """Game Freak's GFPAK archive (Pokémon Legends: Arceus: 678 '.gfpak' files under bin/archive, 1.6 GB): 'GFLXPACK', u32 version 0x1000, u32 0, u32 file count, u32 folder count,
+    u64 offset of the file table, u64 offset of the file hashes (FNV-1a 64 of each path; no names are stored), u64 offset of the folder table pointers. The file table holds 0x18 bytes
+    per file {u16 level, u16 compression, u32 length, u32 stored length, u32 0, u64 data offset}: compression 0 stored, 1 zlib, 2 LZ4 (one block), 3 Oodle Kraken (pkNX; upstream's
+    reader is the reference). Arceus's entries are all Oodle Kraken, decoded by the game's own decoder: DM_GFPAK_DECODED = a folder of those already decoded (the porter decodes them
+    on the Android device, gfpak_decoded), else through the Mac host (oodle, DM_OODLE_HOST), else left out with a red line, and the app captures the shaders only they hold
+    (73 rows upstream: battle, field and Pokédex UI) for the next port (gfx_vk_shader.c vk_shader_missing). → (#index, data) of each entry"""
+    if d[8:12] != b'\0\x10\0\0': red(f'{label}: GFPAK version {d[8:12].hex()}, not 0x1000')
+    n, _, files = struct.unpack_from('<IIQ', d, 0x10)
+    ents = [struct.unpack_from('<2xHII4xQ', d, files + 0x18 * i) for i in range(n)]
+    dec = gfpak_decoded(label, len(d)) if any(ct == 3 for ct, _, _, _ in ents) else None
+    skipped = 0
+    for i, (ct, usz, csz, off) in enumerate(ents):
+        raw = d[off:off + csz]
+        if ct == 0: data = raw
+        elif ct == 1: data = __import__('zlib').decompress(raw)
+        elif ct == 2:
+            import lz4.block
+            data = lz4.block.decompress(raw, uncompressed_size=usz)
+        elif ct == 3 and dec is not None:
+            if i not in dec: continue   # decoded on the device: no shader in it
+            data = dec[i]
+        elif ct == 3 and os.environ.get('DM_OODLE_HOST'): data = oodle(raw, usz)
+        elif ct == 3: skipped += 1; continue
+        else: red(f'{label}: entry {i} has compression {ct}, which this reader does not decode')
+        if len(data) != usz: red(f'{label}#{i}: {len(data):#x} bytes, the entry says {usz:#x}')
+        yield f'#{i}', data
+    if skipped: print(f'[RED] {label}: {skipped} of {n} entries are Oodle Kraken and nothing decodes them (DM_GFPAK_DECODED, DM_OODLE_HOST): their shaders are left out (the app captures the ones it meets)', flush=True)
+
+def gfpak_decoded(label, size):
+    """The Oodle entries of a GFPAK that hold a BNSH file, decoded already: DM_GFPAK_DECODED/<label with / as __>.dec = 'DGFD', u64 the archive's size, u32 count, then per entry
+    u32 index, u32 length and the bytes (porter/pipeline.py device_oodle: the game's own decoder on the Android device). → {index: bytes}, or None without a folder or without a file
+    of this archive at this size"""
+    root = os.environ.get('DM_GFPAK_DECODED')
+    if not root: return None
+    p = os.path.join(root, label.lstrip('/').replace('/', '__') + '.dec')
+    if not os.path.exists(p): return None
+    b = open(p, 'rb').read()
+    if b[:4] != b'DGFD' or struct.unpack_from('<Q', b, 4)[0] != size: return None
+    out, o = {}, 16
+    for _ in range(struct.unpack_from('<I', b, 12)[0]):
+        i, n = struct.unpack_from('<II', b, o); out[i] = b[o + 8:o + 8 + n]; o += 8 + n
+    return out
 
 NLG_DICT = bytes.fromhex('5824f3a9')
 def nlg_dict(d):
@@ -1361,6 +1407,9 @@ def scan_file(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] == SCNE:   # a Bezel Engine archive (bea_members): each entry scanned as a file of its own (the shaders are BNSH in its .bfsha entries)
         for nm, m in bea_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}/{nm}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:8] == GFPAK:   # a Game Freak archive (gfpak_members): each entry scanned as a file of its own (the shaders are BNSH entries)
+        for nm, m in gfpak_members(open(path, 'rb').read(), '/' + rel): scan_blob(m, f'/{rel}{nm}', found)
         return rel, uniq_keys(found), var_pairs(found), trees
     d = unzs(path) if head[:4] == ZSTD_MAGIC else open(path, 'rb').read()   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
     if d[:4] == b'Yaz0': d = yaz0(d)

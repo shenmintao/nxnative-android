@@ -39,7 +39,7 @@ class DeferredSubmission(unittest.TestCase):
         start = header.index('typedef struct {\n    int end_error')
         state = header[start:header.index('int vk_encode_deferred_parts(void);', start)]
         split = ''.join(function(core, name) for name in ('static void split_advance_upload(', 'static void split_collect(',
-                                                        'static int split_defer(', 'void vk_cmd_split(', 'int vk_sub_sent_early('))
+                                                        'static int split_defer(', 'static void vk_cmd_split_(void) {', 'void vk_cmd_split(', 'int vk_sub_sent_early('))
         prefix, rest = (ROOT / 'tests/native/vk_split_submit.c').read_text(encoding='utf8').split('/* ENCODER IMPLEMENTATION */')
         fixture, suffix = rest.split('/* SPLIT IMPLEMENTATION */')
         variants = [

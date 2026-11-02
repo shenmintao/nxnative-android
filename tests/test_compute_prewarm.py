@@ -26,7 +26,7 @@ class ComputePrewarm(unittest.TestCase):
         code += 'static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;\n'
         code += 'static nvn_hmap g_cpipes = {.klen=24}, g_pipes = {.klen=sizeof(pkey)};\nstatic FILE *g_prec;\n'
         code += '\n'.join(re.findall(r'^#define PIPE_MAGIC[^\n]*', source, re.M)) + '\n'
-        code += function(source, 'static void pipe_record(const pkey *k) {') + '\n'
+        code += source[source.index('enum { PREC_Q ='):source.index('static pkey *g_pw;')]
         code += function(source, 'static VkPipeline compute_pipeline(') + '\n'
         code += 'static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;\n'
         code += 'static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout l, vkshader_t *const s[3]) { (void)k;(void)l;(void)s;graphics_calls++;return (VkPipeline)77; }\n'

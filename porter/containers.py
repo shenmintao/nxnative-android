@@ -4,13 +4,18 @@ import json
 import os
 from pathlib import Path
 
-from porter import config, toolchain
+from porter import config, dumps, toolchain
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, nsp
 
 
 def scan(folder, title_id=None, *, keys=None, cfg=None, env=None, selected=None):
-    app, family = nsp.scan_nsps(folder, title_id=title_id)
+    cfg = config.load() if cfg is None else cfg
+    keys = keys or cfg.get('keys')
+    options = {'title_id': title_id}
+    if keys: options['keys'] = keys
+    if any(p.is_file() and dumps.compressed(p) for p in Path(folder).iterdir()): options['exts'] = dumps.EXTS
+    app, family = nsp.scan_nsps(folder, **options)
     if selected is not None:
         selected = Path(selected)
         chosen_title = nsp.title_of(selected) if selected.is_file() else None
@@ -21,6 +26,7 @@ def scan(folder, title_id=None, *, keys=None, cfg=None, env=None, selected=None)
     if not keys or not Path(keys).is_file():
         return app, family
     base = family['base']
+    if dumps.compressed(base): return app, family   # the porter expands NCZ payloads before extraction
     # NSPs may also combine base/update/DLC. The CNMT, not filenames, is authoritative.
     work = folder / f'{app:016X}_build'
     logs = work / 'logs'; logs.mkdir(parents=True, exist_ok=True)

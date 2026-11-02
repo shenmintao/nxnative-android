@@ -5,16 +5,16 @@ from pathlib import Path
 from porter.upstream import BuildError, nsp
 
 
-def resolve(source):
+def resolve(source, keys=None):
     path = Path(source).expanduser().resolve()
     if path.is_dir():
         return path, None
     if not path.is_file():
         raise BuildError(f'no such game file or folder: {path}')
-    if path.suffix.lower() not in ('.nsp', '.xci'):
-        raise BuildError('choose an NSP or XCI file, or a folder containing the base game, updates and DLC')
+    if path.suffix.lower() not in ('.nsp', '.xci', '.nsz', '.xcz'):
+        raise BuildError('choose an NSP, XCI, NSZ or XCZ file, or a folder containing the base game, updates and DLC')
     try:
-        if path.suffix.lower() == '.nsp':
+        if path.suffix.lower() in ('.nsp', '.nsz'):
             with path.open('rb') as stream:
                 header = stream.read(16)
             if len(header) != 16 or header[:4] != b'PFS0':
@@ -22,7 +22,7 @@ def resolve(source):
             count, strings = struct.unpack_from('<II', header, 4)
             if 16 + count * 24 + strings > path.stat().st_size:
                 raise BuildError(f'incomplete NSP file table: {path.name}')
-        title_id = nsp.title_of(path)
+        title_id = nsp.title_of(path, nsp.header_key(keys)) if keys else nsp.title_of(path)
     except (OSError, ValueError, struct.error) as exc:
         raise BuildError(f'cannot read game input {path.name}: {exc}') from exc
     if title_id is None:

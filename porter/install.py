@@ -47,9 +47,10 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False):
         adb.shell(f'am force-stop {shlex.quote(man["package"])}')
         adb.shell(f'rm -f {shlex.quote(files + "/" + datapack.MANIFEST)}')   # written last, so incomplete updates cannot start
         PROG.set(step='pushing the game data', done=0, total=man['bytes'], unit='B'); pushing = True
+        have = adb.remote_sizes(files)   # again: an install with --replace-signer uninstalls first, and Android deletes the files folder with the app
         adb.push_tree(data, files, keep=datapack.KEEP_ON_DEVICE, skip=(datapack.MANIFEST,), verify=lambda rel: rel.split('/', 1)[0] not in ('RomFS', 'aoc'),   # the game's own files change only with their version
-                      progress=lambda d, t, note: PROG.set(done=d, total=t, note=note))
-        stale = [rel for rel in adb.remote_sizes(files) if rel.split('/', 1)[0] in datapack.OWNED and not (data / rel).is_file()]
+                      progress=lambda d, t, note: PROG.set(done=d, total=t, note=note), have=have)
+        stale = [rel for rel in have if rel.split('/', 1)[0] in datapack.OWNED and not (data / rel).is_file()]   # the push only adds the pack's own files, which are never stale
         if stale:   # an older version's files, which the game would still find
             PROG.set(step=f'removing {len(stale):,} stale files')
             for i in range(0, len(stale), 64): adb.shell(f'cd {shlex.quote(files)} && rm -f ' + ' '.join(shlex.quote(r) for r in stale[i:i + 64]))

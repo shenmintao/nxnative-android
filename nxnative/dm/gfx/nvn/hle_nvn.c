@@ -777,31 +777,35 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
 // (when it re-records that material in place; packing the next recording right behind by used never touches them, since used includes the JUMP). So a segment remembers that guest range and is reclaimed when the game gives out memory
 // overlapping it; segments overflowing from a host segment keep the same range.
 // The segment pool grows on demand (SMBW opening course: many small command buffers each overflow once per frame, and the old fixed 64 segments × 1 MB ran out within 8 frames); abort only beyond HOSTSEG_CAP in total.
+// A segment is as large as the game asked for when it says (an empty pool with a length: HOSTSEG_MIN up to HOSTSEG_SZ), else HOSTSEG_SZ: Super Mario Odyssey entering the Wooded Kingdom
+// sets up tens of thousands of command buffers with an empty pool and 0x200 bytes each before recording into them, and at 256 KB apiece these (never reclaimed: no guest bytes to hang off)
+// reached the 1 GB cap within 3 seconds, every time; at 4 KB they come to 128 MB
 #define HOSTSEG_SZ (256u << 10)
+#define HOSTSEG_MIN (4u << 10)
 #define HOSTSEG_CAP (1u << 30)
 uint64_t dm_nvn_frame_count(void);
-typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
-static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg;
+typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t sz; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
+static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
-// Take a segment: origin = the current recording's guest bytes [BEGIN, end of JUMP); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
-static uint8_t *hostseg_take(const cmd_t *o) {
+// Take a segment of sz bytes: origin = the current recording's guest bytes [BEGIN, end of JUMP); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
+static uint8_t *hostseg_take(const cmd_t *o, uint32_t sz) {
     static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL;
     uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;
-    for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + HOSTSEG_SZ) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
+    for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + g_hostseg[i].sz) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
     if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
     for (int i = 0; i < g_nhostseg && !m; i++)
-        if (!g_hostseg[i].busy) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi }; m = g_hostseg[i].mem; }
-    if (!m && (uint64_t)(g_nhostseg + 1) * HOSTSEG_SZ <= HOSTSEG_CAP) {
+        if (!g_hostseg[i].busy && g_hostseg[i].sz == sz) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, sz }; m = g_hostseg[i].mem; }
+    if (!m && g_hostseg_bytes + sz <= HOSTSEG_CAP) {
         if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
-        m = malloc(HOSTSEG_SZ);
-        g_hostseg[g_nhostseg++] = (hostseg_t){ m, f, 1, lo, hi };
+        m = malloc(sz); g_hostseg_bytes += sz;
+        g_hostseg[g_nhostseg++] = (hostseg_t){ m, f, 1, lo, hi, sz };
     }
-    unsigned t = ++total; int n = g_nhostseg;
+    unsigned t = ++total; int n = g_nhostseg; unsigned mb = (unsigned)(g_hostseg_bytes >> 20);
     pthread_mutex_unlock(&g_hostseg_mu);
     if (!m) die("NVN command memory: the game's pool is empty and host-lent segments reached %u MB without being reclaimed by the game's blocks", HOSTSEG_CAP >> 20);
-    if (t == 1 || t % 1024 == 0) LOG("[nvn] the game's command memory ran short, the host lends a segment (%u times so far, frame %llu, segment pool %d segments × %u KB)", t, (unsigned long long)f, n, HOSTSEG_SZ >> 10);
+    if (t == 1 || t % 1024 == 0) LOG("[nvn] the game's command memory ran short, the host lends a segment (%u times so far, frame %llu, segment pool %d segments, %u MB)", t, (unsigned long long)f, n, mb);
     return m;
 }
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
@@ -812,7 +816,8 @@ static void hostseg_release(uintptr_t lo, uintptr_t hi) {
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
-    if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(CB(c)), HOSTSEG_SZ); return; }
+    if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } uint32_t sz = HOSTSEG_SZ; if (!pl && n >= 64) { sz = HOSTSEG_MIN; while (sz < n && sz < HOSTSEG_SZ) sz <<= 1; }
+        cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
     if (!pl->mem) { LOG("[RED] AddCommandMemory: pool has no CPU storage"); return; }
     hostseg_release((uintptr_t)(pl->mem + off), (uintptr_t)(pl->mem + off + n));
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
@@ -828,7 +833,7 @@ static uint8_t *cmd_alloc_keep(cmd_t *o, uint32_t size, uint32_t keep) {
         // The game's callback cannot supply enough (newer-SDK games hand out small chunks sized for real-device commands, or disable the callback and manage memory themselves): continue recording in a host segment instead of aborting
         if (!o->cb || tries == 2) {
             static int once; if (!once++) LOG("[nvn] command memory: the game's callback did not add enough (cb=%p, need %u bytes), using a host-lent segment", (void *)o->cb, size + keep);
-            cmd_new_segment(o, hostseg_take(o), HOSTSEG_SZ); break;
+            cmd_new_segment(o, hostseg_take(o, HOSTSEG_SZ), HOSTSEG_SZ); break;
         }
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
         { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ncb;
@@ -993,9 +998,11 @@ NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
     for (int i = 0; i < n; i++) *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
+// The backend's count of sampler registrations so far, kept with each texture / sampler bind (gfx_vk_tex.c: a bind sees the samplers as registered when it was recorded); 0 without one
+__attribute__((weak)) uint64_t mtl_samp_seq(void) { return 0; }
 static p_bind_handles *bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
     if (n < 0 || n > 32) { LOG("[RED] bind handle count %d", n); return NULL; }
-    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; r->defer = 0; r->src = 0; memcpy(r->h, h, 8 * n);
+    p_bind_handles *r = RECN(c, op, p_bind_handles, h, n); r->stage = st; r->first = first; r->n = n; r->defer = 0; r->src = 0; r->sseq = mtl_samp_seq(); memcpy(r->h, h, 8 * n);
     {   // this command buffer may have bound a pool other than the first: move its IDs to that pool's part of the table (handle: texture ID in bits 0-19, sampler ID from bit 20)
         int tb = CB(c)->tex_base, sb = CB(c)->samp_base;
         for (int i = 0; i < n && (tb || sb); i++) {
@@ -1424,7 +1431,7 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period);
 static int present_itv(const win_t *o);
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
-__attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns) { (void)pace_ns; }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
+__attribute__((weak)) void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { (void)pace_ns; (void)pq_ns; }   // Android (perf_android.c): a frame's work starts, for the CPU performance hint
 __attribute__((weak)) void dm_perf_deadline(uint64_t target_ns, int frame_step) { (void)target_ns; (void)frame_step; }   // Android: the scheduler deadline, and whether the frame-step controller already owns pacing
 __attribute__((weak)) uint64_t dm_present_period_adapt(uint64_t period) { return period; }   // Android (perf_android.c): a longer period the frames can hold steadily
 __attribute__((weak)) int mtl_snap_on(void) { return 0; }
@@ -1462,9 +1469,16 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     }
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
+    // The wait for the present thread (pq_ns) goes to the adaptive frame rate apart from the frame's work: at 40 or 30 fps it is the longer period's own pace
+    // (Super Mario Odyssey's title held 30 fps with 1 ms of GPU work a frame and showed 60 when pinned there). The CPU hint still counts it as work: with the
+    // replay on its own thread it holds the replay's and the GPU's time too, and without it the hint let the CPU clocks fall to 1 GHz (perf_android.c).
+    // With the replay on its own thread the pace can be in the wait for the present's job (the replay thread held by the full present queue); the replay's
+    // own time in that wait comes back to the rate as the frame's replay time (dm_perf_frame_cost)
+    uint64_t pq_ns = 0;
     uint64_t tk = *idx < 4 ? __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE) : 0;
-    if (tk & ASYNC_FENCE) { uint64_t w0 = now_ns(); job_wait(tk & ~ASYNC_FENCE, ~0ull); g_pq_wait_ns += now_ns() - w0; tk = __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE); }   // its present still queued
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
+    if (tk & ASYNC_FENCE) { uint64_t w0 = now_ns(); job_wait(tk & ~ASYNC_FENCE, ~0ull); pq_ns = now_ns() - w0; tk = __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE); }   // its present still queued
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); pq_ns += now_ns() - w0; }
+    g_pq_wait_ns += pq_ns;
     // The sync signals when the texture is available: once the work before its last present is done, as Horizon releases a swap-chain image (not all work so far).
     // Xenoblade Chronicles 3 waits on it on the CPU right after presenting frame N, before it submits N+1: fenced "now", that wait took frame N's whole GPU tail
     // (frame = replay + GPU tail, ~16 ms of 33), so the GPU never ran a frame while the next one was replayed. DM_NVN_ACQ_NOW=1: the old fence (all work so far)
@@ -1476,7 +1490,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     { static int w = -1; if (w < 0) { const char *ar = getenv("DM_NVN_ACQ_REPLAYED"); w = !(ar && !atoi(ar)); } if (w && nvn_async()) job_wait(g_job_enq, ~0ull); }
     if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = acq_now || *idx >= 4 ? nvn_fence_now() : o->done[*idx]; }
     SEQ("acquire %d sync %p", *idx, (void *)s);   // The swapchain texture becomes available once the commits before this point have completed
-    if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; dm_perf_frame_start(pace_ns); }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
+    if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; dm_perf_frame_start(pace_ns, pq_ns); }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 // The older API (NVN 53, Super Mario 3D World + Bowser's Fury): the queue waits for the texture on the GPU and no sync object is handed out. The host replays in submission order, so later commands already come after earlier presents; the same as WindowAcquireTexture without a sync object
@@ -2363,7 +2377,7 @@ NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 // Combined texture handle (texture id | sampler id << 20) is recorded into the texture slot as is: the replay layer takes the texture from the low 20 bits and the sampler from the high bits (nvn_mtl.m NVN_RB_SAMPT)
 // One combined handle: recorded as the hardware lays the command out, the handle 16 bytes in, where Luigi's Mansion 3 patches it after recording (nvn_obj.h p_bind_tex1)
 NVN(nvnCommandBufferBindTexture, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNtextureHandle h) {
-    p_bind_tex1 *r = REC(c, OP_BIND_TEX1, p_bind_tex1); *r = (p_bind_tex1){st, i, (uint64_t)h, CB(c)->tex_base, CB(c)->samp_base};
+    p_bind_tex1 *r = REC(c, OP_BIND_TEX1, p_bind_tex1); *r = (p_bind_tex1){st, i, (uint64_t)h, CB(c)->tex_base, CB(c)->samp_base, mtl_samp_seq()};
 }
 _Static_assert(offsetof(p_bind_tex1, h) == 8, "a single texture bind keeps its handle 16 bytes into the record (8 of header)");
 NVN(nvnCommandBufferBindTextures, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNtextureHandle *h) { bind_handles(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h); }

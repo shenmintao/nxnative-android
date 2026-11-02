@@ -50,7 +50,7 @@ static void vkDestroyPipeline(VkDevice device, VkPipeline pipeline, const VkAllo
 }
 /* PRODUCTION HELPERS */
 static void reset(void) {
-    if (g_prec) fclose(g_prec);
+    if (g_prec) { pipe_record_flush(); fclose(g_prec); }
     g_prec = NULL; free(g_pw); g_pw = NULL; g_pw_n = g_pw_next = g_pw_done = 0;
     nvn_hm_clear(&g_cpipes, NULL); nvn_hm_clear(&g_pipes, NULL);
     created = destroyed = observed = graphics_calls = 0;
@@ -74,11 +74,14 @@ int main(void) {
     file_with(PIPE_MAGIC_V1, sizeof(pkey), keys, 1, 1);
     prewarm_start(); assert(g_pw_n == 1 && g_pw[0].kind == 0);
     prewarm_thread(NULL); assert(graphics_calls == 1 && created == 0 && g_pw_done == 1);
-    fclose(g_prec); g_prec = NULL;
+    pipe_record_flush(); fclose(g_prec); g_prec = NULL;
     FILE *file = fopen("vk_pipelines.bin", "rb"); uint32_t header[2];
     assert(fread(header, 8, 1, file) == 1 && header[0] == PIPE_MAGIC && header[1] == sizeof(pkey));
     assert(fseek(file, 0, SEEK_END) == 0 && ftell(file) == (long)(8 + sizeof(pkey))); fclose(file);
-    reset(); keys[0].kind = 0;
+    reset(); keys[0].kind = 1;
+    file_with(PIPE_MAGIC_V1, sizeof(pkey), keys, 1, 0); prewarm_start();
+    assert(g_pw_n == 1 && g_pw[0].kind == 0 && g_pw[0].fdz == 2);
+    reset(); keys[0].kind = 0; keys[0].fdz = 0;
     file_with(PIPE_MAGIC, sizeof(pkey), keys, 3, 0); prewarm_start(); prewarm_thread(NULL);
     assert(graphics_calls == 1 && created == 1 && observed == 0 && g_pw_done == 2);
     uint64_t key[3] = {18, 3, 4};
@@ -86,8 +89,9 @@ int main(void) {
     assert(cached && created == 1 && observed == 0);
     key[2] = 5; VkPipeline variant = compute_pipeline(shaders+1, (VkPipelineLayout)9, key, 1);
     assert(variant && variant != cached && created == 2 && observed == 1);
+    pipe_record_flush();
     assert(ftell(g_prec) == (long)(8 + 4*sizeof(pkey)));
-    fclose(g_prec); g_prec = NULL;
+    pipe_record_flush(); fclose(g_prec); g_prec = NULL;
     file = fopen("vk_pipelines.bin", "rb"); assert(file && !fseek(file, 8+3*sizeof(pkey), SEEK_SET));
     pkey recorded; assert(fread(&recorded, sizeof recorded, 1, file) == 1); fclose(file);
     assert(recorded.kind == 1 && recorded.key[0] == 18 && recorded.um[0] == 3 && recorded.im[0] == 5);

@@ -69,7 +69,7 @@ class Aarch64Preflight(unittest.TestCase):
         base = self.root / 'test.xci'
         base.write_bytes(b'placeholder container')
         port = Port(Options(self.root))
-        port.g, port.fam, port.have = Profile(), {}, {}
+        port.g, port.fam, port.have = Profile(), {'dlc': []}, {}
         port.work, port.logs, port.env = self.root, self.logs, {}
         port.versions, port.derived, port.provisional = ['v0'], False, False
         with patch.object(nsp, 'pick_nsps', return_value={'v0': (base, None)}), \
