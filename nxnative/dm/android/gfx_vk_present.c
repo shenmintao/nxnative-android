@@ -16,6 +16,9 @@
 
 __attribute__((weak)) ANativeWindow *dm_front_window(void) { return NULL; }
 static uint64_t g_presents;
+#ifndef DM_RELEASE
+uint64_t vk_debug_next_present(void) { return g_presents + 1; }
+#endif
 // Vulkan IDs include host redraws; fallback hand-over times are kept separately
 // from real display feedback so late driver results can replace a fallback.
 enum { PRES_TIMES = 64 };
@@ -767,6 +770,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
 // slack). The pause menu's redraws carry no time. DM_VK_PACE=0 (live) presents without times
 static _Atomic uint64_t g_refresh_ns;
 static uint64_t g_pace_target, g_pace_anchor, g_pace_n, g_pace_resync, g_pace_slip; static int g_pace_on = 1, g_snapshot_lead = 1;
+static int g_pace_budget_on = 1; static uint64_t g_pace_trimmed; static double g_pace_trimmed_ms;
 static uint64_t mono_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
 static void pace_reset(void) { g_pace_target = g_pace_anchor = g_refresh_ns = 0; }
 static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on the grid through the anchor
@@ -777,6 +781,7 @@ static uint64_t pace_snap(uint64_t t) {   // the first vsync at or after t on th
 static uint64_t pace_desired(double period, int buffered) {   // the frame's desired present time (0 = none)
     if (!V.has_dtiming || !g_swap) return 0;
     if (g_pace_n % 30 == 0) { const char *e = getenv("DM_VK_PACE"); g_pace_on = !(e && !atoi(e));
+        e = getenv("DM_VK_PACE_BUDGET"); g_pace_budget_on = !(e && !atoi(e));
         e = getenv("DM_VK_SNAPSHOT_LEAD"); g_snapshot_lead = !(e && !atoi(e)); }
     if (!g_refresh_ns || g_pace_n % 120 == 0) {
         VkRefreshCycleDurationGOOGLE rc; uint64_t was = g_refresh_ns;
@@ -791,8 +796,9 @@ static uint64_t pace_desired(double period, int buffered) {   // the frame's des
             if (pt[i].desiredPresentTime && pt[i].actualPresentTime > pt[i].desiredPresentTime + g_refresh_ns) g_pace_slip++;   // went out a vsync or more after its own
         }
     g_pace_n++;
-    if (g_pace_n % 600 == 0) VKLOG("[perf] display timing: %llu frames, %llu resyncs, %llu shown a vsync or more after their time, %llu actual presentation samples (cumulative)%s",
-                                   (unsigned long long)g_pace_n, (unsigned long long)g_pace_resync, (unsigned long long)g_pace_slip, (unsigned long long)g_pres_recorded, g_pace_on ? "" : "; off (DM_VK_PACE=0)");
+    if (g_pace_n % 600 == 0) VKLOG("[perf] display timing: %llu frames, %llu resyncs, %llu shown a vsync or more after their time, %llu actual presentation samples (cumulative)%s; budget_on=%d budget_trimmed=%llu budget_trimmed_ms=%.3f",
+                                   (unsigned long long)g_pace_n, (unsigned long long)g_pace_resync, (unsigned long long)g_pace_slip, (unsigned long long)g_pres_recorded, g_pace_on ? "" : "; off (DM_VK_PACE=0)",
+                                   g_pace_budget_on, (unsigned long long)g_pace_trimmed, g_pace_trimmed_ms);
     if (!g_pace_on || !g_refresh_ns || !g_pace_anchor || period <= 0) { g_pace_target = 0; return 0; }
     // The earliest vsync this frame can make: its GPU work (submitted just before), the blit, then the latch a vsync before it is shown. When the cadence's next vsync is
     // earlier, the cadence restarts half a vsync further out than that, so the next frames have room for the jitter: restarting at the earliest itself made 31 long frames
@@ -801,7 +807,10 @@ static uint64_t pace_desired(double period, int buffered) {   // the frame's des
     // this queue. Reserving its entire timestamp span again counts elapsed work
     // as a future delay and pushes the cadence out. Keep the blit margin;
     // a GPU that really finishes late still appears late in the actual feedback.
-    double vk_gpu_ms_recent(void); double g = buffered && g_snapshot_lead ? 0 : vk_gpu_ms_recent();
+    // Elapsed gaps between split submissions are not the next frame's GPU work.
+    double vk_gpu_ms_recent(void), vk_gpu_ms_budget(double, double *); double trimmed = 0;
+    double g = buffered && g_snapshot_lead ? 0 : (g_pace_budget_on ? vk_gpu_ms_budget(period * 1e3, &trimmed) : vk_gpu_ms_recent());
+    if (trimmed > 0) { g_pace_trimmed++; g_pace_trimmed_ms += trimmed; }
     uint64_t gpu = (uint64_t)((g > 4 ? g : 4) * 1e6) + 3000000;
     uint64_t now = mono_ns(), t = g_pace_target ? pace_snap(g_pace_target + (uint64_t)(period * 1e9) - g_refresh_ns / 2) : 0;
     if (t < now + gpu + g_refresh_ns) { if (g_pace_target) g_pace_resync++; t = pace_snap(now + gpu + g_refresh_ns * 3 / 2); }

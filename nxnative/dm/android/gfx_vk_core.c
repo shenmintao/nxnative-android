@@ -13,6 +13,7 @@
 #include "nvn_dirty.h"
 #include "copy_queue.h"
 #include "gpu_segments.h"
+#include "vk_pace_budget.h"
 #include "pool_write_ranges.h"
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
@@ -891,6 +892,14 @@ next_main:
 VkCommandBuffer vk_cmd(void) { return cur()->main; }
 int vk_cmd_parts_left(void) { vksub_t *s = cur(); return MAIN_CBS - (s->nmain_used > s->nup_used ? s->nmain_used : s->nup_used); }   // parts vk_cmd_split can still begin (gfx_vk_exec.c pass splits)
 int vk_sub_sent_early(void) { return g_cur >= 0 && (g_slot[g_cur].nmain_sent > 0 || g_slot[g_cur].deferred_pending); }
+#ifndef DM_RELEASE
+int vk_debug_stall_ready(void) {
+    if (g_cur < 0) return 0;
+    // A deferred part must have reached vkQueueSubmit before replay sleeps.
+    vksub_t *s = &g_slot[g_cur]; split_collect(s);
+    return s->nmain_sent > 0 && !s->cb_err;
+}
+#endif
 uint64_t g_up_gen;   // upload command buffers begun (gfx_vk_tex.c lin_copy: once per upload buffer)
 VkCommandBuffer vk_upload_cmd(void) {
     vksub_t *s = cur();
@@ -1301,6 +1310,18 @@ double vk_gpu_ms_recent(void) {   // the latest finished frame's GPU time among 
     uint64_t f = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
     for (uint64_t k = 2; k < 8 && k <= f; k++) { double g = mtl_gpu_ms(f - k); if (g >= 0) return g; }
     return -1;
+}
+double vk_gpu_ms_budget(double period_ms, double *trimmed_ms) {
+    uint64_t f = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
+    double spans[8], latest = -1; int n = 0;
+    // Keep the raw latest lookup (f-2..f-7); only the median reaches further
+    // back through known ring entries, up to eight finished spans.
+    for (uint64_t k = 2; k < 64 && k <= f && n < 8; k++) {
+        double g = mtl_gpu_ms(f - k); if (g < 0) continue;
+        if (!n && k < 8) latest = g;
+        spans[n++] = g;
+    }
+    return vk_pace_budget_estimate(latest, spans, n, period_ms, trimmed_ms);
 }
 // Internal completion protects command-pool host access and slot reuse.
 static void completion_retire(cpend *c) {

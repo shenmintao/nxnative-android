@@ -9,6 +9,7 @@
 #include "nvn_hmap.h"
 #include "rt_alias.h"
 #include <math.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -1644,6 +1645,21 @@ static void pipeline_key(pkey *out, const vk_replay_state *state, uint32_t prim,
 
 #include "vk_pipeline_scan.h"
 
+#ifndef DM_RELEASE
+static void replay_stall(void) {
+    uint64_t vk_debug_next_present(void);
+    const char *e = getenv("DM_VK_X_STALL_MS"); if (!e) return;
+    char *end; long ms = strtol(e, &end, 10); if (*end || ms < 1 || ms > 1000) return;
+    int vk_debug_stall_ready(void); if (!vk_debug_stall_ready()) return;
+    // Consume before sleeping: another identical DM_CTL env line can re-arm it.
+    unsetenv("DM_VK_X_STALL_MS");
+    uint64_t start = tnow(); struct timespec delay = {ms / 1000, ms % 1000 * 1000000};
+    while (nanosleep(&delay, &delay) && errno == EINTR) {}
+    VKLOG("[perf] replay stall: present %llu requested_ms=%ld start_ns=%llu end_ns=%llu",
+          (unsigned long long)vk_debug_next_present(), ms, (unsigned long long)start, (unsigned long long)tnow());
+}
+#endif
+
 static int prepare_draw(int prim, int indexed) {
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
@@ -1700,6 +1716,9 @@ rebind_views:;
     uint64_t image_gen = g_vk_image_gen;
     depth_clone_before_draw();
     if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
+#ifndef DM_RELEASE
+    replay_stall();
+#endif
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
