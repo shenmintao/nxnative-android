@@ -444,6 +444,7 @@ static uint64_t g_next_id;
 static int dm_host_work;
 static void qos_map_init(void) {}
 static void pause_install(void) {}
+static void hitch_init(void) {}
 static uintptr_t pthread_mach_thread_np(pthread_t thread) { (void)thread; return 1; }
 static int pthread_get_qos_class_np(pthread_t thread, qos_class_t *qos, int *rel) {
     (void)thread; *qos = 0; *rel = 0; return 0;

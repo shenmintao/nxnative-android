@@ -8432,6 +8432,7 @@ uint64_t mtl_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_v
     return present_enqueue(&t, period, crop, ev ? ev_val : 0);
 }
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
+    extern _Atomic uint64_t dm_present_ns; atomic_store_explicit(&dm_present_ns, now_ns(), memory_order_relaxed);
     if (atomic_load(&g_present_discard)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait
     if (t) { xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);

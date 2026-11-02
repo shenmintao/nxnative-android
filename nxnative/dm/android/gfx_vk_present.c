@@ -948,6 +948,7 @@ static void *present_thread(void *arg) {
 }
 static void present_thread_start(void) { pthread_t t; pthread_create(&t, NULL, present_thread, NULL); pthread_detach(t); }
 static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, double period) {   // im NULL: nothing to show, the ticket still completes in order
+    extern _Atomic uint64_t dm_present_ns; atomic_store_explicit(&dm_present_ns, mono_ns(), memory_order_relaxed);
     static int sync = -1; static pthread_once_t once = PTHREAD_ONCE_INIT;
     if (sync < 0) sync = getenv("DM_VK_SYNC_PRESENT") != NULL;
     if (sync || !dm_front_window()) {   // headless: nothing to show; or presenting on this thread
