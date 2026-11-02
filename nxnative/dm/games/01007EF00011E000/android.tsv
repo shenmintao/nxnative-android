@@ -4,8 +4,9 @@
 # Final debug: fixed 58.224/58.130 fps, moving 57.867/57.692; 60 fps thresholds not met.
 # 30-minute soak: same PID, no RED, last 5 minutes 55.567 fps with thermal/frequency interference.
 # 1199 graphics keys packaged; cold-cache hitch criterion not met. Release save/load smoke passed.
-# 2026-11-02 warm fixed OFF/ON/ON/OFF: one recurring explicit-sync caller on prime CPUs
-# reduced late presents 3.498% to 0.843% (57.743 to 59.814 fps), with >50 ms 49 to 0.
+# 2026-11-02: generic upstream lock-poll spin waits remove fixed-view long frames.
+# Sync-caller pinning also helped the old modules, but adds no benefit to the new rule;
+# retain the generic polling fix without an extra affinity restriction.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
 tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-01: Chinese menus, save/load, controller/touch, CPU mapping and HOME restoration checked; final debug docked 1080p output at 1600x900 internal in sampled scenes, fixed mean 58.177 fps and moving 57.780 fps; 30-minute soak same PID and no RED, last 5 minutes 55.567 fps with thermal/frequency interference; performance and cold-cache hitch criteria not met; 111 unit tests and Vulkan validation pass, release a1178870 save/load smoke passed; standing lower-leg ground occlusion remains reproducible, full gameplay unverified
@@ -21,7 +22,6 @@ env	DM_FPS_HOLD=off
 env	DM_VK_ENCODE_THREAD=1
 env	DM_VK_TAIL_DRAWS=256
 env	DM_PIN_REPLAY=prime
-env	DM_PIN_SYNC_THREAD=prime
 env	DM_VK_GUEST_NOTIFY=1
 env	DM_VK_DEFER_PARTS=1
 env	DM_VK_CMP_CONSTANT=1
