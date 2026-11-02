@@ -93,6 +93,14 @@ Run `20261102-211447-H1-pace-off-once` repeats the original192400 F416 setup wit
 
 Ordinary cadence worsens: >17.5 ms intervals1.300537% ->8.695043%, while mean fps58.934487 ->59.498442 and p99 stays approximately25.001 ms. Pacing-off is diagnostic only. Resolution, caps, thermal levels and prewarm match; periodic mean draws4450.417 ->4449.167. Current production bcd840c1 and the original preferences/primary saves were verified/restored; no runtime/default change was made. The appropriate next candidate would retain pacing while resisting elapsed submission gaps in its GPU estimate, rather than disable pacing in production.
 
+#### Mechanism and scope of a prospective fix
+
+There are two costs to distinguish. First, a newly encountered pipeline can block replay while it is created. Second, presentation scheduling can add another delay after that work has ended. With split submission, the GPU may execute early commands and then wait for the CPU to produce the rest. The first/last GPU timestamp span can include that idle gap; it is elapsed time, not a measurement of uninterrupted GPU execution.
+
+`vk_gpu_ms_recent()` exposes the recent submission span. `pace_desired()` uses it as a budget for the next requested presentation, with margins and vsync snapping. A span inflated by an earlier compile stall can therefore push the cadence out again. In the retained original run, one275.015 ms display interval is followed by308.350 ms. Disabling the pacer removes the five consecutive second gaps while six substantial compile-demand clusters remain, supporting this amplification mechanism. It does not prove that every gameplay hitch has the same cause.
+
+A production candidate should preserve the pacer and its normal-frame cadence, while giving it an estimate resistant to elapsed submission gaps or stale outliers. Candidate filters or bounds still need to be designed and tested; the raw GPU timing statistic should remain distinct from the scheduling estimate. GPU completion synchronization and actual-presentation feedback must remain correct under genuinely heavy GPU work. Validation should show less added post-stall delay without the ordinary-cadence regression observed with pacing disabled. Eliminating the first pipeline-creation stall remains a separate task. No such correction is implemented in the current release.
+
 ## 5. What is implemented, and known limitations
 
 Source was adapted from nxnative `c646d43d567fbd1b96777ff7f3bd6d9aabb1a36a` (`mtl_prog_prefetch`, pending builds, `pso_predict_rest`). The reviewed nx2android reference was `8e030b41`, already an ancestor of this branch. These were targeted upstream reviews, not a complete audit of all Metal features. A future fix should fetch and search the relevant upstream functions again before inventing a replacement.
