@@ -1,0 +1,62 @@
+# BotW user-play hitch follow-up
+
+Authorized by the user on 2026-11-02 after the manual-play report and upstream review.
+
+## Scope and acceptance
+
+- BotW 1.9.0 (v1114112), TB323FU / SM8850P / Adreno 840 / Android 16, balanced mode.
+- Docked 1920x1080 output, stock 1280x720..1600x900 internal DRS, target 60, HOLD off. No quality, vendor mode, or system performance changes.
+- Use an isolated copy of the verified owned Great Plateau seed. Expand the previous one-second forward/back route to bounded six-second moves and camera turns; record screenshots and internal resolution. Never play the primary save.
+- First diagnose one 120-second route after 60-second warmup: align actual present intervals with timed graphics/compute pipeline creation, texture work, submission waits, and GPU segment/gap observations. Diagnostic trace overhead is recorded and its fps is not an acceptance result.
+- Implement only a cause shown to explain a material portion of long frames. Check the two upstreams first. Do not skip draws or alter shader precision.
+- The user explicitly waived OFF/ON/ON/OFF for this follow-up on 2026-11-02. Build on production 44a337e0, validate source checks, unchanged rendering/input and zero Vulkan errors, then run one bounded moving smoke in the owned seed. Record presentation metrics as observations only; performance gain remains unquantified. Do not restart comparative or long-running performance loops.
+- Finish with appropriate unit checks, zero Vulkan validation errors, release smoke, original preferences and unchanged primary saves. Implementation groups restore production APK 44a337e0; the completed release smoke promotes bcd840c1 below as the next production baseline. Future groups must restore the new baseline. Final 30-minute soak remains waived unless the user asks for it.
+
+## Starting evidence
+
+Manual route diagnostic `20261102-151653-user-live-hitch`: 120.112 s, 58.004 fps, 33 intervals >50 ms, 12 >100 ms, max 241.680 ms. Graphics creation checkpoints 1301 to 1689 after prewarm completed. Android generic `mtl_*` pipeline/upload statistics are fixed-zero stubs and cannot exclude this work; GPU timestamp envelopes include submission gaps.
+
+Publication and Dimensity 9400 experiments were held during this investigation. The first-use mechanisms below form candidate 0.3.0rc2; Dimensity experiments remain deferred. The accepted short-route plan 2 measurements stay in `perf-plan-2.md`; they are not evidence for the broader route.
+
+## Latest direction
+
+The user approved program-creation shader prefetch and bounded upcoming-command pipeline compilation, then waived the four-run performance comparison. Implement these on the production-derived branch, with ordinary full pipelines and correct synchronous fallback whenever preparation is incomplete. The failed GPL experiment is checkpointed separately at `experiment/gpl-resident-20261102` / `16600918`; it is excluded from this implementation. Keep balanced mode, stock DRS, save isolation and the production rollback procedure above.
+
+## Implemented prefetch and prediction
+
+- Source adapts nxnative `c646d43`'s program-creation prefetch and bounded pending/predicted builds to existing Vulkan pipelines. The queue owns shader keys; speculative jobs own complete pipeline keys and stable shader/layout handles. The actual draw recomputes its key, steals queued work or waits for an exact running build. It never skips a draw for this optimization.
+- Prediction uses a private replay-state copy, allows at most two admitted builds and eight bounded scans per logical submission, follows nested calls/jumps, and stops at changed targets or memory/compute/synchronization work. Uncertain shader-view variants may miss the prediction and compile normally. The existing 1000-byte PPE2 key ABI is unchanged.
+- 156 source tests passed. Cold first-use Vulkan run `20261102-182026-coverage`, with recorded prewarm disabled, passes fixed/moving checks: zero validation errors, three unused-output warnings, 3264 shader fetches completed; 44 predicted jobs = 42 completed + two stolen by demand. All three compiler worker masks are 0-7, rather than the replay thread's inherited narrow affinity. Stock DRS selects 1280x720 under validation overhead; not performance evidence. An earlier attempt was interrupted by a transient read-only adb timeout, recovered to 44a337e0, and repeated with retry inside the original scene deadline.
+- Ordinary single observation `20261102-182822-prefetch-moving-observation`: 60 s warmup, 120.047 s moving, 7099 presents, 59.135126 fps, late >17.5 ms 1.112990%, p99 25.001354 ms, >50/>100 ms 16/5, max 200.010937 ms. Main pass 1600x900 before/after, output 1920x1080, balanced ceilings 1996800/2438400 kHz, sampled CPU/GPU/skin severity zero, audio and PID continuity pass. End RSS 2405240 KiB (~2.29 GiB). Raw timing records 46 graphics demand misses (including prediction waits), not 46 driver compiles; background work is separate. This is not a controlled improvement result and remaining hitches are evident.
+- Release `bcd840c1a9a3427e6dbe4f46c5caa041d6caf5f9e0fb941243e2ca42ddcc988d` passes isolated save/load and 30 s gameplay smoke in `20261102-190024-coverage`, with packaged 1209 prewarm keys and RED=0. It is installed as the new production runtime; original preferences and primary saves are unchanged, app stopped/display OFF. The previous 44a337e0 APK and data remain available for rollback; rewritten modules and shader data are unchanged.
+- Candidate version is 0.3.0rc2. The 30-minute soak and comparative FPS windows stay waived; performance gain is unquantified. Desktop packaging uses an isolated venv and a locally built bootloader, with no global Python launcher changes.
+
+## Desktop candidate verification
+
+Windows x64 bundle built with Python 3.12.10, PySide6 6.12.0 and PyInstaller 6.22.3 in an isolated environment. The PyInstaller source archive matches the SHA-256 published by PyPI; the launchers were compiled locally. Frozen `--help`, `profiles`, `-m porter profiles` and engine `build.py --help` pass. The native Windows Qt platform renders all four tabs with the expected 0.3.0rc2 version and adjacent engine path; the hidden-window screenshot was inspected. An offscreen-platform font artifact does not occur with the native Windows platform. No game assets, keys or toolchains are bundled.
+
+Final source review moved the single-owner replay shadow off guest stacks and kept unsupported stages on the original demand path. The 12 affected queue/replay/host checks were rerun successfully, all 144 release sources build, and the resulting bcd840c1 APK passed the isolated release smoke above. The earlier cold validation and ordinary moving observation used the preceding build of the same two mechanisms.
+
+## Previous GPL experiment
+
+The diagnostic capture above is complete. The user stopped the route-list-only proposal because unvisited routes would still compile, then approved the resource-derived graphics-pipeline-library prototype. The static scan finds 15,767 known shader pairs and full pair coverage of both sampled runs; this is not an exhaustive list of complete pipelines or runtime-generated shaders.
+
+The Adreno 840 reports graphicsPipelineLibrary=1 and fastLinking=1; the recorded Mali driver has neither extension. The prototype is opt-in (`DM_VK_GPL=1`), combines the actual pre-rasterization/fragment modules and descriptor layout in a library, and links vertex/attachment state at first use. No draws are omitted. State and shader variants not covered by prewarm still compile synchronously. Validate rendering first, then measure full-table startup cost/memory and the same OFF/ON/ON/OFF route; advertisement or a simple probe is not acceptance.
+
+Initial game library creation failed with VK_ERROR_UNKNOWN and zero validation errors. An independent real-shader probe reproduces the failure while complete pipelines succeed. A synthetic shader fails when only generator word 2 becomes zero; the real pair succeeds when only that word becomes 1 (preserving its tool ID). Descriptor sets/buffers, independent-set layouts, SPIR-V version changes and ordinary optimization did not explain the failure. The runtime now applies the nonzero low version bits only to zero-generator modules while GPL is enabled; shader instructions are unchanged. [SPIR-V physical layout](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_physical_layout_of_a_spir_v_module_and_instruction) permits zero and assigns the generator word no semantics.
+
+Strict game validation `20261102-171648-coverage` passed stationary/moving checks: 962 libraries, 1,212 links, zero creation failures, zero validation errors, three unused-output warnings. Stock DRS selected 1280x720 under validation overhead; this is not performance acceptance. The private runner now archives/removes a stale log before prototype startup so an earlier RED cannot fail a new process before its log rotates. All 154 source tests passed across the full run (151 passed, three decoder tests subsequently passed with the native DLL configured).
+
+The full resident-table probe `20261102-172313-coverage` did not complete: progress passed 15,000 pairs / 62,000 libraries, then SIGABRT at roughly 587 seconds of app lifetime. Last sampled RSS was 6,296,796 KiB, available system memory 3,292,816 KiB. Android records EXIT_SELF/status134, not LOW_MEMORY; high memory is observed but not an established cause of the abort. Production 44a337e0, original settings and primary-save hashes were restored, app stopped/display OFF. No performance A/B ran and no optimization was promoted. The all-resident prototype is unsuitable for release in this state.
+
+## Targeted upstream gaps reviewed after the user's background-CPU question
+
+Latest fetched references: nxnative `c646d43d567fbd1b96777ff7f3bd6d9aabb1a36a`, nx2android `8e030b41` (already an ancestor of this branch). These are Metal-backend mechanisms without corresponding Android Vulkan paths, not a list of unmerged Android commits:
+
+- `mtl_prog_prefetch`: start shader-library loading when the game creates the program.
+- `pso_predict_rest`, `shader_prefetch_rest`, bounded demand-first pending builds: inspect upcoming draws and overlap exact pipeline builds with current replay.
+- Metal 4 archived bases and `hybrid_get`: draw with a compatible vertex-pulling pipeline while the specialized pipeline compiles. Android GPL remains an isolated, incomplete experiment; Metal APIs cannot be copied into Vulkan.
+- `sdx_decide` / store lookahead, readable-tile pass fusion, and `DM_NVN_CS_HOIST`: reduce attachment traffic and pass splits after dependency checks. Potential Android/Mali applicability is not measured.
+- Generic `mtl_create_*` / upload statistics still return zeros in Android `gfx_common.c`; backend timings exist separately but are not wired into these host diagnostics.
+
+The first two mechanisms are implemented above. The shared lock-poll rule, ADPF changes, memory lookup changes, real motion input and `DM_HITCH_DUMP` are already present and must not be reported as missing. Other mechanisms remain outside this candidate's scope; retain the failed resident-table evidence and the ordinary production baseline.

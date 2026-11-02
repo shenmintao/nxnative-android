@@ -23,8 +23,8 @@ class DepthOnlyPrograms(unittest.TestCase):
         key = source[key_start:source.index('\n', key_start)]
         draw = source[source.index('static int prepare_draw('):source.index('    if (g_x_nogs && S.sh[2])')]
         draw += '    (void)prim; (void)indexed; return 1;\n}\n'
-        start = source.index('    for (int i = 0; i < S.ncol; i++) {', source.index('// attachments and blending'))
-        colour = source[start:source.index('    k.clip_neg1', start)]
+        start = source.index('    for (int i = 0; i < state->ncol; i++) {', source.index('// attachments and blending'))
+        colour = source[start:source.index('    k.clip_neg1', start)].replace('state->', 'S.')
         harness = r'''
 #include <assert.h>
 #include <stdint.h>

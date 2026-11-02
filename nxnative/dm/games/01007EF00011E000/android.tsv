@@ -1,3 +1,6 @@
+# 0.3.0rc2: program prefetch + bounded pipeline prediction; 156 source tests; Vulkan 0 errors / 3 unused-output warnings.
+# Single 120 s observation: 59.135 fps, 16 >50 ms intervals; no comparative gain claim. Release bcd840c1 smoke passed.
+# Plan 2 historical baseline follows; it does not measure the first-use follow-up.
 # TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-02.
 # Balanced mode, owned Great Plateau save; 60 s warmup + 120 s actual-present windows.
 # Docked 1920x1080 output, stock 1280x720..1600x900 DRS (1600x900 in sampled scenes).
@@ -11,7 +14,7 @@
 # Release 44a337e0 save/load smoke passed. Existing lower-leg ground occlusion remains.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-02: balanced mode; docked 1080p output, stock DRS sampled at 1600x900; final debug fixed 59.895 fps and moving 59.830 fps pooled, first-start moving 59.875 fps, all five windows have zero >50 ms intervals; graphics+compute prewarm, warm moving runtime compute creation zero; 150 unit tests, Vulkan validation zero errors and release 44a337e0 save/load smoke pass; real gyro direction/stability confirmed and rumble verified; final 30-minute soak waived by user; lower-leg ground occlusion remains, full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-02: balanced mode; docked 1080p output, stock DRS sampled at 1600x900; Plan 2 baseline fixed 59.895 fps / moving 59.830 fps; 0.3.0rc2 program prefetch and bounded pipeline prediction, 156 source tests, Vulkan zero errors / three unused-output warnings, release bcd840c1 isolated save/load smoke pass; single 120 s moving observation 59.135 fps / 16 intervals >50 ms, comparative gain unquantified; real gyro direction/stability confirmed and rumble verified; final 30-minute soak waived; lower-leg ground occlusion and hitches remain, full gameplay unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn

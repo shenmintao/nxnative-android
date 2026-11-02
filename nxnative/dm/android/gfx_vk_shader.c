@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -59,7 +60,9 @@ enum { NPEND = 4096 };
 static pend_t g_pend[NPEND]; static unsigned g_npend; static pthread_mutex_t g_pend_mu = PTHREAD_MUTEX_INITIALIZER;
 static void shader_set(const uint8_t k[8], const void *control, uint64_t data, uint32_t ncode) {
     uint64_t key = 0; for (int i = 0; i < 8; i++) key = key << 8 | k[i];
-    if (!key || !control || !data || !ncode || ncode >= (1u << 24) || vk_shader_stage(key) >= 0) return;
+    if (!key || !control || !data || !ncode || ncode >= (1u << 24)) return;
+    int stage = vk_shader_stage(key);
+    if (stage >= 0) { vk_shader_prefetch(key, stage); return; }
     uint32_t nctl = 0x880, own; memcpy(&own, (const uint8_t *)control + 0x20, 4); if (own >= 0x760 && own < 0x880) nctl = own;   // as hle_nvn.c keys_hash
     uint8_t *c = malloc(nctl); if (!c) return; memcpy(c, control, nctl);
     pthread_mutex_lock(&g_pend_mu);
@@ -188,6 +191,15 @@ static uint32_t *spv_add_outputs(const uint32_t *w, uint32_t nw, uint32_t mask, 
 }
 static nvn_hmap g_shaders = {.klen = 16};   // {key, stage} → vkshader_t*
 static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
+#include "vk_shader_prefetch.h"
+// Lookahead must not wait behind an unrelated shader load. Missing or busy
+// modules remain ordinary demand work; returned cache entries live for the run.
+vkshader_t *vk_shader_cached(uint64_t key, int stage) {
+    uint64_t k[2] = {key, (uint64_t)stage};
+    if (pthread_mutex_trylock(&g_sh_mu)) return NULL;
+    vkshader_t *s = nvn_hm_get(&g_shaders, k); pthread_mutex_unlock(&g_sh_mu);
+    return s == (void *)1 ? NULL : s;
+}
 // Shared layouts keep pipeline layouts and descriptor bindings reusable across shaders; g_sh_mu protects this cache too.
 static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b, uint32_t n) {
     struct { uint32_t n, b[96][4]; } k = {.n = n};

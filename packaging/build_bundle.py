@@ -26,7 +26,7 @@ def main():
     for f in files:
         d = APP / f; d.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / f, d)
     docs = ['README.md', 'README.zh-CN.md', 'docs/ARCHITECTURE.md', 'docs/DEVELOPMENT_GUIDE.md',
-            'docs/PORT_STATUS.md', 'docs/PORT_CHECKLIST.md', 'docs/perf-plan.md', 'docs/perf-plan-2.md', 'docs/perf-log.md']
+            'docs/PORT_STATUS.md', 'docs/PORT_CHECKLIST.md', 'docs/perf-plan.md', 'docs/perf-plan-2.md', 'docs/perf-log.md', 'docs/perf-hitch-followup.md']
     docs += tracked('docs/releases')
     for src, dst in [('packaging/INSTALL.md', 'INSTALL.md'), ('packaging/INSTALL.md', 'packaging/INSTALL.md'), ('nxnative/LICENSE', 'LICENSE')] + [(p, p) for p in docs]:
         (APP / dst).parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / src, APP / dst)

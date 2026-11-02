@@ -20,7 +20,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n);
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]);
 
 // ---------------- NVN state shadow ----------------
-static struct {
+typedef struct {
     const prog_t *prog; vkshader_t *sh[6]; int prog_ok; uint32_t missing_stages;
     p_bind_buf ubo[6][16], ssbo[6][16];
     uint64_t tex[6][256], samp[6][128], img[6][32], tex_sseq[6][256], samp_sseq[6][128];   // *_sseq: the sampler registrations made before the bind (gfx_vk_tex.c vk_samp_at)
@@ -34,7 +34,8 @@ static struct {
     // the open render pass
     int pass_open; uint32_t pass_w, pass_h; VkFormat cfmt[8], dfmt; VkImageAspectFlags daspect; uint32_t samples; int ncol;
     VkPipeline bound_pipe; int rp_pass;   // rp_pass: the open pass began with vkCmdBeginRenderPass
-} S;
+} vk_replay_state;
+static vk_replay_state S;
 static p_tf_bind g_tf[4]; static uint64_t g_tf_off[4]; static int g_tf_on, g_tf_in_pass; static uint32_t g_tf_verts;   // transform feedback: buffers, bytes written into each, capture on, a capture in the open pass (xfb_begin), vertices captured since Begin
 static int g_depth_zero = 1, g_lower_left;
 void mtl_set_depth_zero(int on) { g_depth_zero = on; }
@@ -97,6 +98,9 @@ static int g_x_listpasses;
 uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }   // the replay time so far (gfx_vk_present.c: a frame's cost for the adaptive rate)
 // flicker experiments (DM_CTL env lines, read every submission): DM_VK_X_NOSETC no descriptor set reuse, DM_VK_X_NODRVC no driver segment reuse, DM_VK_X_LANDCUT deferred
 // uniform updates land at each cut, DM_VK_X_NOKEEP no pass kept for the same targets, DM_VK_X_NOSHC no shadow reuse
+static int g_pipe_predict_on = 1, g_pipe_predict_scanned, g_pipe_predict_budget;
+static const uint8_t *g_predict_next, *g_predict_returns[16]; static unsigned g_predict_depth;
+static int rt_same_state(const vk_replay_state *state, const p_set_rt *r);
 static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on depth written by fragment shaders (pipeline key fdz)
 static int g_depth_clone;   // DM_VK_DEPTH_CLONE: 0 old FDZ, 1 pure-depth probe, 2 D16 copies (default); ordinary FDZ for other cases
 uint64_t g_depth_clone_copies, g_depth_clone_failures, g_depth_clone_restarts;
@@ -170,6 +174,7 @@ static void x_read(int continuation) { const char *c = getenv("DM_VK_CB_DRAWS");
     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     g_lrz_touch = !((e = getenv("DM_VK_LRZ_TOUCH")) && !atoi(e)); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_depth_clone = depth_clone_mode();
+    { const char *e = getenv("DM_VK_PIPELINE_PREDICT"); g_pipe_predict_on = !e || atoi(e); }
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 128;
     g_tail_draws = (e = getenv("DM_VK_TAIL_DRAWS")) ? atoi(e) : 0;
     if (g_tail_draws < 32 || g_tail_draws > 512) g_tail_draws = 0;
@@ -216,7 +221,7 @@ void vk_exec_continue(void) { // a physical boundary preserves one-shot diagnost
 }
 void vk_exec_reset(void) {
     static int inited; if (!inited) { inited = 1; state_reset(); prewarm_start(); compute_warm_start(); }
-    g_rc_npend = 0; g_rc_skip = 0;
+    g_rc_npend = 0; g_rc_skip = 0; g_pipe_predict_scanned = 0; g_pipe_predict_budget = 2;
     exec_boundary(0);
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
     { extern volatile int g_vk_samp_log; if (g_vk_samp_log > 0) VKLOG("submission begins (present %llu, thread %d)", (unsigned long long)g_tex_frame, (int)gettid()); }
@@ -947,12 +952,13 @@ typedef struct {
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
     uint64_t vin;           // actual vertex fetch classes, three bits per NVN attribute location
 } pkey;
+static int pipeline_predict_rest(const pkey *current, int budget);
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
 static nvn_hmap g_cpipes = {.klen = 24};   // {compute shader, unsigned / signed integer-texel bindings}; also under g_pipe_mu
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
-// Debug acceptance runs count runtime creation calls, a conservative upper bound
-// on driver compilations. Prewarm calls are excluded; timestamps are MONOTONIC.
+// Debug: graphics demand-miss time (including prediction waits), plus compute
+// creation calls; not driver compile counts. Prewarm excluded, MONOTONIC.
 static uint64_t pipeline_observe_start(void) {
 #ifndef DM_RELEASE
     const char *e = getenv("DM_VK_PIPELINE_TIMES");
@@ -964,6 +970,8 @@ static void pipeline_observe_end(const char *kind, uint64_t start) {
     if (start) VKLOG("runtime pipeline %s: start_ns=%llu end_ns=%llu", kind,
                      (unsigned long long)start, (unsigned long long)tnow());
 }
+#include "vk_pipeline_jobs.h"
+
 static VkPipeline compute_pipeline(vkshader_t *cs, VkPipelineLayout layout, const uint64_t ck[3], int record) {
     pthread_mutex_lock(&g_pipe_mu); VkPipeline p = nvn_hm_get(&g_cpipes, ck); pthread_mutex_unlock(&g_pipe_mu);
     if (p) return p == (void *)1 ? VK_NULL_HANDLE : p;
@@ -1040,15 +1048,18 @@ static VkPipeline graphics_pipeline(const pkey *k, VkPipelineLayout layout) {
     vkshader_t *stg[3] = {S.sh[0], S.sh[1], S.sh[2]};
     uint64_t observed = pipeline_observe_start();
     uint64_t tb = g_prof_on ? tick() : 0;
-    p = build_pipeline(k, layout, stg);
+    p = pipeline_predict_take(k);
+    if (!p) {
+        pthread_mutex_lock(&g_pipe_mu); p = nvn_hm_get(&g_pipes, k); pthread_mutex_unlock(&g_pipe_mu);
+        if (!p) p = build_pipeline(k, layout, stg);
+    }
     if (g_prof_on) g_prof_ns[0] += tick() - tb; g_vkst.pipes_built++;
     pipeline_observe_end("graphics", observed);
-    pthread_mutex_lock(&g_pipe_mu);
-    VkPipeline had = nvn_hm_get(&g_pipes, k);
-    if (had) { if (p != (void *)1) vkDestroyPipeline(V.dev, p, NULL); p = had; }   // a prewarm thread made it meanwhile
-    else { nvn_hm_put(&g_pipes, k, p); if (p != (void *)1) pipe_record(k); }
-    pthread_mutex_unlock(&g_pipe_mu);
+    p = pipeline_publish(k, p);
     g_last_k = *k; g_last_p = p;
+    if (g_pipe_predict_on && g_pipe_predict_scanned < 8 && g_pipe_predict_budget > 0 && !g_async_pipe && p != (VkPipeline)1) {
+        g_pipe_predict_scanned++; g_pipe_predict_budget -= pipeline_predict_rest(k, g_pipe_predict_budget);
+    }
     return p == (void *)1 ? VK_NULL_HANDLE : p;
 }
 // ---- pipeline prewarm: every pipeline the game needed is recorded (DM_ROOT/vk_pipelines.bin) and made again at the next boot on background
@@ -1575,6 +1586,64 @@ static void rd_read(const uint64_t *a, int n) {
         vk_scratch(4, 4, &db, &dof); VkBufferCopy r = {o, dof, 4}; vk_img_barrier_all(cb); vkCmdCopyBuffer(cb, b, db, 1, &r); vk_img_barrier_all(cb); }
 }
 // everything a draw needs bound; 0 when the draw cannot be done (logged once per reason)
+// The same fixed-state key is used by a real draw and by prediction. Resource
+// views and fragment-depth history are filled only by the actual draw below.
+static void pipeline_key(pkey *out, const vk_replay_state *state, uint32_t prim, int indexed, int var) {
+    pkey k; memset(&k, 0, sizeof k);
+    for (int i = 0; i < 3; i++) k.key[i] = state->sh[i] ? state->sh[i]->key : 0;
+    k.topo = topo(prim); k.restart = state->prim_restart && (k.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
+    k.raster_discard = state->rast_discard; k.alt = (uint32_t)g_spv_alt; k.cull = g_no_cull ? 0 : state->poly.cull;
+    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
+    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
+    k.front = ((state->poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); k.mode = state->poly.mode; k.depth_clamp = state->depth_clamp;
+    k.bias_en = (state->poly.offset_en & (state->poly.mode == 0 ? 1 : state->poly.mode == 1 ? 2 : 4)) != 0;
+    if (var == 2) k.bias_en = 0;
+    if (var == 8) k.raster_discard = 1;   // no fragment shader in the pipeline
+    int has_depth = (state->daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (state->daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
+    k.dt = has_depth && state->ds.dt; k.dw = state->ds.dw; k.df = state->ds.df; k.st = has_stencil && state->ds.st;
+    if (g_x_nodepth) k.dt = k.dw = k.st = 0;
+    k.sf[0] = state->ds.sf_f; k.sf[1] = state->ds.sf_b; k.sfail[0] = state->ds.fail_f; k.szfail[0] = state->ds.zfail_f; k.szpass[0] = state->ds.zpass_f; k.sfail[1] = state->ds.fail_b; k.szfail[1] = state->ds.zfail_b; k.szpass[1] = state->ds.zpass_b;
+    // vertex input: every location the vertex shader reads
+    vkshader_t *vsh = state->sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
+    uint32_t used_streams = 0; int need_zero = 0;
+    for (int loc = 0; loc < 16; loc++) {
+        if (!(in_mask >> loc & 1)) continue;
+        va_st a; memcpy(&a, &state->vattr[loc], 4);
+        VkFormat f = a.fmt ? vertex_format(a.fmt) : VK_FORMAT_UNDEFINED;
+        if (f == VK_FORMAT_UNDEFINED || !state->vbuf[a.stream].address) { k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, 16,
+            sint_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_SINT : int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
+        k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, a.stream, f, a.offset};
+        uint32_t declared = sint_mask >> loc & 1 ? 3 : int_mask >> loc & 1 ? 2 : 1;
+        k.vin |= (uint64_t)vertex_input_code(a.fmt, f, declared) << (3 * loc);
+        used_streams |= 1u << a.stream;
+    }
+    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, state->vstream[s].stride, state->vstream[s].divisor ? 1u : 0u, state->vstream[s].divisor};
+    if (need_zero) k.bind[k.nbind++] = (typeof(k.bind[0])){16, 0, 0, 0};
+    // attachments and blending
+    k.ncol = (uint32_t)state->ncol; k.dfmt = state->dfmt; k.samples = state->samples ? state->samples : 1; k.a2c = state->ms.a2c;
+    k.logic_en = state->color.logic_op != 3 && state->color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
+    k.logic_op = state->color.logic_op;
+    for (int i = 0; i < state->ncol; i++) {
+        k.cfmt[i] = state->cfmt[i];
+        k.wmask[i] = state->cfmt[i] && state->sh[1] ? (state->chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: Vulkan colour outputs are undefined, so write none
+        const vkfmt_t *f = state->rt_has_col[i] ? vk_fmt(state->rt_has_cview[i] && state->rt_cview[i].set_format ? state->rt_cview[i].format : state->rt_col[i].d.format) : NULL;
+        if (((state->color.blend_en >> i) & 1) && f && !f->is_int) {
+            k.blend_en |= 1u << i;
+            k.bl[i].src = state->blend[i].src_rgb; k.bl[i].dst = state->blend[i].dst_rgb; k.bl[i].srca = state->blend[i].src_a; k.bl[i].dsta = state->blend[i].dst_a; k.bl[i].eq = state->blend[i].eq_rgb; k.bl[i].eqa = state->blend[i].eq_a;
+        }
+    }
+    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
+    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
+    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
+    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
+    k.fdz |= (uint32_t)((k.blend_en & 1) && state->sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta))) << 1;
+    #undef SRC1F
+    k.clip_neg1 = !g_depth_zero;
+    *out = k;
+}
+
+#include "vk_pipeline_scan.h"
+
 static int prepare_draw(int prim, int indexed) {
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
@@ -1635,19 +1704,8 @@ rebind_views:;
     uint64_t t0 = tick();
     VkCommandBuffer cb = vk_cmd();
     if (g_no_cull < 0) g_no_cull = getenv("DM_VK_NOCULL") != NULL;
-    pkey k; memset(&k, 0, sizeof k);
-    for (int i = 0; i < 3; i++) k.key[i] = S.sh[i] ? S.sh[i]->key : 0;
-    k.topo = topo(prim); k.restart = S.prim_restart && (k.topo == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || k.topo == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) && indexed;
-    k.raster_discard = S.rast_discard; k.alt = (uint32_t)g_spv_alt; k.cull = g_no_cull ? 0 : S.poly.cull;
-    // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
-    // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
-    k.front = ((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0); k.mode = S.poly.mode; k.depth_clamp = S.depth_clamp;
-    k.bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
-    if (var == 2) k.bias_en = 0;
-    if (var == 8) k.raster_discard = 1;   // no fragment shader in the pipeline
-    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0, has_stencil = (S.daspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
-    k.dt = has_depth && S.ds.dt; k.dw = S.ds.dw; k.df = S.ds.df; k.st = has_stencil && S.ds.st;
-    if (g_x_nodepth) k.dt = k.dw = k.st = 0;
+    pkey k; pipeline_key(&k, &S, prim, indexed, var);
+    int has_depth = (S.daspect & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
     if (g_x_logfs && S.sh[1] && S.sh[1]->key == g_x_logfs) VKLOG("logfs: present %llu pass %d (%ux%u, %llu draws before): depth attachment %d test %d (state %d) func %u write %u; depth range %.9g %.9g; viewport %.1f %.1f %.1f %.1f",
         (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, (unsigned long long)g_pass_draws, has_depth, k.dt, S.ds.dt, k.df, k.dw, S.dnear, S.dfar, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]);
     // A depth buffer that a fragment shader wrote through gl_FragDepth: Adreno's early culling (LRZ) then rejects whole triangles of later draws that test it, in some frames
@@ -1659,47 +1717,10 @@ rebind_views:;
     // Not with a depth bias (gl_FragCoord.z need not carry it). DM_VK_FDZ=0 (live): never
     { vkimg_t *dim = has_depth ? P_att[8].im : NULL; vkshader_t *fsh = k.raster_discard ? NULL : S.sh[1];
       if (dim && fsh && fsh->depth_repl && k.dt && k.dw) dim->fdz_frame = g_tex_frame + 1;
-      k.fdz = g_fdz && !P_depth_copied && dim && fsh && !fsh->depth_repl && k.dt && !k.bias_en && dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2; }
-    k.sf[0] = S.ds.sf_f; k.sf[1] = S.ds.sf_b; k.sfail[0] = S.ds.fail_f; k.szfail[0] = S.ds.zfail_f; k.szpass[0] = S.ds.zpass_f; k.sfail[1] = S.ds.fail_b; k.szfail[1] = S.ds.zfail_b; k.szpass[1] = S.ds.zpass_b;
-    // vertex input: every location the vertex shader reads
-    vkshader_t *vsh = S.sh[0]; uint32_t in_mask = vsh ? vsh->local[0] : 0, int_mask = vsh ? vsh->local[1] | vsh->local[2] : 0, sint_mask = vsh ? vsh->local[1] : 0;
-    uint32_t used_streams = 0; int need_zero = 0;
-    for (int loc = 0; loc < 16; loc++) {
-        if (!(in_mask >> loc & 1)) continue;
-        va_st a; memcpy(&a, &S.vattr[loc], 4);
-        VkFormat f = a.fmt ? vertex_format(a.fmt) : VK_FORMAT_UNDEFINED;
-        if (f == VK_FORMAT_UNDEFINED || !S.vbuf[a.stream].address) { k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, 16,
-            sint_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_SINT : int_mask >> loc & 1 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0}; need_zero = 1; continue; }
-        k.attr[k.nattr++] = (typeof(k.attr[0])){(uint32_t)loc, a.stream, f, a.offset};
-        uint32_t declared = sint_mask >> loc & 1 ? 3 : int_mask >> loc & 1 ? 2 : 1;
-        k.vin |= (uint64_t)vertex_input_code(a.fmt, f, declared) << (3 * loc);
-        used_streams |= 1u << a.stream;
-    }
-    for (int s = 0; s < 16; s++) if (used_streams >> s & 1) k.bind[k.nbind++] = (typeof(k.bind[0])){(uint32_t)s, S.vstream[s].stride, S.vstream[s].divisor ? 1u : 0u, S.vstream[s].divisor};
-    if (need_zero) k.bind[k.nbind++] = (typeof(k.bind[0])){16, 0, 0, 0};
-    // attachments and blending
+      k.fdz |= g_fdz && !P_depth_copied && dim && fsh && !fsh->depth_repl && k.dt && !k.bias_en && dim->fdz_frame && g_tex_frame + 1 - dim->fdz_frame <= 2; }
     if (P_dup_colors && S.sh[1]) for (int i = 0; i < S.rt_n; i++)
         if ((P_dup_colors & S.sh[1]->out_locs & (1u << i)) && ((S.chmask.mask >> (4 * i)) & 0xf))
             VKRED_ONCE(93, "colour slot %d aliases slot %d and this draw writes it: the later slot's writes are lost", i, P_color_slot[i]);
-    k.ncol = (uint32_t)S.ncol; k.dfmt = S.dfmt; k.samples = S.samples ? S.samples : 1; k.a2c = S.ms.a2c;
-    k.logic_en = S.color.logic_op != 3 && S.color.logic_op != 0 && 0;   // logic ops: not on mobile render targets in version 1
-    k.logic_op = S.color.logic_op;
-    for (int i = 0; i < S.ncol; i++) {
-        k.cfmt[i] = S.cfmt[i];
-        k.wmask[i] = S.cfmt[i] && S.sh[1] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // no fragment shader: Vulkan colour outputs are undefined, so write none
-        const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_has_cview[i] && S.rt_cview[i].set_format ? S.rt_cview[i].format : S.rt_col[i].d.format) : NULL;
-        if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
-            k.blend_en |= 1u << i;
-            k.bl[i].src = S.blend[i].src_rgb; k.bl[i].dst = S.blend[i].dst_rgb; k.bl[i].srca = S.blend[i].src_a; k.bl[i].dsta = S.blend[i].dst_a; k.bl[i].eq = S.blend[i].eq_rgb; k.bl[i].eqa = S.blend[i].eq_a;
-        }
-    }
-    // Dual-source blending: NVN blends colour target 0 with the shader's output 1 as its second source (factors SRC1_*, 0x10-0x13), the translator declares that output at
-    // location 1, and Vulkan takes the second source only from location 0, index 1 (with location 1 the blend reads undefined values: Pokémon Legends: Arceus's post effects,
-    // shader ha_post_effects variation 4, washed the whole picture out; the validation layer named it). Such a pipeline takes the fragment shader's dual-source variant
-    #define SRC1F(x) ((x) >= 0x10 && (x) <= 0x13)
-    k.fdz |= (uint32_t)((k.blend_en & 1) && S.sh[1] && !k.raster_discard && (SRC1F(k.bl[0].src) || SRC1F(k.bl[0].dst) || SRC1F(k.bl[0].srca) || SRC1F(k.bl[0].dsta))) << 1;
-    #undef SRC1F
-    k.clip_neg1 = !g_depth_zero;
     // layout and pipeline
     VkDescriptorSetLayout dsl[5] = {0}; int nsets = 0;
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { dsl[S.sh[st]->set] = S.sh[st]->dsl; if (S.sh[st]->set + 1 > nsets) nsets = S.sh[st]->set + 1; }
@@ -2203,20 +2224,20 @@ static void clear_tex(const p_clear_tex *c) {
 }
 
 // ---------------- the record walker ----------------
-static int rt_same(const p_set_rt *r) {   // the targets the open pass draws into already
-    int n = r->n > 8 ? 8 : r->n; if (n != S.rt_n) return 0;
+static int rt_same_state(const vk_replay_state *state, const p_set_rt *r) {   // the targets the open pass draws into already
+    int n = r->n > 8 ? 8 : r->n; if (n != state->rt_n) return 0;
     for (int i = 0; i < n; i++) {
         int has = r->color[i] != NULL && r->color[i]->magic == MAGIC('T', 'E', 'X', 0);
-        if (has != S.rt_has_col[i] || (has && memcmp(r->color[i], &S.rt_col[i], sizeof S.rt_col[i]))) return 0;
-        if (r->has_cview[i] != S.rt_has_cview[i] || (r->has_cview[i] && memcmp(&r->cview[i], &S.rt_cview[i], sizeof S.rt_cview[i]))) return 0;
+        if (has != state->rt_has_col[i] || (has && memcmp(r->color[i], &state->rt_col[i], sizeof state->rt_col[i]))) return 0;
+        if (r->has_cview[i] != state->rt_has_cview[i] || (r->has_cview[i] && memcmp(&r->cview[i], &state->rt_cview[i], sizeof state->rt_cview[i]))) return 0;
     }
     int hd = r->depth != NULL && r->depth->magic == MAGIC('T', 'E', 'X', 0);
-    if (hd != S.rt_has_dep || (hd && memcmp(r->depth, &S.rt_dep, sizeof S.rt_dep))) return 0;
-    if (r->has_dview != S.rt_has_dview || (r->has_dview && memcmp(&r->dview, &S.rt_dview, sizeof S.rt_dview))) return 0;
+    if (hd != state->rt_has_dep || (hd && memcmp(r->depth, &state->rt_dep, sizeof state->rt_dep))) return 0;
+    if (r->has_dview != state->rt_has_dview || (r->has_dview && memcmp(&r->dview, &state->rt_dview, sizeof state->rt_dview))) return 0;
     return 1;
 }
 static void set_rt(const p_set_rt *r) {
-    if (S.pass_open && !g_x_nokeep && rt_same(r)) { g_vkst.rt_kept++; return; }   // the same targets again (Unity sets them before many draws): the pass goes on
+    if (S.pass_open && !g_x_nokeep && rt_same_state(&S, r)) { g_vkst.rt_kept++; return; }   // the same targets again (Unity sets them before many draws): the pass goes on
     vk_end_pass();
     S.rt_n = r->n > 8 ? 8 : r->n;
     for (int i = 0; i < S.rt_n; i++) {
@@ -2297,12 +2318,14 @@ static void exec_ops(const uint8_t *p) {
         if (h.op < 64) g_sub_ops[h.op]++;
         static uint64_t skip = ~0ull; if (skip == ~0ull) { skip = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) skip |= 1ull << v; q = *n ? n + 1 : n; } }   // debugging: record ops not replayed
         if (h.op < 64 && h.op > 3 && (skip >> h.op & 1)) { p += h.size; continue; }
-        const uint8_t *a = p + 8;
+        const uint8_t *a = p + 8; g_predict_next = p + h.size;
         switch (h.op) {
         case OP_END: return;
         case OP_BEGIN: break;
         case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); exec_ops((const uint8_t *)(uintptr_t)t); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8);
+            if (g_predict_depth < 16) g_predict_returns[g_predict_depth] = p + h.size;
+            g_predict_depth++; exec_ops((const uint8_t *)(uintptr_t)t); g_predict_depth--; break; }
         case OP_SIGNAL_EVENT: { volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4); mtl_sub_event(val, m, v); break; }
         case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2); mtl_sub_counter(ad, (uint32_t)t); break; }
         case OP_RESET_COUNTER: break;

@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -43,6 +44,14 @@ static void ucopy_wait(uint64_t sequence) {
 static void ucopy_drain(void) { ucopy_wait(vk_copyq_head(&g_ucopy)); }
 void vk_uniform_copy_config(int enabled) { if (!enabled) ucopy_drain(); g_ucopy_on = enabled; }
 vkdev_t V;
+void vk_compile_thread(const char *name) {
+    pthread_setname_np(pthread_self(), name);
+    // A worker spawned by the prime-pinned replay would inherit its narrow
+    // affinity. Restore the app leader's allowed mask so idle cores can compile.
+    cpu_set_t allowed;
+    if (!sched_getaffinity(getpid(), sizeof allowed, &allowed)) sched_setaffinity(0, sizeof allowed, &allowed);
+    setpriority(PRIO_PROCESS, 0, 10);
+}
 pthread_mutex_t g_vk_queue_mu = PTHREAD_MUTEX_INITIALIZER;   // VkQueue access is externally synchronized: submissions and presents
 
 uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {

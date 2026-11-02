@@ -197,6 +197,12 @@ typedef struct {
     VkDeviceSize db_size, db_offsets[96]; // native descriptor byte layout, when descriptor_buffer is enabled
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
+int vk_shader_stage(uint64_t key);
+vkshader_t *vk_shader_cached(uint64_t key, int stage);   // nonblocking; no loading or GPU work
+void vk_shader_prefetch(uint64_t key, int stage);
+void vk_shader_prefetch_report(void);
+void vk_pipeline_predict_report(void);
+void vk_compile_thread(const char *name);
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)
 VkShaderModule vk_vertex_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint64_t inputs);
 void vk_shaders_open(const char *path);

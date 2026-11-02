@@ -210,7 +210,7 @@ static int gettid(void) { return 1; }
 static void compute_warm_start(void) {}
 #define VK_NULL_HANDLE NULL
 static struct { int pass_open; void *bound_pipe; uint64_t logical_state; } S;
-static int g_cb_draws, g_ord_parts, g_psplit_now, g_rc_npend, g_rc_skip;
+static int g_cb_draws, g_ord_parts, g_psplit_now, g_rc_npend, g_rc_skip, g_pipe_predict_scanned, g_pipe_predict_budget;
 static uint64_t g_set_epoch;
 static unsigned initialized, prewarmed, reads, continuation_reads, logical_reads;
 static void state_reset(void) { initialized++; }

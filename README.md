@@ -4,7 +4,7 @@ Port your own Nintendo Switch games to Android. The game's ARM64 code runs nativ
 
 **[中文说明](README.zh-CN.md)** · [Downloads](https://github.com/shenmintao/nxnative-android/releases) · [Game status](docs/PORT_STATUS.md) · [Install guide](packaging/INSTALL.md)
 
-The current candidate is **0.3.0rc1**. The Windows bundle starts with `nxnative-android.exe`; a source checkout starts with `nxnative-android.cmd` or `python -m nxnative_android`. It includes no games or keys.
+The current candidate is **0.3.0rc2**. The Windows bundle starts with `nxnative-android.exe`; a source checkout starts with `nxnative-android.cmd` or `python -m nxnative_android`. It includes no games or keys.
 
 ## What this fork adds
 
@@ -13,20 +13,21 @@ The current candidate is **0.3.0rc1**. The Windows bundle starts with `nxnative-
 - Touch controls, controller detection, Android text input, game rumble and real device gyro/accelerometer input. BotW's scope direction and stability were checked on the physical tablet.
 - Graphics **and compute** pipeline prewarming, upstream lock-poll spin waits, and the retained Vulkan performance stack. The extra sync-caller affinity experiment is disabled; asynchronous compilation that skips draws stays disabled by default.
 - Upstream rendering fixes and ADPF hints, including GPU workload reporting where the Android API supports it.
+- Prepare shaders when the game creates its programs, and compile a bounded set of upcoming pipelines on background workers. A draw waits for its correct pipeline when preparation is incomplete.
 
 ## BotW 1.9.0: verified scope
 
 Tested on **TB323FU, SM8850P / Adreno 840, Android 16, balanced mode**, using the owned Great Plateau save. Docked output is **1920×1080**; the game retains its **1280×720–1600×900** dynamic internal resolution (1600×900 in the measured scenes).
 
-| Final debug measurement | Average fps | Late intervals (>17.5 ms) | Intervals >50 ms |
+| Plan 2 baseline, before the first-use follow-up | Average fps | Late intervals (>17.5 ms) | Intervals >50 ms |
 |---|---:|---:|---:|
 | Fixed view, two 120 s windows | 59.895 | 0.647% | 0 |
 | Moving route, two 120 s windows | 59.830 | 0.829% | 0 |
 | First start, moving, one 120 s window | 59.875 | 0.751% | 0 |
 
-The final package passed 150 unit tests, Vulkan validation with zero errors (three unused-output warnings), and a release save/load smoke test. The user waived the final 30-minute soak; it was **not run**. Full-game compatibility is unverified and a lower-leg ground-occlusion issue remains, so BotW stays **work in progress**. These results do not establish native internal 1080p or the performance of another device. [Acceptance and experiment record](docs/perf-plan-2.md).
+That baseline passed 150 engine tests, Vulkan validation with zero errors (three unused-output warnings), and a release save/load smoke test. The user waived the final 30-minute soak; it was **not run**. Full-game compatibility is unverified and a lower-leg ground-occlusion issue remains, so BotW stays **work in progress**. These results do not establish native internal 1080p or the performance of another device. [Baseline acceptance and experiment record](docs/perf-plan-2.md).
 
-**Subsequent user-play regression (2026-11-02):** a different Great Plateau route still stutters. A 120 s diagnostic capture measured 58.004 fps, 33 intervals over 50 ms and 12 over 100 ms (maximum 241.680 ms). Surrounding runtime checkpoints show 388 additional graphics pipeline creations after startup prewarm; their per-frame cost has not yet been isolated. The short acceptance route does not cover this behavior. Release packaging/publication is held for investigation.
+**First-use follow-up (2026-11-02):** broader gameplay reproduced stutters outside that route. Timed attribution linked graphics creation to 6 of 11 intervals over 50 ms in an expanded-route diagnostic. This candidate adapts upstream program-creation prefetch and bounded command lookahead to Vulkan, using ordinary full pipelines. It passed 156 source tests and a cold first-use rendering check with zero Vulkan errors and three unused-output warnings. One ordinary 120 s observation records 59.135 fps and 16 intervals over 50 ms; hitches remain. The user waived OFF/ON/ON/OFF, so performance gain is **unquantified**. [Follow-up scope, evidence and limits](docs/perf-hitch-followup.md).
 
 ## Hardware compatibility
 
