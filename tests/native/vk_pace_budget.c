@@ -79,14 +79,14 @@ static void test_log(const char *format, ...) {
 
 #if CASE == 2
 static const char *request;
-static unsigned sleeps, consumed, drains, interrupted;
+static unsigned sleeps, consumed, drains, interrupted, env_reads;
 static uint64_t clock_ns = 1000000000ull;
 static uint64_t vk_debug_next_present(void) { return 123; }
 static int g_cur;
 typedef struct { int end_error, last_sent; uint64_t cpu_first; } part;
 typedef struct { int nmain_sent, deferred_pending, cb_err; part deferred_part; uint64_t cpu_first; } vksub_t;
 static vksub_t g_slot[1];
-static const char *stall_getenv(const char *name) { assert(!strcmp(name,"DM_VK_X_STALL_MS")); return request; }
+static const char *stall_getenv(const char *name) { assert(!strcmp(name,"DM_VK_X_STALL_MS")); env_reads++; return request; }
 static int stall_unsetenv(const char *name) { assert(!strcmp(name,"DM_VK_X_STALL_MS") && request); request = NULL; consumed++; return 0; }
 static uint64_t tnow(void) { return clock_ns; }
 static void vk_encode_drain(void) { assert(request && !sleeps); drains++; }
@@ -101,17 +101,20 @@ static int stall_sleep(const struct timespec *delay, struct timespec *left) {
 #define nanosleep stall_sleep
 /* STALL */
 int main(void) {
-    request = "150"; replay_stall(); assert(request && !sleeps && !consumed);  // no part sent
+    request = "150"; replay_stall_read(); replay_stall(); assert(request && !sleeps && !consumed);  // no part sent
+    for (int i = 0; i < 20; i++) replay_stall();
+    assert(env_reads == 1 && request && !sleeps);  // draws never scan the environment
     g_slot[0].deferred_pending = 1; g_slot[0].deferred_part = (part){0,1,42};
     replay_stall(); assert(!request && sleeps == 1 && consumed == 1 && drains == 1 && logs == 1);
     assert(strstr(log_line,"present 123 requested_ms=150 start_ns=1000000000 end_ns=1150000000"));
     for (int i = 0; i < 20; i++) replay_stall();
-    assert(sleeps == 1 && consumed == 1 && logs == 1);
-    request = "150"; replay_stall(); assert(!request && sleeps == 2 && consumed == 2 && logs == 2);
+    assert(sleeps == 1 && consumed == 1 && logs == 1 && env_reads == 1);
+    request = "150"; replay_stall(); assert(sleeps == 1);  // next submission reads the re-armed request
+    replay_stall_read(); replay_stall(); assert(!request && sleeps == 2 && consumed == 2 && logs == 2 && env_reads == 2);
     const char *bad[] = {"0","1001","-1","bad","150ms"};
-    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) { request = bad[i]; replay_stall(); assert(request && sleeps == 2); }
-    request = "1"; replay_stall(); request = "1000"; replay_stall(); assert(sleeps == 4 && consumed == 4);
-    g_cur = -1; request = "150"; replay_stall(); assert(request && sleeps == 4);
+    for (unsigned i = 0; i < sizeof bad / sizeof *bad; i++) { request = bad[i]; replay_stall_read(); replay_stall(); assert(request && sleeps == 2); }
+    request = "1"; replay_stall_read(); replay_stall(); request = "1000"; replay_stall_read(); replay_stall(); assert(sleeps == 4 && consumed == 4);
+    g_cur = -1; request = "150"; replay_stall_read(); replay_stall(); assert(request && sleeps == 4);
     g_cur = 0; g_slot[0].cb_err = 1; replay_stall(); assert(request && sleeps == 4);
     return 0;
 }

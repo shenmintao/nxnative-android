@@ -153,7 +153,17 @@ void vk_watch(const vkimg_t *im, const char *what) {
     g_watch_n--; VKLOG("watch: present %llu pass %d (%ux%u): %s %ux%u fmt %d pool %#llx+%#llx (image %p, nvn flags %#x, %d overlapping)", (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, what, im->w, im->h, im->fmt,
                        (unsigned long long)im->pool, (unsigned long long)im->off, (const void *)im, im->flags, im->novl);
 }
+#ifndef DM_RELEASE
+static long g_x_stall_ms;
+static void replay_stall_read(void) {
+    const char *e = getenv("DM_VK_X_STALL_MS"); g_x_stall_ms = 0; if (!e) return;
+    char *end; long ms = strtol(e, &end, 10); if (!*end && ms >= 1 && ms <= 1000) g_x_stall_ms = ms;
+}
+#endif
 static void x_read(int continuation) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = c ? atoi(c) : 128; if (!continuation) g_sub_pass = 0;
+#ifndef DM_RELEASE
+    replay_stall_read();
+#endif
     const char *bc = getenv("DM_VK_BIND_CACHE"); g_vk_bind_cache = !(bc && !atoi(bc));
     const char *bv = getenv("DM_VK_CACHE_VERIFY"); g_vk_bind_verify = bv && atoi(bv);
     { const char *bc = getenv("DM_VK_BUFFER_CACHE"); vk_buffer_cache_config(bc ? atoi(bc) : 1); }   // 0: uncached comparison, 2: sampled canonical verification
@@ -1648,11 +1658,10 @@ static void pipeline_key(pkey *out, const vk_replay_state *state, uint32_t prim,
 #ifndef DM_RELEASE
 static void replay_stall(void) {
     uint64_t vk_debug_next_present(void);
-    const char *e = getenv("DM_VK_X_STALL_MS"); if (!e) return;
-    char *end; long ms = strtol(e, &end, 10); if (*end || ms < 1 || ms > 1000) return;
+    long ms = g_x_stall_ms; if (!ms) return;
     int vk_debug_stall_ready(void); if (!vk_debug_stall_ready()) return;
     // Consume before sleeping: another identical DM_CTL env line can re-arm it.
-    unsetenv("DM_VK_X_STALL_MS");
+    g_x_stall_ms = 0; unsetenv("DM_VK_X_STALL_MS");
     uint64_t start = tnow(); struct timespec delay = {ms / 1000, ms % 1000 * 1000000};
     while (nanosleep(&delay, &delay) && errno == EINTR) {}
     VKLOG("[perf] replay stall: present %llu requested_ms=%ld start_ns=%llu end_ns=%llu",

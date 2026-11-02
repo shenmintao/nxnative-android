@@ -28,6 +28,7 @@ class VulkanPaceBudget(unittest.TestCase):
         present = (ANDROID / 'gfx_vk_present.c').read_text(encoding='utf8')
         spans = core[core.index('static uint64_t g_cur_frame,'):core.index('// Internal completion protects')]
         stall = '\n'.join(function(core, name) for name in ('static void split_collect(', 'int vk_debug_stall_ready('))
+        stall += '\nstatic long g_x_stall_ms;\n' + function(replay, 'static void replay_stall_read(')
         stall += '\n' + function(replay, 'static void replay_stall(')
         pace = present[present.index('static _Atomic uint64_t g_refresh_ns;'):present.index('static void present_window(')]
         code = (ROOT / 'tests/native/vk_pace_budget.c').read_text(encoding='utf8')
@@ -60,6 +61,9 @@ class VulkanPaceBudget(unittest.TestCase):
         core = (ANDROID / 'gfx_vk_core.c').read_text(encoding='utf8')
         self.assertIn('#ifndef DM_RELEASE\n' + function(replay, 'static void replay_stall(') + '#endif', replay)
         self.assertIn('#ifndef DM_RELEASE\n    replay_stall();\n#endif', replay)
+        self.assertIn('#ifndef DM_RELEASE\nstatic long g_x_stall_ms;\n' + function(replay, 'static void replay_stall_read(') + '#endif', replay)
+        self.assertIn('#ifndef DM_RELEASE\n    replay_stall_read();\n#endif', function(replay, 'static void x_read('))
+        self.assertNotIn('getenv', function(replay, 'static void replay_stall('))
         self.assertIn('#ifndef DM_RELEASE\n' + function(core, 'int vk_debug_stall_ready(') + '#endif', core)
         present = (ANDROID / 'gfx_vk_present.c').read_text(encoding='utf8')
         self.assertIn('#ifndef DM_RELEASE\nuint64_t vk_debug_next_present(void) { return g_presents + 1; }\n#endif', present)
