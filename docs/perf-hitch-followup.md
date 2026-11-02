@@ -2,6 +2,8 @@
 
 Authorized by the user on 2026-11-02 after the manual-play report and upstream review.
 
+For a standalone review brief with version identities, raw-artifact locations and specific code questions, see the [AI handoff](ai-handoff-botw-hitches.md).
+
 ## Scope and acceptance
 
 - BotW 1.9.0 (v1114112), TB323FU / SM8850P / Adreno 840 / Android 16, balanced mode.
