@@ -198,6 +198,9 @@ typedef struct {
 } vkshader_t;
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 int vk_shader_stage(uint64_t key);
+int vk_shader_is_xfb(uint64_t key);
+void vk_pair_warm_program(const uint8_t keys[][8], unsigned known, int n);
+void vk_pair_warm_report(void);
 vkshader_t *vk_shader_cached(uint64_t key, int stage);   // nonblocking; no loading or GPU work
 void vk_shader_prefetch(uint64_t key, int stage);
 void vk_shader_prefetch_report(void);

@@ -968,6 +968,7 @@ static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_
 static nvn_hmap g_cpipes = {.klen = 24};   // {compute shader, unsigned / signed integer-texel bindings}; also under g_pipe_mu
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]);
 static void pipe_record(const pkey *k);
+#include "vk_pair_warm.h"
 // Debug: graphics demand-miss time (including prediction waits), plus compute
 // creation calls; not driver compile counts. Prewarm excluded, MONOTONIC.
 static uint64_t pipeline_observe_start(void) {
@@ -1106,7 +1107,7 @@ static void pipe_record(const pkey *k) {   // (under g_pipe_mu: only queued here
     if (g_precq_n < PREC_Q) g_precq[g_precq_n++] = *k;   // (a full queue drops the record: that pipeline is only not prewarmed next time)
     pthread_cond_signal(&g_precq_cv); pthread_mutex_unlock(&g_precq_mu);
 }
-static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;
+static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done; static int g_pw_workers;
 static void prewarm_progress(void) {
     size_t d = __atomic_add_fetch(&g_pw_done, 1, __ATOMIC_RELAXED);
     if (d == g_pw_n || d % 500 == 0) VKLOG("prewarm: %zu of %zu pipelines", d, g_pw_n);
@@ -1139,11 +1140,12 @@ static void *prewarm_thread(void *arg) {
         pthread_mutex_unlock(&g_pipe_mu);
         prewarm_progress();
     }
+    if (!__atomic_sub_fetch(&g_pw_workers, 1, __ATOMIC_ACQ_REL)) pair_warm_ready();
     return NULL;
 }
 static void prewarm_start(void) {
     pipe_record_flush();   // a reopened cache must not race an outstanding record
-    const char *root = getenv("DM_ROOT"); if (!root) return;
+    const char *root = getenv("DM_ROOT"); if (!root) { pair_warm_ready(); return; }
     char path[1024]; snprintf(path, sizeof path, "%s/vk_pipelines.bin", root);
     uint32_t hdr[2] = {PIPE_MAGIC, (uint32_t)sizeof(pkey)}, fh[2] = {0};
     FILE *f = fopen(path, "rb");
@@ -1161,10 +1163,13 @@ static void prewarm_start(void) {
     if (f) fclose(f);
     // rewrite the file with the records read (dropping a torn last record), then append to it
     g_prec = fopen(path, "wb"); if (g_prec) { fwrite(hdr, sizeof hdr, 1, g_prec); if (g_pw_n) fwrite(g_pw, sizeof(pkey), g_pw_n, g_prec); fflush(g_prec); }
-    if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); return; }
+    if (!g_pw_n || getenv("DM_VK_NOPREWARM")) { VKLOG("prewarm: %zu pipelines recorded%s", g_pw_n, g_pw_n ? ", off (DM_VK_NOPREWARM)" : ""); pair_warm_ready(); return; }
     long nc = sysconf(_SC_NPROCESSORS_ONLN); int nt = nc >= 8 ? 3 : nc >= 4 ? 2 : 1;
     VKLOG("prewarm: %zu recorded pipelines on %d threads", g_pw_n, nt);
-    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED); pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a); }
+    __atomic_store_n(&g_pw_workers, nt, __ATOMIC_RELEASE);
+    for (int i = 0; i < nt; i++) { pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        int r = pthread_create(&t, &a, prewarm_thread, NULL); pthread_attr_destroy(&a);
+        if (r && !__atomic_sub_fetch(&g_pw_workers, 1, __ATOMIC_ACQ_REL)) pair_warm_ready(); }
 }
 static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshader_t *const stg[3]) {
     DM_SYNC_SCOPE("work: build graphics pipeline");

@@ -48,6 +48,13 @@ static const bent *find(uint64_t key) {
     return NULL;
 }
 int vk_shader_stage(uint64_t key) { bundle_auto(); const bent *e = g_bundle ? find(key) : NULL; return e ? (int)e->stage : -1; }   // the NVN stage the bundle has this shader as
+int vk_shader_is_xfb(uint64_t key) {
+    bundle_auto(); const bent *e = g_bundle ? find(key) : NULL; if (!e) return 1;
+    const uint32_t *w = (const uint32_t *)(g_bundle + e->spv_off); uint32_t nw = e->spv_len / 4;
+    for (uint32_t at = 5; at < nw;) { uint32_t n = w[at] >> 16; if (!n || n > nw - at) return 1;
+        if ((w[at] & 65535) == 16 && n >= 3 && w[at + 2] == 11) return 1; at += n; }
+    return 0;
+}
 
 // Run-time capture: a shader a draw needs that the bundle does not have is saved as DM_ROOT/captured_shaders/<key>.bin ("DMSC", u32 control length, u32 code length, the control
 // section as its key hashed it, the code area), and the porter translates the folder into the bundle at the next port (porter/pipeline.py, shader_vk.py --capture).

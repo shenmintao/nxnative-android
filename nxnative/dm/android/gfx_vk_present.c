@@ -1017,7 +1017,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
               (unsigned long long)g_color_promotions, (unsigned long long)g_color_promotion_failures); }
         void vk_segment_report(void); vk_segment_report();
         vk_encode_report();
-        vk_shader_prefetch_report(); vk_pipeline_predict_report();
+        vk_shader_prefetch_report(); vk_pipeline_predict_report(); vk_pair_warm_report();
         { extern uint64_t g_pipe_hot_hits; VKLOG("binding fast paths: pipelines %llu reused", (unsigned long long)g_pipe_hot_hits); }
         { extern uint64_t g_snapshot_copies, g_snapshot_fallbacks, g_snapshot_wait_ns;
           VKLOG("present snapshots: %llu copied, %llu ordinary fallbacks, %.2f s capacity wait (cumulative)",

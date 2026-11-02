@@ -614,6 +614,9 @@ static void pk_drop(const void *p) {
 // Set by a backend whose shaders are translated before the game runs (Android's Vulkan bundle, gfx_vk_shader.c): called at SetShaders for each stage whose key is known then, while the
 // control section is still the game's to read, so a shader whose code no game file holds can be saved and translated by the next port (Xenoblade Chronicles 3 sets hundreds)
 void (*g_nvn_on_shader)(const uint8_t key[8], const void *control, uint64_t data, uint32_t ncode);
+// Optional program-level preparation; keys are copied by the backend, never
+// guest program/control pointers. NULL leaves other backends unchanged.
+void (*g_nvn_on_program)(const uint8_t keys[][8], unsigned known, int n);
 // mapped = 1: computed only when the code area is in a registered memory pool (at SetShaders: Mario sets some programs with an unmapped address first and fills it in before the first draw)
 static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     uint32_t ncode = 0; void *mb; uint64_t mo;
@@ -651,6 +654,7 @@ NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData 
         // DM_NVN_SHDUMP (debugging): keep a copy of the control section so the replay layer can save shaders missing from the map (never freed)
         if (dump && sd[i].control) { void *c = malloc(0x880); memcpy(c, sd[i].control, 0x880); o->sd[i].control = c; }
     }
+    if (g_nvn_on_program) g_nvn_on_program(k->key, k->ok, n);
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
 }

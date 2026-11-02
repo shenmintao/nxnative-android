@@ -28,7 +28,8 @@ class ComputePrewarm(unittest.TestCase):
         code += '\n'.join(re.findall(r'^#define PIPE_MAGIC[^\n]*', source, re.M)) + '\n'
         code += source[source.index('enum { PREC_Q ='):source.index('static pkey *g_pw;')]
         code += function(source, 'static VkPipeline compute_pipeline(') + '\n'
-        code += 'static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done;\n'
+        code += 'static pkey *g_pw; static size_t g_pw_n; static volatile size_t g_pw_next, g_pw_done; static int g_pw_workers;\n'
+        code += 'static void pair_warm_ready(void) {}\n'
         code += 'static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout l, vkshader_t *const s[3]) { (void)k;(void)l;(void)s;graphics_calls++;return (VkPipeline)77; }\n'
         code += '\n'.join(function(source, signature) for signature in (
             'static void prewarm_progress(', 'static void *prewarm_thread(', 'static void prewarm_start(void) {'))
