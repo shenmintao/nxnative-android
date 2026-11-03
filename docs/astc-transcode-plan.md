@@ -5,6 +5,10 @@ game launches, APKs, runtime/default/profile changes, installation-gate changes,
 production changes, merge or push. The supplied upstream investigation found no
 transcoder to port; the optional repeat search was not needed for these prototypes.
 
+The step-1b comparison appended below supersedes the initial storage recommendation.
+It measures ETC2/EAC and a compact ASTC patch, including complete BC1 image quality.
+Step 2 has not been implemented; runtime and porter defaults remain unchanged.
+
 **Result:** the guarded BC1/BC4 direct paths meet the one-byte error bound in the
 reference-decoder sample. An unconditional eight-weight BC4 path cannot do so for
 some real blocks. ASTC-only re-encoding fails the 38 dB requirement, even at
@@ -452,3 +456,310 @@ and its storage/port-time costs, or require a different representation/research
 direction. The unconditional eight-weight BC4 mapping and universal ASTC-only
 38 dB target are not met. Do not remove the install gate or proceed to device
 implementation based on this report alone.
+
+## Step 1b: smaller alternatives, 2026-11-03
+
+The user requested this offline comparison before choosing an implementation.
+All tools, raw metrics, named exception lists and generated banks are private in
+`BENCH/astc-transcode/alternatives/`. No device commands, Android builds,
+porter/GUI/runtime changes or production changes. This section uses the same
+owned game/DLC census and decoder/conversion sources as step 1.
+
+### Option 1: ETC2/EAC capabilities and tools
+
+The saved Dimensity JSON has `optimalTilingFeatures=119809` for **each** of
+ETC2 RGB8, RGB8A1, RGBA8 (UNORM and sRGB), EAC R11 and RG11 (UNORM and SNORM):
+all ten have sampled-image, linear-filter and transfer-source/destination support.
+This is offline capability evidence, not a rendering or performance test.
+
+Mapping: BC1 to RGB8 unless transparent selectors require RGB8A1; BC3 to RGBA8;
+BC4 to R11 and BC5 to RG11 with signedness preserved. sRGB remains sRGB.
+BNTX cannot identify the later BC1 RGB/RGBA binding, so punch-through content is
+handled conservatively. EAC signed sampling naturally returns signed values;
+it does not need the ASTC signed-value shader remap discussed above.
+
+| Tool | Pinned revision | License | Configuration |
+|---|---|---|---|
+| etcpak 2.1 | `3d716e1550023dc5ff8b602636af8b76584e0b66` | BSD-3-Clause | Default ETC2 heuristics, one thread; RGB8/RGBA8/unsigned R11/RG11 |
+| etc2comp | `39422c1aa2f4889d636db5790af1d0be6ff3a226` | Apache-2.0 | Effort 0 and high-quality effort 100, jobs=maxJobs=1 |
+| detex reference decoder | `cab11584d9be140602a66fd9a88ef0b99f08a97a` | ISC | Independent ETC2/EAC decode |
+| zstd | 1.5.7 | BSD license option | Level 3, independent image frames |
+
+The cores are unchanged and their fetched blobs are hash-checked. etcpak's
+[public encoder interface](https://github.com/wolfpld/etcpak/blob/3d716e1550023dc5ff8b602636af8b76584e0b66/ProcessRGB.hpp)
+has no RGB8A1 or signed-EAC entry points: these are **unsupported**, not passes.
+Future distribution must retain the respective licenses/notices; astcenc retains
+its Apache-2.0 obligations. The tool/library sources and binaries are private here.
+[etcpak license](https://github.com/wolfpld/etcpak/blob/3d716e1550023dc5ff8b602636af8b76584e0b66/LICENSE.txt),
+[etc2comp license](https://github.com/google/etc2comp/blob/39422c1aa2f4889d636db5790af1d0be6ff3a226/LICENSE),
+[detex license](https://github.com/hglm/detex/blob/cab11584d9be140602a66fd9a88ef0b99f08a97a/LICENSE).
+The zstd BSD redistribution terms are in its
+[versioned license](https://github.com/meta/zstd/blob/v1.5.7/LICENSE).
+
+Metrics use the same bcdec reference and 38 dB RGB/alpha gate, with meaningful
+R/RG checks so constant channels cannot hide error. EAC is decoded to replicated
+16-bit normalized values; signed range has peak two. The adapter applies the
+required signed-EAC base -128 to -127 rule, which detex itself omits. There are
+694 such component-endpoint occurrences in each etc2comp signed run, including
+atlas padding; no decoder errors. The
+[Khronos signed-EAC rule](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html)
+defines that corner case.
+
+**Encoder-setting correction:** final BC3 uses etc2comp `RGBX`. Its `NUMERIC`
+mode still uses alpha-dependent source averages and candidate heuristics, which
+can discard RGB at zero alpha. That initial diagnostic is retained privately
+and excluded from final BC3 scores. RGB8/A1/EAC retain their tested settings.
+Opaque and varying-alpha known-bitstream tests verify channels/raster order;
+64 real blocks' internal encoder reconstruction agrees with independent decode
+within 6e-8 RGB and exactly in alpha. The remaining failures below are measured
+tool/settings failures, not a proof that every possible ETC2 encoder must fail.
+[Source-average metric handling](https://github.com/google/etc2comp/blob/39422c1aa2f4889d636db5790af1d0be6ff3a226/EtcLib/EtcCodec/EtcBlock4x4Encoding_ETC1.cpp).
+
+Coverage: fast/effort-0 test **347 complete images / 271,475,772 valid texels**.
+BC3 UNORM and signed BC4/BC5 include all unique payloads; other formats select
+eight complete images from each size quartile, with the largest included.
+Effort-100 calibration is slow, so its documented sample is **267 complete
+images / 7,520,726 texels**: the same complete small-format sets, plus up to 16
+images per other format, at most 262,144 texels each, retaining A1 coverage.
+No resizing or partial-image PSNR. These sample failures are concrete
+counterexamples, not full-census failure-rate estimates. Different preset
+sample sizes must not be compared as if they were the same population.
+
+Failures / tested images, checking RGB, alpha and meaningful R/RG:
+
+| Source | etcpak | etc2comp effort 0 | etc2comp effort 100 |
+|---|---:|---:|---:|
+| BC1 UNORM | 29/29; 3 unsupported | 30/32 | 15/16 |
+| BC1 sRGB | 13/28; 4 unsupported | 12/32 | 7/16 |
+| BC3 UNORM | 153/154 | 152/154 | 149/154 |
+| BC3 sRGB | 14/32 | 8/32 | 2/16 |
+| BC4 UNORM | 2/32 in R; 0 in RGB | 0/32 | 0/16 |
+| BC4 SNORM | 1 unsupported | 0/1 | 0/1 |
+| BC5 UNORM | 0/32 | 0/32 | 0/16 |
+| BC5 SNORM | 32 unsupported | 0/32 | 0/32 |
+
+Representative per-image PSNR median / fifth percentile, in dB:
+
+| Source | etcpak RGB; alpha | Effort-100 RGB; alpha |
+|---|---|---|
+| BC1 UNORM | 29.76/24.65; inf/inf | 32.50/25.35; inf/inf |
+| BC1 sRGB | 38.08/31.47; inf/inf | 40.68/32.21; inf/inf |
+| BC3 UNORM | 20.57/19.02; 63.31/45.92 | 27.86/26.29; inf/48.80 |
+| BC3 sRGB | 38.66/31.49; 46.85/38.02 | 42.07/35.16; 50.70/43.73 |
+| BC4 UNORM | 49.20/41.27; inf/inf | 57.96/50.92; inf/inf |
+| BC4 SNORM | Unsupported | 54.34/54.34; inf/inf |
+| BC5 UNORM | 47.75/43.02; inf/inf | 53.53/48.80; inf/inf |
+| BC5 SNORM | Unsupported | 49.60/46.07; inf/inf |
+
+Meaningful-R BC4 UNORM med/p5 is 44.43/36.49 dB fast and 53.19/46.15 HQ;
+signed R is 49.57 dB HQ. BC5 UNORM RG med/p5 is 45.99/41.26 fast and
+51.77/47.04 HQ; signed RG is 47.84/44.31 HQ. EAC therefore looks substantially
+more promising than these ETC2 colour results, but no full-census EAC quality
+acceptance or mixed ETC memory footprint has been established.
+
+BC5 texel-weighted angular median/p95, using the same positive-Z reconstruction:
+
+| Source | etcpak | Effort 0 | Effort 100 |
+|---|---:|---:|---:|
+| UNORM | 0.08/1.82 degrees | 0.04/1.23 | 0.05/1.00 |
+| SNORM | Unsupported | 0.43/2.02 | 0.41/1.57 |
+
+All-BC5 statistics are hypothetical normal interpretations. The normal-name
+subset's median of per-image p95 angles is 1.76 degrees fast / 1.08 HQ for
+unsigned data (8 / 3 sampled images), and 1.30 HQ for all 32 signed payloads.
+Those per-image summaries are distinct from texel-weighted global p95. No new
+angular threshold is invented. The approved mixed design retains signed RG8
+losslessly, so these lossy signed-EAC angles do not improve on that baseline.
+
+Serial PC encoder throughput, MPix/s, same i7-13700H as step 1, AVX2/FMA/BMI
+optimized build, one native job. Three timed repeats after warm-up; fast calls
+average 32 repetitions. These exclude BC decode, format preparation and IO.
+
+| Source/target | etcpak | Effort 0 | Effort 100 |
+|---|---:|---:|---:|
+| BC1 UNORM / RGB8 | 326.868 | 0.672 | 0.013 |
+| BC1 sRGB / RGB8 | 460.427 | 0.840 | 0.013 |
+| BC1 UNORM / A1 | Unsupported | 1.616 | 0.020 |
+| BC1 sRGB / A1 | Unsupported | 1.728 | 0.023 |
+| BC3 UNORM / RGBA8 | 219.735 | 0.691 | 0.014 |
+| BC3 sRGB / RGBA8 | 268.783 | 0.875 | 0.016 |
+| BC4 UNORM / R11 | 285.727 | 1.321 | 0.020 |
+| BC4 SNORM / signed R11 | Unsupported | 1.262 | 0.010 |
+| BC5 UNORM / RG11 | 114.605 | 0.502 | 0.007 |
+| BC5 SNORM / signed RG11 | Unsupported | 0.706 | 0.005 |
+
+Planning assumption only: phone throughput at **10-25% of serial PC**, not a
+measurement or guaranteed bound. Fast supported targets would encode a
+1024-square image in roughly 9-92 ms, before decode/upload costs; this already
+poses burst-upload hitch risk. Missing A1/signed targets need another encoder.
+Effort 0 is roughly 2.4-21 seconds per 1024-square image, and effort 100 roughly
+3-35 minutes. A complete synchronous on-upload encoder meeting this quality
+criterion is **not established**. Fast supported encoding is computationally
+plausible as background work, but its quality failures prevent recommending
+it as the blanket replacement.
+
+Content-dependent full-unique-set serial PC estimates: effort 0 about 3.20 h,
+effort 100 about 8.57 days, excluding extraction, decode, gate checks and IO.
+etcpak alone projects about 25 s for its supported population, but omits
+372,247,536 texels in A1/signed targets; that is not a complete pack time.
+A complete fast combination can use the already tested effort-0 results for
+those targets: it fails **213/347** sampled images in RGB/alpha, or **215/347**
+including meaningful R/RG. Its full-unique-set serial encode estimate is
+243.7 s, before decode, gate checks and IO. This composed configuration is not
+a new encode experiment and does not rescue the quality gate.
+No full ETC pack was generated because the measured encoders fail the quality
+gate. Its ideal logical payload would be 8,917,552,712 catalog bytes, or
+5,235,060,320 unique bytes plus metadata. The same values describe ideal ETC
+texture memory; lossless fallback for failures would increase that memory,
+and its full-census extent remains unmeasured.
+
+### Option 2: complete BC1 direct-plus-patch assembly
+
+This test processes **every unique BC1 payload**, all layers/mips and valid
+texels, then applies the image-level 38 dB RGB/alpha gate. It uses the unchanged
+C converter and thorough ASTC fallback from step 1. Duplicate inventory entries
+are accounted for exactly; this is no longer the 512-block sample.
+
+| Source | Unique blocks / fallback | Full-census blocks / fallback |
+|---|---:|---:|
+| BC1 UNORM | 45,720,473 / 4,870,145 | 142,191,280 / 14,463,828 |
+| BC1 sRGB | 476,396,315 / 122,799,739 | 741,334,243 / 154,831,069 |
+| Total | 522,116,788 / 127,669,884 | 883,525,523 / 169,294,897 |
+
+All fallback blocks are three-colour mode; no four-colour quantization rejects.
+The **394,446,904 unique direct blocks** have maximum error **1/255**, with
+zero violating channels. Full-image checks plus a separate test of all 117,765
+edge blocks (78,510 accepted direct) include every padding texel as well.
+No malformed ASTC blocks. The bound still requires the UNORM8 decode policy
+described in step 1; fallback blocks themselves are not one-byte bounded.
+
+| Assembled BC1 images | Tested / failed 38 dB | RGB med / p5 / minimum | Alpha minimum |
+|---|---:|---:|---:|
+| UNORM | 3,371 / **0** | 57.90 / 55.11 / **40.66** dB | 58.86 dB |
+| sRGB | 7,964 / **0** | 58.74 / 55.02 / **41.13** dB | 46.01 dB |
+
+The patch reuses complete, quality-checked thorough BC3/unsigned BC5 results.
+It stores 347,424,128 bytes of passed images and **47 unique whole-image
+exceptions**: 3 BC3 UNORM, 38 BC3 sRGB, 6 unsigned BC5 (73 catalog aliases).
+BC4 and all SNORM remain on current lossless R8/RG8 paths. No new angular gate
+was introduced. Included converted images meet their RGB/alpha/meaningful-RG
+38 dB gate; exceptions are explicitly decoded losslessly, not relabelled passes
+of the lossy ASTC encoder. Private `patch-exceptions.csv` contains every identity.
+Unsigned BC5 retains the step-1 thorough result (pre-exception angular median/p95
+0.00/1.04 degrees, normal-name subset0.00/1.62); replacing rejected images with
+lossless decode does not increase their pixel error. Signed BC5 is lossless.
+
+Patch bank, constructed and verified:
+
+| Component | Bytes |
+|---|---:|
+| BC1 fallback ASTC blocks | 2,042,718,144 |
+| Passed BC3/unsigned BC5 ASTC blocks | 347,424,128 |
+| 13,713-entry index, 128 bytes/entry | 1,755,264 |
+| Header | 128 |
+| **Raw bank** | **2,391,897,664** |
+| Independent zstd-3 image frames | 425,601,396 |
+| Compressed alignment padding | 100,972 |
+| **Compressed bank, including index/header/padding** | **427,457,760** |
+
+There is **no per-block position table**. The pinned direct predicate determines
+fallback positions in source-block order; full-source+geometry hashes and expected
+fallback counts reject a mismatch. The diagnostic 65,267,760 bitmap bytes are
+not stored. Source/target profile, mip/layer geometry and codec policy must be
+part of a production format's version contract. This bank is a private prototype,
+not an implemented runtime ABI.
+
+Raw SHA256: `e9b409d77c89e3eb7e3ddc1d9e8b79d60960a379f834078af58709c9239ae5a4`.
+Compressed SHA256: `7f1ce132d024360066b0441ba74163058e1ed0b69873a17f77e14b371ee44442`.
+Every compressed image frame is independently addressable and round-tripped;
+plaintext/index SHA256s and bank SHA256s are retained. The 427 MB size assumes
+the phone reads/decompresses those frames. PC-side expansion before installation
+would instead leave the 2.392 GB raw bank on the phone.
+
+Fresh serial C timing, five repeats on one thread: direct UNORM/sRGB
+**229.3 / 199.4 MPix/s**; direct plus ordered patch memcpy/count check
+**229.8 / 221.5 MPix/s**. No affinity/frequency control; small differences between
+these medians are timing variance, not an assembly speedup. Hashing, zstd,
+deswizzling, IO and upload are excluded. At the same unverified phone scaling,
+conversion alone is about **18-53 ms per 1024-square image**, before those costs.
+The largest catalog BC1 image has 116,042,383 texels across its layers/mips:
+roughly **2-6 seconds** of assumed serial conversion. Synchronous replay-time
+conversion is therefore a risk; background/load preparation or a bounded cache
+needs explicit design and device validation. Fully expanding a persistent cache
+would recover much of the complete-sidecar storage cost.
+
+Four-worker complete BC1 quality-run wall time was 572.877 s, overlapping the
+ETC experiment. Raw+compressed bank build and verification took 287.077 s;
+zstd compression plus immediate round-trip accounted for 11.911 s of that.
+BC3/BC5 reuse step-1 outputs, so these are not timings for regenerating all inputs
+from scratch. Serial throughput and phone assumptions are separate from these
+shared-host wall times.
+
+Logical texture memory, including the retained R8/RG8 paths and quality exceptions:
+**16,874,636,483 catalog bytes / 10,123,802,415 unique bytes**. Converted BC1 is
+14,136,408,368 catalog bytes, exactly twice its 7,068,204,184 BC source bytes.
+This is identical for the complete mixed sidecar and patch representation.
+It is a catalog footprint, not resident GPU memory, RSS or a device measurement.
+
+### Comparison and decision
+
+For a fair storage comparison, the **same approved complete mixed sidecar** was
+also framed with the identical per-image zstd-3 policy. This does not change its
+texture representation, quality gate or encoder candidate. BC1 is reconstructed
+on the PC from the already verified direct+patch data; no new encoding search.
+All image frames round-trip; a full uncompressed 8.7 GB file was not written.
+
+- Complete mixed raw payload: 8,701,292,736 bytes; with the same index/header,
+  **8,703,048,128 bytes raw** (derived exact size).
+- Actual complete mixed compressed bank: **2,090,229,056 bytes**, including
+  index/header and 101,772 alignment bytes. SHA256:
+  `8652d965b5874a95c41894c8e14011189963898b662aec28a93eb6a7fd4d5790`.
+- Build/hash/round-trip wall time: 206.841 s. Native BC1 assembly accounted for
+  26.056 s; zstd compression plus immediate full round-trip for 38.927 s.
+  These reuse the already encoded fallback/BC3/BC5 data.
+- Patch saves **6,311,150,464 bytes (72.5%) raw**, or **1,662,771,296 bytes
+  (79.5%) with the same compression**. Do not compare compressed patch against
+  uncompressed complete sidecar and call that the compression-adjusted saving.
+
+GB below is decimal. Added data is in addition to the original owned files.
+Texture memory is the complete logical inventory, not simultaneous residency;
+ETC memory assumes every image remains compressed and is therefore an ideal
+lower-cost case that does not meet the measured quality gate.
+
+| Representation | Added data/storage | Logical catalog texture memory | Phone work and hitch risk | Quality evidence | Complexity/licensing |
+|---|---|---|---|---|---|
+| Approved complete mixed ASTC sidecar | 8.703 GB raw; **2.090 GB actual zstd** | **16.875 GB**, includes lossless exceptions | Hash, IO, zstd and upload; **no BC1 conversion**. Decompression/IO still need a bounded loading path. | Complete BC1 passes; 47 BC3/unsigned BC5 lossless exceptions; BC4/SNORM lossless. | Content lookup before image creation, correct views/copies/re-uploads, versioned frames. astcenc Apache-2.0; zstd BSD option. |
+| Option 1, ETC2/EAC encoded on phone | No texture sidecar | 8.918 GB ideal; enforcing lossless exceptions increases it, total unmeasured | Fast supported targets assumed9-92 ms per1024-square; A1/signed require another encoder. Complete higher-quality upload encoding can take seconds/minutes. | Measured colour encoders fail38dB; EAC sample promising. No universal acceptance. | New target formats, encoder, pre-creation quality/fallback selection. Fast BSD-3-Clause; HQ Apache-2.0. |
+| Option 1, PC ETC2/EAC pack | 5.235 GB unique raw payload plus metadata, before exceptions; compressed full pack not generated | Same ideal8.918 GB, with unmeasured quality-fallback growth | No encode on phone; lookup/IO/upload. HQ full-set serial projection~8.57 days, not an actual full encode. | Same measured quality failures; a PC pack alone does not remove them. | Offline toolchain/gate plus runtime lookup/views. Same encoder licenses; no encoder needed on phone. |
+| Option 2, ASTC patch | **2.392 GB actual raw; 0.427 GB actual zstd** | **16.875 GB**, identical to complete mixed sidecar | IO/hash/zstd plus direct BC1 conversion; assumed18-53 ms per1024-square, largest catalog image~2-6 s. Needs scheduling/cache policy. | All11,335 BC1 images pass38dB; direct blocks <=1/255; same47 lossless exceptions. | Same format/content issues plus pinned C converter, implicit patch-order/count contract and worker/cache logic. astcenc Apache-2.0 on PC, zstd BSD option, repository bcdec license. |
+
+The patch prototype accesses whole images in canonical layer/mip order. Fine-grain
+streaming may need per-subresource hashes/prefix counts or independently compressed
+subresources; that metadata and runtime policy are not implemented or sized here.
+Unknown contents, partial writes, missing/corrupt data and re-uploads must retain
+the existing lossless path. Both ASTC alternatives still require resolving format
+selection before physical image creation. Compression does not solve that issue.
+
+**Recommendation:** start step 2 with the **compressed complete mixed sidecar**
+if its measured 2.090 GB is acceptable. It preserves the user's original goal of
+PC-made texture data and avoids introducing BC1 conversion on the phone. This is
+a choice to reduce conversion-related hitch risk, not a claim of measured phone
+performance; larger IO/decompression and memory still need device validation.
+Choose option 2 if saving another 1.663 GB justifies the added conversion and
+scheduling work. Do not choose blanket ETC2/EAC with these measured encoders
+while retaining the 38 dB requirement; its attractive ideal memory size depends
+on quality that the colour paths did not achieve. Further EAC-only research is
+a separate decision, not an implemented third candidate.
+
+The user must choose **2.090 GB complete compressed sidecar with no phone BC1
+conversion**, or **0.427 GB patch with phone conversion and an explicit loading
+budget**, before step 2 resumes. No quality threshold or runtime default changes
+follow from this comparison. Raw data, corrected encoder-setting provenance,
+codec/source hashes and verification results are indexed by
+`BENCH/astc-transcode/alternatives/alternatives-manifest.json`.
+
+Final offline checks: 90 codec smoke cases, known opaque/varying-alpha spatial
+cases, internal/independent reconstruction, complete BC1/padding coverage and
+all three 13,713-entry bank indexes pass. The unchanged repository source suite
+was rerun: **165 passed, 0 skipped**, 107.681 s, native Yaz0 enabled. Only this
+report and the perf-log entry are committed; no generated game data enters Git.
