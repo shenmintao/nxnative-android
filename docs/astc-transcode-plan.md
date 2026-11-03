@@ -1408,3 +1408,97 @@ blocked by the unapproved audio RED and incomplete device acceptance**.
 Next is supervisor review of that audio failure and a new supervised continuation,
 without assuming any change to the approved acceptance. No merge, push, tag or
 publication occurs.
+
+## Step3 continuation: clarified V gate and FP32 blend failure (2026-11-03)
+
+The supervisor clarifies that V is judged on zero Vulkan validation errors and
+no crash. Warnings and recovered audio-watchdog REDs are recorded; non-validation
+runs retain the strict RED0 gate except one zero-copy capability notice. This
+scope supersedes the previous audio-only stop without changing APK3 or data.
+The private harness records each audio/restart event with adjacent-read host
+monotonic bounds and UTC observation times, retains epoch-timestamped logcat,
+and polls keyguard/focus every5s. Launch requires unlocked/awake; a foreground
+lock marks the run disturbed and permits one restart. Gate fixture checks V
+audio/warnings are allowed while non-V audio and V validation errors still fail.
+
+### New correctness blocker
+
+Fresh validation3 starts with the layer enabled. Before title detection it
+reports **2 errors**:
+
+```text
+VUID-VkGraphicsPipelineCreateInfo-renderPass-06041
+blendEnable = VK_TRUE with VK_FORMAT_R32G32B32A32_SFLOAT,
+whose format features lack VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT.
+```
+
+The layer's full reported format-feature masks are retained. Three identical
+warnings concern a fragment output at location0 with no corresponding color
+attachment; they are listed without failing V. Raw RED7 comprises baseline1,
+recovered audio1, warnings3 and real validation errors2. No NonWritable06341
+recurrence is observed. Required errors0, observed2: **V fails by2**.
+The controller stops the process; no crash is observed, no new format fallback
+or shader/runtime fix is attempted, and no further experiment follows.
+
+One201ms audio watchdog is recorded at host observation16:22:18.188+08,
+bounded by an adjacent-read interval0.688s wide. `AudioUnit restarted` is
+observed16:22:19.477, interval0.719s wide. Logcat records dead IAudioTrack at
+epoch1793694137.708 and AAudio disconnection at1793694137.736; the new stream
+s#2 opens successfully (`AAUDIO_OK`) at1793694138.969. This is restart/reopen
+evidence, not an exact native timestamp for the file's watchdog line or proof
+of audible output. No later2000-callback diagnostic is reached before the
+unrelated Vulkan error. Audio is **not the blocker in this V run**.
+
+| Approved item | Current result |
+|---|---|
+| V, zero errors/no crash | FAIL:2 errors,3 warnings; controller stop, no crash observed |
+| Four-view comparison and BC5 normals | Not reached |
+| Sidecar hits/misses/exceptions, fetch distribution/frame correlation | Not run; no600-present counters, native phone probe never pushed |
+| Isolated save/reload +30s smoke | Not run |
+| 120s moving route/60s warmup and600s continuous | Not run; fps,>17.5%,p99,>50/>100,max and memory/LMK acceptance unknown |
+| Same-debug OFF/ON | Neither run; all no-regression limits unevaluated |
+
+### Data audit, disturbance and safe end
+
+The controller mistakenly overlaps the initial hash audit and V startup.
+Only `env.txt` and `settings.txt` differ after V writes the intended handheld
+test configuration; all immutable data files match. This invalidates that
+configuration audit and adds startup load, so no timing/performance inference
+is drawn. The app is stopped, original preferences restored, and the **full
+48,182-file audit reruns serially:0 mismatches,111.718s**, followed by **32/32
+installed sidecar chunk hashes**. No bulk data is resent. The launch controller
+now requires completed full-file/chunk proof before preparing any app run.
+Both the overlapping audit and corrected proof are retained. The explicit
+format-feature validation error remains the correctness blocker.
+
+All active keyguard/focus samples show unlocked GameNativeActivity foreground;
+Settings was focused before launch. No lock disturbance, restart or transport
+disconnect is observed. Startup PID23057 has RSS1,442,480KiB (1408.672MiB),
+PSS1,269,629KiB (1239.872MiB); HAL CPU/GPU73.628C,skin36.786C,battery33.3C,
+severity0; CPU caps2.1/2.6/2.6GHz, Game Mode`standard`. No mode/performance
+setting is changed by the agent. Main-pass DRS, BC-shadow residency over time,
+GOOGLE presentation feedback and pair-warm counters remain unmeasured; four
+workers and refresh timing are merely announced.
+
+The once-exempt pool is1,191,936B/1.13671875MiB; the first24 allocation logs
+reach cumulative copied162.6MiB,zero-copy0.0. All22 startup slow-replay sync
+samples print0.0ms rounded to0.1ms. No600-submission volume row exists, so live
+copy residency, MiB/submission and steady copying cost remain unestablished.
+
+Safe end is verified again: exact release3 e85e77ce, full data, bank a98538dc
+and manifest50534b64;17 staged seed-file hashes match before atomic rename
+into the ordinary save. Debug/validation/test roots are removed, app stopped,
+keeper ended, screen OFF (sleep reissued after an awake readback). The current
+screen timeout reads**600000ms**, differing from the prior attempt's30000ms.
+The agent issued no settings writes; this observed external change is retained
+without attributing its source or changing it. Performance mode stays standard.
+
+`BENCH/astc-phone-validation.json` appends the fourth continuation and preserves
+all previous attempts. Evidence under
+`astc-phone-validation/session-20261103-step3-vgate/` includes audio recovery
+timestamps, raw warnings/errors, keyguard/focus transitions, both audits,
+32-chunk proof and final state. APK/source hashes still match the existing
+build and182-test result; no rebuild or production export change occurs.
+Publication is blocked by VUID06041 and the unexecuted acceptance. Next is
+supervisor review/correctness work on the unsupported blend format, followed by
+a supervised continuation. No merge, push, tag or publication occurs.
