@@ -2066,3 +2066,19 @@ Readable vendor thermal/performance configurations are archived with source path
 - Tried: productized the approved complete compressed representation, ran the full owned corpus through guarded/reference checks and image gates, built all three APK variants, and audited the staged pack and actual runtime reader/fetch on the host.
 - Conclusion:offline artifacts are reviewable; quality exceptions remain lossless. Synchronous per-image work, BC-shadow memory, first-use lookup coverage and BC5 angular tails remain device questions. These results establish neither phone frame-time acceptance nor a production change.
 - Next:supervisor reviews this branch and starts the separately approved step3 protocol in a new session. No device command, merge, push or unapproved alternative follows from step2.
+
+### ASTC step3 phone installation and monitoring stop, 2026-11-03
+
+- Approved: owned BotW1.9.0/v1114112+DLC1/2, V2405A/Dimensity9400, handheld/stock DRS/target60/HOLD off/audio on, balanced settings unchanged; isolated Plateau seed, V/visual/save-load/30s/120s+60s warmup/600s and same-debug OFF(pair+budget0)/default ON. Cadence+0.5pp, >50<=OFF, startup+10s, RSS ON-OFF<=250MB, no app LMK.
+- Normal player install: ASTC LDR/decode-mode gate and whole-bank host verification pass; release2 installed/on-phone SHA0e9d049e matches. Vivo risk activity briefly appears then resolves without agent UI confirmation; no settings/account requirement. Two host dependency failures were resolved with existing perf-python; no code/APK/pack change.
+- Blocker: after3 recovered adb push failures, read-only keyguard query times out20s around15:13:25; watcher's stop marker terminates porter15:13:27. Last92%,16.4/17.9GiB,piece7/32,29m44s. This is a controller/transport stop, not proof of relock or game failure; no further install/experiment follows.
+- All game acceptance NOT RUN: no V errors/warnings assessment, visual comparison, fetch counters/distribution/long-frame correlation, save/reload,120s/600s, fps/tails, RSS/PSS/BC-shadow series or OFF/ON. GOOGLE timing advertised, runtime/pair counters unknown. Native phone fetch harness compiled only; never pushed/executed.
+- Baseline only: current HAL CPU/GPU39.318C,skin33.593C,battery31.4C,severity0; CPU caps permission-denied; Game Mode standard.181 source tests PASS/0 skipped/171.141s. Tablet untouched; no phone performance inferred from host/tablet evidence.
+- Safe end: exact release2 retained, stopped/OFF, timeout30000ms unchanged, no debug/validation builds, UI XML removed;17,813,171,626B partial data retained incl10/32 sidecar pieces/671,088,640B. Complete bank/manifest absent, seed not copied; requested complete-data/seed end state remains unmet.
+- Evidence: BENCH/astc-phone-validation.json and astc-phone-validation/session-20261103-step3 hold all not-run rows, setup screenshot index, unlock/install/raw checks and partial-file inventory. docs/astc-transcode-plan.md updated; publication blocked. No runtime fix, retry after blocker, merge, push, tag or version bump.
+
+### Day-end: ASTC phone validation blocked before gameplay, 2026-11-03
+
+- Tried: normal generated non-BC pack installation plus read-only unlock/keepawake supervision; APK/capability gate pass, transfer interrupted by controller watchdog at92%. Host source checks181/181 pass; no device game test ran.
+- Conclusion: release installed and phone stopped/OFF;17.813GB resumable data retained, complete bank/manifest and seed missing. All step3 and OFF/ON acceptance remain unevaluated;0.3.0rc3 publication blocked.
+- Next: new supervised session to address monitoring reliability, resume normal installation and execute the already approved protocol. Do not infer an APK/game failure, relax acceptance or continue experiments in this stopped run.

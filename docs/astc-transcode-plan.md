@@ -1042,3 +1042,70 @@ frame-time tails. The saved phone JSON is evidence of capabilities, not an
 installation or rendering test. The existing lossless path's raw compressed
 readback/reinterpretation limitations are not solved by this sidecar. No device
 acceptance or production promotion follows from these host results.
+
+## Step 3: Dimensity 9400 phone validation, 2026-11-03 — BLOCKED
+
+The user approved BotW 1.9.0 / v1114112 + DLC1/2 on vivo V2405A
+(`10AEBS0BKY001KZ`, MT6991 / Immortalis-G925), handheld, stock internal DRS,
+target60, `DM_FPS_HOLD=off`, audio on and unchanged balanced device settings.
+The protocol specifies an isolated owned Plateau seed, Vulkan/visual checks,
+save/reload plus30s smoke, a60s warmup/120s moving route,600s continuous run,
+and the same-debug-APK OFF/ON comparison. OFF disables both pair warming and
+pacing budget; ON uses defaults. Limits remain cadence OFF+0.5pp, >50ms count
+no higher than OFF, startup OFF+10s, RSS ON-OFF <=250,000,000 bytes, and no app LMK.
+The private protocol and all result rows are in `BENCH/astc-phone-validation.json`.
+
+**Installation reached92%; no game validation ran.** The positive ASTC LDR and
+UNORM8 capability gate and complete host bank verification passed through the
+normal `python -m porter install <generated ASTC pack> --apk ...release2.apk`
+player path. The release APK installed; its on-phone SHA256 matches
+`0e9d049eaee0d866a46231c9c0c8d6aca5569a772b11679894c2a72bcd443b77`.
+A vivo `PackageInterceptActivity` was briefly observed and then resolved without
+agent UI confirmation. No system-setting or account-verification change was
+required. Two initial host dependency attempts failed before installation;
+the existing `tools/perf-python` backports.zstd dependency resolved them.
+
+After three automatically recovered adb push failures, the read-only keyguard
+watcher's `dumpsys window policy` query timed out after20s at about15:13:25.
+Its stop marker caused the controller to terminate porter at15:13:27. Last
+progress was16.4/17.9GiB (92%), `textures.astc` piece7/32,29m44s into the successful
+installation attempt. This was a controller/adb monitoring stop; no evidence
+establishes a relock or game failure. The last watcher observation was unlocked.
+All watcher/installer/validation-waiter processes ended. No retry, debug install,
+seed preparation or device experiment followed this blocker.
+
+| Approved criterion | Phone evidence / result |
+|---|---|
+| Zero validation errors; baseline warnings | Not run; errors and warnings unknown |
+| Title/load/Plateau/route-end, including normal maps | Not run; no game screenshots or comparison |
+| Sidecar hits/misses/exceptions, phone fetch distribution, long-frame overlap | Not measured; no runtime counters or phone benchmark execution |
+| Isolated save/reload +30s gameplay, stable PID, RED0 | Not run; seed not copied |
+| 120s moving route after60s warmup | Not run; fps, >17.5ms%, p99, >50/>100, max unknown |
+| 600s continuous run, RSS/PSS/BC shadows, thermal/caps, no LMK | Not run; no gameplay time series |
+| Debug OFF versus default ON | Neither run; all four limits and app-LMK criterion unevaluated |
+
+The fresh Vulkan report confirms no BC, ASTC LDR/decode-mode support and no
+descriptor buffer. `VK_GOOGLE_display_timing` is advertised; runtime operation
+and pair-warm counters remain unmeasured. One pre-test HAL baseline reports
+CPU/GPU39.318C, skin33.593C, battery31.4C, severity0. CPU `scaling_max_freq` reads
+were permission-denied; no cap or game-memory result is inferred. Game Mode
+reports `standard`; device performance settings, rotation and30s screen timeout
+were not changed. The tablet was not accessed. Full local source checks pass
+**181/181,0 skipped** in171.141s; the Android production-fetch CPU benchmark was
+compiled but never pushed or executed. These are host checks, not device acceptance.
+
+**End state is safe but incomplete:** exact release2 remains installed, app
+stopped, screen OFF, no debug/validation APK installed, temporary UI XML removed.
+There are17,813,171,626 retained external bytes, including10/32 resumable64MiB
+sidecar pieces (671,088,640 bytes). The complete `textures.astc` and final
+`nx2a-data.json` are absent, so the installation cannot start the game. The
+requested complete-data/seed end state is not met. Partial files remain for a
+normal porter resume; roughly1.42GB of the final pack remains. Original PC packs,
+APKs and the production registry/export are unchanged.
+
+Raw evidence, setup screenshot index, capability report, source-suite logs,
+partial-file inventory and final package/power checks are under
+`BENCH/astc-phone-validation/session-20261103-step3/`. All acceptance cells remain
+**not evaluated**, and publication is blocked pending a new supervised session
+that completes installation and the approved protocol. No merge, push, tag,
+version bump or pre-release publication was performed.
