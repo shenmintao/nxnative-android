@@ -1330,3 +1330,81 @@ The census and this continuation's evidence live in
 `BENCH/astc-phone-validation/session-20261103-step3-nonwritable/`.
 Host correctness checks alone do not establish phone acceptance; installed-data
 hash audit and the restarted V/remaining protocol are recorded below when run.
+
+### APK3 installed-data audit and restarted V outcome
+
+The same phone is online at transport13. The supervisor unlock is observed
+read-only, with harmless wake events every10s while stopped. The existing
+**19,232,312,322B** pack is reused: **48,182/48,182 file SHA-256s match,
+0 mismatches**,109.75s; **32/32 installed sidecar chunks** are independently
+reverified against the original bank. **No bulk data is resent**, no transfer
+retry/reconnect or measurement disconnect occurs. Validation3 and final release3
+install successfully, with installed APK hashes matching the table above.
+An installer helper observes a window-list entry followed by a launcher/app
+transition, refuses all taps and exits; no settings/account action is requested
+or performed. The actual successful installation/hash checks remain decisive.
+
+Fresh V uses the original isolated seed and settings, with the layer enabled.
+It advances through startup to the last logged slow-replay present108, with
+**0 Vulkan validation errors,0 validation warnings and no VUID06341 recurrence**.
+However, it stops before title detection on a new unapproved RED:
+
+```text
+audio #0: the device has not called back for 201 ms while playing:
+the silent sink stands in, retrying the AudioUnit
+```
+
+Raw RED2 consists of exactly one approved zero-copy baseline and this audio
+RED. Logcat records dead IAudioTrack and AAudio error-899
+`AAUDIO_ERROR_DISCONNECTED`; a GPU-completion timeout is also retained.
+These observations do not establish root cause or an ASTC relationship.
+No audio exemption, workaround, relaunch or further experiment is inferred.
+PID5986's exit record is USER REQUESTED/FORCE STOP, confirming the harness
+stop rather than an app crash or low-memory kill.
+
+| Required criterion | APK3 result |
+|---|---|
+| Complete V, zero validation errors | Incomplete: observed errors0/warnings0 before audio gate |
+| No unapproved RED (baseline exempt once) | FAIL:audio1 versus required0; baseline1, no recurrence |
+| Title/load/Plateau/end visuals, BC5 normals | Not reached; no game reference comparison claimed |
+| Sidecar coverage/fetch distribution/long-frame coincidence | Not run; bank opens, counters not yet printed; phone probe never pushed |
+| Isolated save/reload plus30s smoke | Not run; a startup save commit is not this criterion |
+| 120s moving route/60s warmup and600s continuous run | Not run; fps/cadence/p99/>50/>100/max and memory series unknown |
+| Same-debug OFF/ON | Neither run; all five no-regression thresholds unevaluated |
+
+Only startup memory is sampled: RSS1,431,004KiB (**1397.465MiB**),
+PSS1,253,797KiB (**1224.411MiB**). Current HAL CPU/GPU74.751C,
+skin35.687C,battery33.1C,severity0; CPU maximums2.1/2.7/2.9GHz,
+GPU cap unavailable, Game Mode`standard`. Existing application ADPF hints and
+automatic vendor VSPA thread-speed messages are observed; no manual mode or
+system setting changes occur and cap causes are not investigated. Initial
+1280x720 and1920x1080 targets are logged, but no sampled main-pass DRS or
+BC-shadow series is available. Display-timing refresh16.591ms is logged;
+actual presentation feedback and pair-warm counters remain unmeasured
+(only four enabled workers announced).
+
+The exempt notice names pool`0x79e300a000`, size`0x123000` =1,191,936B /
+1.13671875MiB. First24 allocation messages reach cumulative copied162.6MiB,
+zero-copy0.0MiB; these are neither live residency nor bytes copied each
+submission. All14 startup slow-replay profiler samples print pool-sync0.0ms
+rounded to0.1ms. No600-submission volume row is reached, so MiB/submission and
+steady copy cost remain unknown; incremental dirty64KiB copies and aggregate
+tracking/lock costs prevent estimating them from the notice pool's size.
+
+Required safe end state **passes**: release3 e85e77ce installed; complete data,
+bank a98538dc and manifest50534b64 retained and rechecked;17 owned-seed file
+hashes match before an atomic rename into the ordinary save while stopped.
+Debug/validation builds and private test files/roots are removed, app stopped,
+screen OFF, timeout30000ms unchanged. Keeper/installer helper ended; no input
+loop started. Tablet, PC production selectors and exported production APK stay
+untouched. The new fix is committed as96f8a505; source hashes still match the
+APK3 build and the182-test result.
+
+`BENCH/astc-phone-validation.json` appends this third continuation and retains
+all earlier attempts, APKs and blockers. It includes complete current rows,
+criteria, source/build/census hashes, screenshot index (setup transition only),
+audio/driver/exit logs, copy-cost limits and final state. **Publication remains
+blocked by the unapproved audio RED and incomplete device acceptance**.
+Next is supervisor review of that audio failure and a new supervised continuation,
+without assuming any change to the approved acceptance. No merge, push, tag or
+publication occurs.
