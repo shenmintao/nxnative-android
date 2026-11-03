@@ -1659,3 +1659,193 @@ A/C (and B if warranted). The user must choose whether to authorize that
 additional diagnostic scope before choosing FP16 versus FP32 engineering.
 The requested comparison remains incomplete; no fix is selected or shipped,
 and no merge, push, tag or publication occurs.
+
+## Mali compatibility findings
+
+### 2026-11-03: UE reference, 04553 and capture attempt
+
+**Status: partial investigation, stopped by the existing non-validation audio
+gate.** No runtime source, default, game profile, generated data or APK changes
+in this continuation. One bounded non-validation attempt reused the existing
+debug C reference. It stopped on an audio watchdog RED before the title-ready
+checkpoint and before any internal PPM. Black rendering versus excluded screen
+capture remains **unresolved**; the earlier black screencaps do not prove that
+BotW's render target is black. This continuation does not select A or B.
+
+The measurable scope was owned BotW1.9.0/v1114112+DLC, V2405A/Dimensity9400,
+balanced, handheld, stock internal DRS, target60, HOLD off, audio on, isolated
+Great Plateau seed. The diagnostic capture goal was corresponding application
+PPM/system PNG at title, load and Plateau, with strict unapproved RED0, stable
+PID and unlocked foreground. No main-pass size or performance threshold was
+evaluated before the stop. The user's600000ms timeout is retained as an
+explicit **user change**, not attributed to this agent.
+
+### Read-only Unreal Engine design reference
+
+Existing authenticated `gh api` access pins EpicGames/UnrealEngine
+**5.8.4-release**, commit `f45729c0b6f097038e72b52d366a62baeca3275b`
+(2026-10-20). Only relevant VulkanRHI and Android platform files were read.
+The following is an independent description, not copied implementation;
+no Unreal source is added to the repository or private artifacts. Links
+require the reader's Epic/GitHub entitlement. References below share prefix
+`Engine/Source/` at that commit.
+
+| Topic | Observed UE mechanism | File / lines | Applicability and limits |
+|---|---|---|---|
+| RGBA32F without blending | Maps the abstract RGBA32F format directly to RGBA32F. Records renderability and blendability separately. The reviewed pipeline serializer writes the requested blend state. | [Runtime/VulkanRHI/Private/VulkanDevice.cpp:763-772,1152-1168](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanDevice.cpp#L763); [VulkanPipeline.cpp:807-828](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanPipeline.cpp#L807) | No automatic FP32-to-FP16 blend substitution, blend disabling or shader emulation found in these paths. A capability flag is useful; it does not implement the guest's unsupported blend operation. Higher-level renderer policy was outside this read scope. |
+| RGBA16_UNORM without linear filtering | Has ordered UNORM16 then FP16 candidates; chooses the first satisfying required capabilities. The default requirement is sampling, **not filtering**. Filterability is recorded separately. | [VulkanDevice.cpp:799-800,1123-1218,1221-1264](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanDevice.cpp#L799) | Missing LINEAR alone does not force substitution in this mapping. Do not cite UE as proof that it always converts Mali UNORM16 to FP16. |
+| Samplers / Android R16 | Sampler construction translates the requested filter without an image-format argument. Android explicitly prefers R16F for the single-channel G16 format for cross-GLES compatibility. | [VulkanState.cpp:197-222](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanState.cpp#L197); [VulkanDevice.cpp:874-881](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanDevice.cpp#L874); [Android/VulkanAndroidPlatform.h:137-141](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/Android/VulkanAndroidPlatform.h#L137) | No general image-dependent nearest-filter downgrade in this sampler path. The single-channel Android policy is not a four-channel precision guarantee. |
+| Android compression selection | Separate ASTC/ETC2 cook variants, configurable priority, extension/GLES checks when selecting a device target, format remaps and optional multiple cooked representations. Vulkan maps each compressed format through format support; HDR is extension-gated separately. | [Developer/Android/AndroidTargetPlatformControls/Private/AndroidTargetPlatformControls.h:191-200,226-235,251-286](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Developer/Android/AndroidTargetPlatformControls/Private/AndroidTargetPlatformControls.h#L191); [AndroidTargetPlatformControls.cpp:542-601,628-668](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Developer/Android/AndroidTargetPlatformControls/Private/AndroidTargetPlatformControls.cpp#L542); [VulkanDevice.cpp:847-889](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanDevice.cpp#L847) | Our per-device pack is an offline BC conversion with hashed sidecar lookup and retained BC shadow, not UE cooking from original assets. UE's GL target-selection check is distinct from Vulkan's actual format-property check. |
+| Android/Mali memory workarounds | Probes image allocation sizes with alternate creation flags; selects an AFBC memory workaround when measured allocation savings warrant it. A separate ASTC allocation probe can select linear tiling for small mipmapped images. | [Android/VulkanAndroidPlatform.cpp:2170-2310](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/Android/VulkanAndroidPlatform.cpp#L2170) | Relevant design for measuring retained/image memory later; neither a blend nor filtering fix. No new workaround is enabled here. |
+| AHardwareBuffer | Queries an external hardware-buffer image's properties, imports it with dedicated image allocation and the returned allocation size/type bits, then uses image/Y'CbCr resources. | [VulkanTexture.cpp:2065-2161](https://github.com/EpicGames/UnrealEngine/blob/f45729c0b6f097038e72b52d366a62baeca3275b/Engine/Source/Runtime/VulkanRHI/Private/VulkanTexture.cpp#L2065) | Different from importing our guest memory pools as buffers. No applicable Mali guest-pool zero-copy fallback repair found. |
+
+Bounded searches of the reviewed VulkanDevice/Extensions/Shaders and Android
+files find no Mali-specific NonWritable decoration repair, FP32 blend emulation
+or UNORM16 filtering repair. This is not an engine-wide absence claim. Existing
+local NonWritable fix96f8a505 remains separate. Targeted upstream searches after
+fetching nx2android34333894c5192606d1ac88b10e8e040667d556c8 and
+nxnative7ef2aaf54ad63747623ae044f2963e310a031f11 find no directly reusable
+related correction. nx2android already forces nearest for integer views; that
+does not cover this UNORM view.
+
+Compared with UE, useful gaps to evaluate in our sidecar path are a general
+per-format/per-usage capability contract (blend, filter and image shape, not
+just BC/ASTC family), an ETC2/EAC deployment fallback for devices lacking the
+required ASTC decode mode, per-shape compressed-image checks (UE specifically
+falls back from ASTC for volume textures), and source-aware normal/HDR encoding
+policy. UE's cook path can use original normal-map intent; a BC transcode must
+preserve already encoded channels and signedness. Our existing manifest gates,
+mixed exceptions and per-texture hashes remain valuable and unchanged. These
+are design gaps or follow-up checks, not assertions of new phone failures or
+permission to expand this investigation.
+
+### 04553 identification and minimal handling proposal
+
+The preserved C validation log has **3 error reports**, all
+`VUID-vkCmdDrawIndexed-magFilter-04553`, while loading:
+
+| Object | Observed evidence |
+|---|---|
+| Descriptor set | `0x2cb20000002cb2`, Set1, Index0 |
+| Sampled view | Both bindings use `0x2cb10000002cb1`, `VK_FORMAT_R16G16B16A16_UNORM` (91) |
+| FS binding1 | `fp_t_tcb_8`, sampler `0x2c6a0000002c6a` |
+| FS binding2 | `fp_t_tcb_A`, sampler `0x2b710000002b71` |
+| Sampling | LINEAR min or mag, comparison disabled; physical format has no SAMPLED_IMAGE_FILTER_LINEAR |
+| Still unknown | Image handle, dimensions, full usage, guest texture/view IDs, full sampler state, exact VS/FS keys, pass and draws/frame. Three validation reports are **not** a draw-frequency measurement. |
+
+Source provenance narrows the cause: `gfx_vk_tex.c:44,60` maps guest formats
+0x2a/0x72 to this UNORM16 format; `color_image_require` changes usage/creation
+support without reducing the format, comparison clones use D16/D32, and BC6H
+CPU fallback uses RGBA16F. Thus this sampled **view format follows a guest
+format or guest reinterpretation view**, rather than an ASTC decode, D16 clone
+or color-promotion-to-UNORM16 policy. The particular image's creator/alias is
+not established by the old log. Do not infer its usage flags or shader keys
+from nearby asynchronous shader-compilation lines.
+
+`gfx_vk_exec.c:1340-1368` selects nearest only when `view_num` classifies an
+integer view. UNORM16 is float-class, so it retains the requested linear
+sampler. The correct compatibility contract must check the **actual view
+format's optimal-tiling feature bits**, including cached descriptors, before
+using that sampler. Merely checking the image parent's format misses aliases.
+
+The smallest diagnostic prototype would explicitly gate nearest min/mag,
+nearest mip selection and anisotropy1 for unsupported view formats while
+preserving wrap/LOD/compare semantics and sampler snapshot versions. Existing
+`vk_samp_at_mode` supplies much of that mechanism. It would remove this illegal
+linear request, preserve the UNORM16 stored values, and permit a controlled
+comparison, but **changes filtering quality**; it is not a demonstrated
+semantics-preserving production fix. It was neither added nor run after the
+strict non-V stop.
+
+To preserve the game's requested filtering, prefer a narrowly scoped
+shader-side filter path over a supported nearest sampler (four taps per
+bilinear sample, with correct address/LOD/mip handling); shader variants,
+implicit derivatives and performance still need evaluation. An FP16 physical
+substitute can use hardware filtering and keeps8B/texel, but UNORM16 bits must
+be converted on uploads/readbacks and all image/view/copy uses must agree.
+UNORM16 steps are1/65535 throughout[0,1]; FP16 has11 significant bits and a
+step of1/2048 just below1, about32 times coarser. Reinterpreting the same bits
+as FP16 is incorrect. UE's candidate fallback does not waive these guest-data
+or precision obligations. No proposal has a visual or VUID-free phone result.
+
+### Black-output attempt and strict stop
+
+The existing debug C APK (`b2fb7bcd…`, no validation layer) was installed over
+the retained complete data; no data retransmission or new APK build. Fresh
+isolated seed and existing logical prewarm input were restored. Requested
+PPMs were to use `DM_VK_SHOTS=1` at each scene checkpoint and a private writable
+`DM_VK_SHOT_DIR`, alongside screencap. `gfx_vk_present.c:904-923` reads the
+game's presented image before the screen overlay using an image-to-buffer
+copy, so a successful nonblack PPM would distinguish rendering from an
+OS-excluded layer. No window security flags are altered.
+
+PID20138 reaches at least present158 but stops during title preparation:
+audio#0 reports no callback200ms, observed **17:08:38.879663+08**, bracketed by
+host monotonic544705843000000..544706562000000ns. Logcat records dead
+IAudioTrack at epoch1793696918.216 and AAUDIO_ERROR_DISCONNECTED(-899) at
+1793696918.238. No restart or subsequent callback evidence appears before the
+controller stop. Raw RED2 = approved zero-copy notice1 + unapproved audio1.
+The layer is off and Vulkan error count0 is **not** a validation pass. The
+private preparation retained slow-replay diagnostics; this short diagnostic
+failure is not a release/OFF/ON performance or audio-baseline measurement.
+
+The title-ready detector had not returned, so no DM_CTL shot request was
+sent: **0 PPM and0 new scene PNG files**. The user-reported FLAG_SECURE remains
+a capture-exclusion hypothesis, not independently verified in a foreground
+window dump in this run; keyguard `secure=true` alone would not establish a
+window FLAG_SECURE. Earlier title/load PNGs remain capture evidence only.
+There is no basis yet to identify a first failing rendering stage or blame
+descriptor fallback, ASTC or pool copying. Sidecar-disable/descriptor-path
+experiments were not started after this stop. No audio workaround, relaxed
+gate or relaunch was introduced.
+
+All active focus observations show the game foreground and unlocked; no
+transport disconnect or disturbed-run restart. One startup RSS/PSS sample is
+1,392,196/1,224,673KiB; automatic CPU caps sampled2.4/3.0/3.1GHz. These are not
+growth or steady-state statistics; vendor/system modes were not changed.
+The one fallback pool is0x79e300a000+0x123000 (1,191,936B/1.13671875MiB).
+First24 allocation logs reach cumulative copied162.6MiB, zero-copy0.0MiB;
+three slow-replay samples print pool-sync0.0ms rounded. Neither allocated
+totals nor rounded timings determine actual MB copied/submission or cost.
+
+### Recommendation, records and end state
+
+UE does not provide evidence for an automatic FP16 solution to06041. Keep B
+as the precision-preserving candidate if FP32 semantics are required; A
+remains a simpler potential tradeoff only after actual target range,
+aliases/readbacks and controlled visuals are known and the user chooses
+reduced storage precision. Existing2-4-day A /3-5-day constrained B estimates
+remain estimates, not fresh prototype results. Neither is selected or shipped.
+
+Priority: (1) obtain a user decision on the strict non-V audio blocker;
+(2) complete internal PPM versus screencap evidence; (3) actual-view04553
+binding diagnostics and filtering proposal validation; (4) identify demand
+FP32 targets and compare06041 A/C/B; (5) resume the original validation,
+visual/BC5, sidecar/fetch, save/reload,120s/600s and OFF/ON acceptance. Pool-copy
+cost remains a recorded baseline/performance question, not a proven black
+rendering cause. No additional phone experiment is authorized by this list.
+
+`BENCH/astc-phone-validation.json` appends this investigation and preserves
+all old rows, attempts, images and blockers. New own-word UE references,
+failed-run logs/events/focus, zero-frame index, host checks and end proof are
+under `astc-phone-validation/session-20261103-mali-compat/`.
+Exact original release3 `e85e77ce…` is reinstalled/hash-verified, bank a98538dc
+and manifest50534b64 rechecked,17 seed-file hashes verified before atomic
+replacement of the ordinary save. Probe build/test roots and files are
+removed, keeper ended, app stopped, screen OFF; timeout600000ms retained.
+This documentation continuation makes no runtime/porter change and does not
+merge, push, tag or publish anything.
+
+Host verification before this documentation commit: full
+`python -m unittest discover tests` **183 PASS,0 skipped,151.060s**
+(152.500s wall), with native compiler/NDK dependencies available. No new
+runtime prototype or APK was built; prior debug/release compile evidence is
+retained, not relabelled as a new build.
+
+Post-restore transport note: an optional read-only recheck lost adb at
+17:16:57+08, after the17:09:57 release/data/seed/stopped/OFF proof. Retried
+with19232312322 retained bytes recorded; same serial returned as transport14
+after565.589s, within the600s tolerance. A first immediate terminal assertion
+failed without saved field values; the settled repeat at17:26:45.957+08
+verifies exact release3, stopped, screen OFF and timeout600000ms. No new app
+launch or measurement; this is separate from the run's zero disconnects.
