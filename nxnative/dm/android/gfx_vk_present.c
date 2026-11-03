@@ -137,6 +137,10 @@ static void vk_pic_set(float x, float y, float w, float h) { atomic_store(&g_pic
 void dm_picture_rect(float r[4]) { for (int i = 0; i < 4; i++) r[i] = (float)atomic_load(&g_pic[i]) / (1 << 20); }
 __attribute__((weak)) int dm_overlay_visible(void) { return 0; }
 __attribute__((weak)) float dm_overlay_scale(void) { return 1; }
+__attribute__((weak)) int dm_overlay_button_size(void) { return 100; }
+__attribute__((weak)) void dm_overlay_metrics(float W, float H, float *px_mm, float insets[4], float *percent) {
+    (void)W; *px_mm = H * 0.1f * dm_overlay_scale() / 10; memset(insets, 0, sizeof(float) * 4); *percent = 100;
+}
 __attribute__((weak)) void dm_overlay_knob(int stick, float *dx, float *dy) { (void)stick; *dx = *dy = 0; }
 __attribute__((weak)) int64_t dm_overlay_pressed(int ctl, uint64_t bit) { (void)ctl; (void)bit; return 0; }
 __attribute__((weak)) int dm_menu_state(void) { return -1; }
@@ -366,7 +370,7 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int 
 }
 // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
 // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
-static const char *const OVM_LABELS[OVM_N] = {[OVM_OVERLAY]="Show gamepad", [OVM_OPACITY]="Opacity", [OVM_EDIT]="Edit layout", [OVM_RUMBLE]="Rumble", [OVM_FPS]="Show FPS", [OVM_MODE]="Mode", [OVM_EXPORT]="Export save", [OVM_IMPORT]="Import save", [OVM_RESUME]="Resume", [OVM_LAYOUT]="Pad mapping", [OVM_TAB]=""};
+static const char *const OVM_LABELS[OVM_N] = {[OVM_OVERLAY]="Show gamepad", [OVM_OPACITY]="Opacity", [OVM_EDIT]="Edit layout", [OVM_RUMBLE]="Rumble", [OVM_FPS]="Show FPS", [OVM_MODE]="Mode", [OVM_EXPORT]="Export save", [OVM_IMPORT]="Import save", [OVM_RESUME]="Resume", [OVM_LAYOUT]="Pad mapping", [OVM_TAB]="", [OVM_SIZE]="Button size"};
 static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import"};   // the rows that are a button: its word
 static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
 static void ov_menu_panel(const ov_canvas *cv, int st) {
@@ -398,6 +402,10 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
         }
         if (it == OVM_RESUME) { cv_rrect(cv, r[0], r[1], r[0] + rw, r[1] + 1, 0.5f, C_LINE); cv_text(cv, r[0] + (rw - cv_text_w("Resume", is)) / 2, cy, "Resume", is, C_ACCENT); continue; }
         cv_text(cv, r[0] + rh * 0.15f, cy, OVM_LABELS[it], is, row == sel ? C_WHITE : C_DIM);
+        if (it == OVM_SIZE) {
+            char value[16]; snprintf(value, sizeof value, "%d%%", dm_overlay_button_size());
+            cv_text(cv, x1 - cv_text_w(value, is), cy, value, is, C_ACCENT); continue;
+        }
         if (it == OVM_LAYOUT) {
             int mode = st >> 28 & 3;
             const char *word = mode == 1 ? "Xbox" : mode == 2 ? "Nintendo" : st >> 30 & 1 ? "Auto: Xbox" : "Auto: Nintendo";
@@ -556,12 +564,17 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
         float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(); ov_rect(cb, x, m + pad, x + cw, m + pad + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
     }
 }
+static float ov_control_sprite_scale(const ov_theme *t, const ov_ctl *c, const float b[4], float H) {
+    if (t->layout) return 2 * b[3] / (c->h * t->dh);
+    float k = H / t->dh * dm_overlay_scale() * ov_cscale(c); int percent = dm_overlay_button_size();
+    return percent == 100 ? k : k * percent / 100.0f;
+}
 static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) {   // (alpha: the player's opacity; each control at its own size factor)
-    float W = (float)g_sext.width, H = (float)g_sext.height, k = H / t->dh * dm_overlay_scale(), b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
-    for (int j = 0; j < t->n; j++) if (t->sp[j].state == OVT_DECOR) { const ov_ctl *c = &L[t->sp[j].ctl]; ov_box(c, W, H, b); ov_tsp(cb, t, &t->sp[j], b[0], b[1], k * ov_cscale(c), alpha); }
+    float W = (float)g_sext.width, H = (float)g_sext.height, b[4]; const ov_ctl *L = OV_LAYOUTS[t->layout];
+    for (int j = 0; j < t->n; j++) if (t->sp[j].state == OVT_DECOR) { const ov_ctl *c = &L[t->sp[j].ctl]; ov_box(c, W, H, b); ov_tsp(cb, t, &t->sp[j], b[0], b[1], ov_control_sprite_scale(t, c, b, H), alpha); }
     for (int i = 0; i < OV_N; i++) {
         const ov_ctl *c = &L[i]; if (c->kind == OV_MENU) continue;
-        ov_box(c, W, H, b); float kc = k * ov_cscale(c); int stick = c->kind == OV_STICK_L || c->kind == OV_STICK_R, held = c->kind != OV_DPAD && dm_overlay_pressed(i, 0) != 0;
+        ov_box(c, W, H, b); float kc = ov_control_sprite_scale(t, c, b, H); int stick = c->kind == OV_STICK_L || c->kind == OV_STICK_R, held = c->kind != OV_DPAD && dm_overlay_pressed(i, 0) != 0;
         float kx = 0, ky = 0; if (stick) { dm_overlay_knob(c->kind == OV_STICK_R, &kx, &ky); kx *= t->travel * kc; ky *= t->travel * kc; }
         for (int j = 0; j < t->n; j++) {
             const ov_tsprite *s = &t->sp[j]; if (s->ctl != i || s->state == OVT_DECOR) continue;
@@ -574,7 +587,7 @@ static void ov_theme_draw(VkCommandBuffer cb, const ov_theme *t, float alpha) { 
 static void ov_theme_menu(VkCommandBuffer cb, const ov_theme *t, int i, float alpha) {
     const ov_ctl *c = &OV_LAYOUTS[t->layout][i]; float W = (float)g_sext.width, H = (float)g_sext.height, b[4]; ov_box(c, W, H, b);
     int held = dm_overlay_pressed(i, 0) != 0;
-    for (int j = 0; j < t->n; j++) if (t->sp[j].ctl == i && t->sp[j].state == (held ? OVT_HELD : OVT_IDLE)) ov_tsp(cb, t, &t->sp[j], b[0], b[1], H / t->dh * dm_overlay_scale() * ov_cscale(c), alpha);
+    for (int j = 0; j < t->n; j++) if (t->sp[j].ctl == i && t->sp[j].state == (held ? OVT_HELD : OVT_IDLE)) ov_tsp(cb, t, &t->sp[j], b[0], b[1], ov_control_sprite_scale(t, c, b, H), alpha);
 }
 static void ov_block(VkCommandBuffer cb, int sp, float x0, float y0, float x1, float y1, float alpha) {   // a solid rectangle in a block sprite's colour
     float bx = g_ov.sp[sp][0], by = g_ov.sp[sp][1]; ov_rect(cb, x0, y0, x1, y1, bx - 2, by - 2, bx + 2, by + 2, alpha);

@@ -60,6 +60,7 @@ static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the game
 static _Atomic int g_pad_layout, g_auto_xbox = 1;   // 0 auto, 1 Xbox labels, 2 Nintendo positions; Android's standard labels are Xbox
 static int xbox_layout(void) { int mode = atomic_load(&g_pad_layout); return mode == 1 || (!mode && atomic_load(&g_auto_xbox)); }
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
+static _Atomic int g_set_button_size = 100; // 80..120 percent, Gamepad / Button size
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
 // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
 // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1)
@@ -75,6 +76,7 @@ static void settings_load(void) {
         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
         else if (sscanf(line, "pad_layout=%d", &v) == 1 && v >= 0 && v <= 2) atomic_store(&g_pad_layout, v);
         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
+        else if (sscanf(line, "button_size=%d", &v) == 1) atomic_store(&g_set_button_size, v < 80 ? 80 : v > 120 ? 120 : v);
         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
             char lay[16], name[32]; int x, y, z, l, i;
@@ -91,8 +93,8 @@ static void settings_load(void) {
 static void settings_save(void) {
     char p[600], tmp[610]; snprintf(p, sizeof p, "%s/settings.txt", g_root); snprintf(tmp, sizeof tmp, "%s.new", p);
     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
-    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\npad_layout=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
-            atomic_load(&g_set_opacity), atomic_load(&g_set_grid), atomic_load(&g_pad_layout));
+    fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\npad_layout=%d\nbutton_size=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
+            atomic_load(&g_set_opacity), atomic_load(&g_set_grid), atomic_load(&g_pad_layout), atomic_load(&g_set_button_size));
     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]);
         if ((x && y) || z) fprintf(f, "ui=%s,%s,%d,%d,%d\n", LAYOUT_NAMES[l], OV_LAYOUTS[0][i].name, x && y ? x - 1 : -1, x && y ? y - 1 : -1, z ? z : 1000);
@@ -200,15 +202,38 @@ int64_t dm_overlay_pressed(int ctl, uint64_t bit) {
     if (OV_CTLS[ctl].kind == OV_BUTTON) bit = OV_CTLS[ctl].btn;
     return bit && bit < 1u << 16 ? atomic_load(&g_press_t[__builtin_ctzll(bit)]) : 0;
 }
-static int g_dpi;   // the display's density (AConfiguration), 0 = unknown
+static _Atomic int g_dpi;   // the display's density (AConfiguration), 0 = unknown
 float dm_overlay_scale(void) {
-    static int last_w = -1, last_h = -1; static float s = 1;
+    static int last_w = -1, last_h = -1, last_dpi = -1; static float s = 1;
     ANativeWindow *w = dm_front_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, h = w ? ANativeWindow_getHeight(w) : 0;
-    if (h != last_h || ww != last_w) { last_w = ww; last_h = h; s = 1;   // (the width picks the layout, whose buttons are sized for its form factor)
+    if (h != last_h || ww != last_w || g_dpi != last_dpi) { last_w = ww; last_h = h; last_dpi = g_dpi; s = 1;   // (the width picks the layout, whose buttons are sized for its form factor)
         float face = 0.1f; const ov_ctl *L = OV_CTLS; for (int i = 0; i < OV_N; i++) if (L[i].kind == OV_BUTTON && L[i].btn == DM_BTN_A) face = L[i].w;   // A's width, in window heights
         if (h > 0 && g_dpi > 0 && g_dpi < 0xfffe) { float mm = face * (float)h / (float)g_dpi * 25.4f; s = OV_MIN_MM / mm; if (s < 1) s = 1; if (s > 1.45f) s = 1.45f; }   // (more and the face buttons touch)
         LOG("[overlay] window %dx%d, density %d dpi: face buttons %.1f mm, controls x%.2f", ww, h, g_dpi, h > 0 && g_dpi > 0 && g_dpi < 0xfffe ? face * h / g_dpi * 25.4f : 0, s); }
     return s;
+}
+// Decor-view insets are reported by GameNativeActivity after layout/rotation.
+// The game surface is unchanged: only controls avoid cutouts and system gestures.
+static pthread_mutex_t g_overlay_metrics_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_overlay_metrics[7]; // left,top,right,bottom, reference width,height,density
+JNIEXPORT void JNICALL Java_org_nxnative_GameNativeActivity_setOverlayInsets(JNIEnv *env, jobject self,
+    jint left, jint top, jint right, jint bottom, jint width, jint height, jint dpi) {
+    (void)env; (void)self; int values[7] = {left,top,right,bottom,width,height,dpi};
+    pthread_mutex_lock(&g_overlay_metrics_mu); int changed = memcmp(values, g_overlay_metrics, sizeof values);
+    memcpy(g_overlay_metrics, values, sizeof values); pthread_mutex_unlock(&g_overlay_metrics_mu);
+    if (dpi > 0 && dpi < 0xfffe) atomic_store(&g_dpi, dpi);
+    if (changed) { atomic_fetch_add(&g_cust_ver, 1); dm_overlay_redraw(); }
+}
+int dm_overlay_button_size(void) { return atomic_load(&g_set_button_size); }
+void dm_overlay_metrics(float W, float H, float *px_mm, float insets[4], float *percent) {
+    int values[7]; pthread_mutex_lock(&g_overlay_metrics_mu); memcpy(values, g_overlay_metrics, sizeof values); pthread_mutex_unlock(&g_overlay_metrics_mu);
+    ANativeWindow *window = dm_front_window();
+    float refh = values[5] > 0 ? values[5] : window ? ANativeWindow_getHeight(window) : H;
+    float refw = values[4] > 0 ? values[4] : window ? ANativeWindow_getWidth(window) : W;
+    int dpi = atomic_load(&g_dpi); if (dpi <= 0 || dpi >= 0xfffe) dpi = 160;
+    *px_mm = dpi / 25.4f * (refh > 0 ? H / refh : 1);
+    for (int k = 0; k < 4; k++) insets[k] = values[k] * (k & 1 ? H / fmaxf(refh, 1) : W / fmaxf(refw, 1));
+    *percent = atomic_load(&g_set_button_size);
 }
 void dm_overlay_knob(int stick, float *dx, float *dy) { *dx = atomic_load(&g_knob[stick][0]) / 10000.0f; *dy = atomic_load(&g_knob[stick][1]) / 10000.0f; }
 static int g_ptr_ctl[32];   // pointer id → control index + 1 (0 = the touch screen)
@@ -343,10 +368,15 @@ static void menu_opacity(int v) {   // the slider: a new value is drawn at once 
     v = v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v;
     if (atomic_exchange(&g_set_opacity, v) != v) { dm_haptics_android_tap(); dm_overlay_redraw(); }
 }
+static void menu_button_size(int v) {
+    v = v < 80 ? 80 : v > 120 ? 120 : v;
+    if (atomic_exchange(&g_set_button_size, v) != v) { atomic_fetch_add(&g_cust_ver, 1); dm_haptics_android_tap(); dm_overlay_redraw(); }
+}
 static void menu_tab(int t) { t = (t % OVM_TABS + OVM_TABS) % OVM_TABS; if (atomic_exchange(&g_menu_tab, t) != t) dm_haptics_android_tap(); dm_overlay_redraw(); }
 static void ed_open(void); static void sp_open(void); static void save_export(void);
 static void menu_do(int item) {
     if (item == OVM_OVERLAY) { atomic_store(&g_set_overlay, !atomic_load(&g_set_overlay)); atomic_store(&g_overlay, 1); settings_save(); }
+    else if (item == OVM_SIZE) { int v = atomic_load(&g_set_button_size) + 10; menu_button_size(v > 120 ? 80 : v); settings_save(); }
     else if (item == OVM_RUMBLE) { int on = !atomic_load(&g_set_rumble); atomic_store(&g_set_rumble, on); dm_haptics_android_set(on); settings_save(); }
     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
     else if (item == OVM_LAYOUT) { int mode = (atomic_load(&g_pad_layout) + 1) % 3; atomic_store(&g_pad_layout, mode); request_input_reset(RESET_PAD); settings_save(); LOG("[input] layout %s: effective %s", mode == 0 ? "Auto" : mode == 1 ? "Xbox" : "Nintendo", xbox_layout() ? "Xbox" : "Nintendo"); }
@@ -395,6 +425,7 @@ static void menu_key(uint64_t bit) {   // a controller key pressed while the men
         for (int k = 0; k < OVM_ROWS; k++) { hi = hi < 0 ? (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1) : (hi + (bit == DM_BTN_UP ? OVM_ROWS - 1 : 1)) % OVM_ROWS; if (ov_menu_item(tab, hi) >= 0) break; }
         atomic_store(&g_menu_hi, hi); dm_overlay_redraw();
     } else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_OPACITY) { menu_opacity(atomic_load(&g_set_opacity) + (bit == DM_BTN_LEFT ? -5 : 5)); settings_save(); }
+    else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_SIZE) { menu_button_size(atomic_load(&g_set_button_size) + (bit == DM_BTN_LEFT ? -10 : 10)); settings_save(); }
     else if ((bit == DM_BTN_LEFT || bit == DM_BTN_RIGHT) && item == OVM_TAB) menu_tab(tab + (bit == DM_BTN_LEFT ? -1 : 1));
     else if (bit == DM_BTN_L || bit == DM_BTN_ZL || bit == DM_BTN_R || bit == DM_BTN_ZR) {
         menu_tab(tab + (bit == DM_BTN_L || bit == DM_BTN_ZL ? -1 : 1));

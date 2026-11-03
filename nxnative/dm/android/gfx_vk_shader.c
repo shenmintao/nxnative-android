@@ -9,6 +9,7 @@
 #include "spv_unused_distances.h"
 #include "spv_vertex_inputs.h"
 #include "spv_vertex_outputs.h"
+#include "spv_depth_clip.h"
 #include "nvn_hmap.h"
 #include "spv_uniform_extent.h"
 #include <CommonCrypto/CommonDigest.h>
@@ -450,26 +451,35 @@ static uint32_t *spv_frag_depth(const uint32_t *w, uint32_t nw, uint32_t *onw) {
 }
 // DM_VK_SPV_DIR=<dir> with DM_VK_SPV_ALT=1 (live, debugging): pipelines made while it is on use <dir>/<key>.spv in place of the bundle's code where the file
 // exists (same bindings), so two compilations of a shader can be compared in one run: the translator's module through spirv-opt, its GLSL through glslc...
-static VkShaderModule alt_module(vkshader_t *s, uint64_t vin) {
+static int shader_depth_clip(vkshader_t *s, uint32_t **w, uint32_t *nw, int clip) {
+    uint32_t count = *nw, *patched = NULL; vk_spv_depth_info info;
+    int status = vk_spv_depth_clip(*w, *nw, clip, s->stage, &patched, &count, &info);
+    if (status < 0) { VKLOG("[RED] shader %016llx: GL depth conversion failed (%d); pipeline refused", (unsigned long long)s->key, status); return 0; }
+    if (patched) { free(*w); *w = patched; *nw = count;
+        if (info.captured_positions) VKLOG("shader %016llx: GL depth converted, %u Position capture(s) retain guest values in XFB-only outputs", (unsigned long long)s->key, info.captured_positions); }
+    return 1;
+}
+static VkShaderModule alt_module(vkshader_t *s, uint64_t vin, int clip) {
     const char *dir = getenv("DM_VK_SPV_DIR"); char path[512] = {0}; FILE *f = NULL;
     if (dir) { snprintf(path, sizeof path, "%s/%016llx.spv", dir, (unsigned long long)s->key); f = fopen(path, "rb"); }
-    if (!f && !vin) return s->mod;
+    if (!f && !vin && !clip) return s->mod;
     size_t n = (size_t)s->nspv * 4;
     if (f) { fseek(f, 0, SEEK_END); long length = ftell(f); fseek(f, 0, SEEK_SET); if (length < 20 || (length & 3)) { fclose(f); f = NULL; } else n = (size_t)length; }
     int alternative = f != NULL;
     uint32_t *w = malloc(n); VkShaderModule m = s->mod;
-    if (!w) { if (f) fclose(f); return vin ? VK_NULL_HANDLE : s->mod; }
-    if (f) { if (fread(w, 1, n, f) != n) { fclose(f); free(w); return vin ? VK_NULL_HANDLE : s->mod; } fclose(f); }
+    if (!w) { if (f) fclose(f); return vin || clip ? VK_NULL_HANDLE : s->mod; }
+    if (f) { if (fread(w, 1, n, f) != n) { fclose(f); free(w); return vin || clip ? VK_NULL_HANDLE : s->mod; } fclose(f); }
     else memcpy(w, s->spv, n);
     uint32_t nw = (uint32_t)(n / 4);
-    for (uint32_t i = 5; i < nw;) { uint32_t k = w[i] >> 16; if (!k || k > nw - i) { free(w); return vin ? VK_NULL_HANDLE : s->mod; }
+    for (uint32_t i = 5; i < nw;) { uint32_t k = w[i] >> 16; if (!k || k > nw - i) { free(w); return vin || clip ? VK_NULL_HANDLE : s->mod; }
         if ((w[i] & 0xffff) == 71 && k >= 4 && w[i + 2] == 34) w[i + 3] = (uint32_t)s->set; i += k; }
     if (vin) { uint32_t *w2 = NULL; int status = vk_spv_vertex_inputs(w, nw, vin, &w2, &nw);
         if (status < 0) { free(w); VKLOG("[RED] shader %016llx: unsupported alternate vertex input interface (%d)", (unsigned long long)s->key, status); return VK_NULL_HANDLE; }
         if (w2) { free(w); w = w2; } }
     shader_nonwritable(s, &w, &nw, NULL, 0);
+    if (!shader_depth_clip(s, &w, &nw, clip)) { free(w); return VK_NULL_HANDLE; }
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
-    if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) m = vin ? VK_NULL_HANDLE : s->mod;
+    if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) m = vin || clip ? VK_NULL_HANDLE : s->mod;
     else VKLOG("shader %016llx: alternative code%s%s, vertex inputs %#llx", (unsigned long long)s->key, alternative ? " from " : " fallback to bundle", alternative ? path : "", (unsigned long long)vin);
     free(w); return m;
 }
@@ -492,26 +502,26 @@ static uint32_t *spv_dual(const uint32_t *w, uint32_t nw, uint32_t *onw) {
     memcpy(&o[at + 8], &w[at + 4], (size_t)(nw - at - 4) * 4); *onw = nw + 4;
     return o;
 }
-static void shader_variant_add(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vin, VkShaderModule module) {
+static void shader_variant_add(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vin, int clip, VkShaderModule module) {
     if (s->nvar == s->capvar) {
         int capacity = s->capvar ? s->capvar * 2 : 8;
         void *variants = realloc(s->var, (size_t)capacity * sizeof *s->var);
         if (!variants) die("[vk] cannot retain shader variants");
         s->var = variants; s->capvar = capacity;
     }
-    s->var[s->nvar++] = (typeof(s->var[0])){um, im, vin, xo, fd, module};
+    s->var[s->nvar++] = (typeof(s->var[0])){um, im, vin, xo, fd, clip, module};
 }
-static VkShaderModule shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vin) {
+static VkShaderModule shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd, uint64_t vin, int clip) {
     int dual = fd >> 1 & 1; fd &= 1;
     if (dual && s->stage != 1) dual = 0;
     if (fd && (s->stage != 1 || s->depth_repl)) fd = 0;
-    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual | vin) || !s->spv) return s->mod;
+    if (!(um | im | xo | (uint32_t)fd | (uint32_t)dual | vin | (uint32_t)clip) || !s->spv) return s->mod;
     if (xo == 1u << 31) {   // DM_VK_SPV_ALT
-        pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo && s->var[i].vin == vin) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
-        VkShaderModule m = alt_module(s, vin); shader_variant_add(s, 0, 0, xo, 0, vin, m); pthread_mutex_unlock(&g_sh_mu); return m; }
+        pthread_mutex_lock(&g_sh_mu); for (int i = 0; i < s->nvar; i++) if (s->var[i].um == 0 && s->var[i].im == 0 && s->var[i].xo == xo && s->var[i].vin == vin && s->var[i].clip == clip) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
+        VkShaderModule m = alt_module(s, vin, clip); shader_variant_add(s, 0, 0, xo, 0, vin, clip, m); pthread_mutex_unlock(&g_sh_mu); return m; }
     xo &= ~(1u << 31);
     pthread_mutex_lock(&g_sh_mu);
-    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1) && s->var[i].vin == vin) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
+    for (int i = 0; i < s->nvar; i++) if (s->var[i].um == um && s->var[i].im == im && s->var[i].xo == xo && s->var[i].fd == (fd | dual << 1) && s->var[i].vin == vin && s->var[i].clip == clip) { VkShaderModule m = s->var[i].mod; pthread_mutex_unlock(&g_sh_mu); return m; }
     uint16_t bind[64]; uint8_t kind[64]; int nb = 0;
     for (int i = 0; i < s->nbind && i < 64; i++) if ((um | im) >> i & 1) { bind[nb] = s->b[i].binding; kind[nb++] = um >> i & 1 ? 1 : 2; }
     uint32_t nw = s->nspv, *w = nb ? spv_int_images(s->spv, s->nspv, bind, kind, nb, &nw) : NULL; VkShaderModule m = s->mod;
@@ -523,7 +533,7 @@ static VkShaderModule shader_module(vkshader_t *s, uint64_t um, uint64_t im, uin
             if (status < 0) {
                 free(w); m = VK_NULL_HANDLE;
                 VKLOG("[RED] shader %016llx: added vertex output defaults could not be initialized (%d)", (unsigned long long)s->key, status);
-                shader_variant_add(s, um, im, xo, fd | dual << 1, vin, m); pthread_mutex_unlock(&g_sh_mu); return m;
+                shader_variant_add(s, um, im, xo, fd | dual << 1, vin, clip, m); pthread_mutex_unlock(&g_sh_mu); return m;
             }
             if (initialized) { free(w); w = initialized; nw = initialized_words; }
         }
@@ -535,23 +545,34 @@ static VkShaderModule shader_module(vkshader_t *s, uint64_t um, uint64_t im, uin
         if (status < 0) {
             free(w); m = VK_NULL_HANDLE;
             VKLOG("[RED] shader %016llx: vertex input interface could not be retyped (%d, signature %#llx)", (unsigned long long)s->key, status, (unsigned long long)vin);
-            shader_variant_add(s, um, im, xo, fd | dual << 1, vin, m); pthread_mutex_unlock(&g_sh_mu); return m;
+            shader_variant_add(s, um, im, xo, fd | dual << 1, vin, clip, m); pthread_mutex_unlock(&g_sh_mu); return m;
         }
         if (w2) { free(w); w = w2; nw = n2; }
-        else if (!w) { shader_variant_add(s, um, im, xo, fd | dual << 1, vin, m); pthread_mutex_unlock(&g_sh_mu); return m; }
+        else if (!w && !clip) { shader_variant_add(s, um, im, xo, fd | dual << 1, vin, clip, m); pthread_mutex_unlock(&g_sh_mu); return m; }
+    }
+    if (clip) {
+        if (!w) { w = malloc((size_t)nw * 4); if (w) memcpy(w, s->spv, (size_t)nw * 4); }
+        if (!w || !shader_depth_clip(s, &w, &nw, clip)) {
+            free(w); m = VK_NULL_HANDLE; shader_variant_add(s, um, im, xo, fd | dual << 1, vin, clip, m); pthread_mutex_unlock(&g_sh_mu); return m;
+        }
     }
     if (w) { shader_nonwritable(s, &w, &nw, s->buffer_writes, s->buffer_writes_inspected);
         VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
-        if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = vin ? VK_NULL_HANDLE : s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, vertex inputs %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, (unsigned long long)vin); }
+        if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = vin || clip ? VK_NULL_HANDLE : s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, vertex inputs %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, (unsigned long long)vin); }
         else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, vertex inputs %#llx", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, (unsigned long long)vin);
         free(w); }
-    else { if (vin) m = VK_NULL_HANDLE; VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd); }
-    shader_variant_add(s, um, im, xo, fd | dual << 1, vin, m);
+    else { if (vin || clip) m = VK_NULL_HANDLE; VKLOG("[RED] shader %016llx: no variant could be made (bindings %#llx / %#llx, outputs %#x, fragment depth %d)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd); }
+    shader_variant_add(s, um, im, xo, fd | dual << 1, vin, clip, m);
     pthread_mutex_unlock(&g_sh_mu);
     return m;
 }
-VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) { return shader_module(s, um, im, xo, fd, 0); }
-VkShaderModule vk_vertex_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint64_t inputs) { return shader_module(s, um, im, xo, 0, inputs); }
+VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd) { return shader_module(s, um, im, xo, fd, 0, 0); }
+VkShaderModule vk_vertex_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint64_t inputs) { return shader_module(s, um, im, xo, 0, inputs, 0); }
+// The PPE2 key already distinguishes clip_neg1; only the module cache needs
+// this extra discriminator. EXT-capable devices use exactly the old modules.
+VkShaderModule vk_preraster_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, uint64_t inputs, int clip) {
+    return shader_module(s, um, im, xo, 0, inputs, clip && !V.has_depth_clip_ctl && (s->stage == 0 || s->stage == 2));
+}
 // static buffers: Ryujinx's support buffer (render scales 1.0, nothing else set: as nvn_mtl.m support_buf) and 64 KB of zeros (unbound uniform slots, driver segments nobody reads)
 static VkBuffer static_buf(int which) {
     static VkBuffer b[2]; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;

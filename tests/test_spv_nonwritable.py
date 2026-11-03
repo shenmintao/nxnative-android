@@ -31,7 +31,7 @@ class NonWritableStorage(unittest.TestCase):
         code = (ROOT / 'tests/native/spv_nonwritable.c').read_text(encoding='utf8')
         code = code.replace('/* SHADER TYPES */', types)
         code = code.replace('/* SHADER FUNCTIONS */', '\n'.join(function(source, f) for f in (
-            'static void shader_nonwritable(', 'vkshader_t *vk_shader(', 'static VkShaderModule alt_module(',
+            'static void shader_nonwritable(', 'vkshader_t *vk_shader(', 'static int shader_depth_clip(', 'static VkShaderModule alt_module(',
             'static void shader_variant_add(', 'static VkShaderModule shader_module(')))
         core = (android / 'gfx_vk_core.c').read_text(encoding='utf8')
         self.assertIn('V.vertex_stores = en.vertexPipelineStoresAndAtomics;', core)

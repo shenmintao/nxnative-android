@@ -3,9 +3,11 @@
 // or the right edge: a thumb reaches as far from the edge on any width) and y of the window's height down; its size is in window heights (round controls stay round)
 #pragma once
 #include <math.h>
+#include <string.h>
 #include "dm_input.h"
 enum { OV_STICK_L, OV_STICK_R, OV_BUTTON, OV_DPAD, OV_MENU };   // OV_MENU: the menu button (always shown, 70%): pauses the game and opens the settings
 typedef struct { int kind; float ax, x, y, w, h; uint64_t btn; const char *label, *name; } ov_ctl;   // ax: the anchor, as a fraction of the window's width; name: the table's
+#include "overlay_geometry.h"
 // The layouts: dm/android/overlay_default.tsv with the game profile's moves (android.tsv overlay rows), compiled by build.py into android_profile.h. Both list the
 // same controls in the same order, so a control's index means the same in either (a press keeps it across a change of layout)
 #include "android_profile.h"
@@ -37,12 +39,27 @@ static inline float ov_cscale(const ov_ctl *c) { int l, i = ov_index(c, &l); flo
 // 6.7" phone made them 7 mm against 12 on an 8.8" tablet). Positions stay where they are
 #define OV_MIN_MM 10.0f
 float dm_overlay_scale(void);
+// Metrics in the caller's raster/window coordinate system, including cutout,
+// system-bar and mandatory-gesture insets. Size percent is stored in settings.
+void dm_overlay_metrics(float W, float H, float *px_mm, float insets[4], float *percent);
+int dm_overlay_button_size(void);
 // where a control is now, in window pixels: its centre x, y and half its width and height
 static inline void ov_box(const ov_ctl *c, float W, float H, float b[4]) {   // (c: in OV_LAYOUTS, whose index finds the player's own place and size)
-    int l, i = ov_index(c, &l); float s = dm_overlay_scale(), mx, my, cs = 1;
-    if (dm_overlay_custom(l, i, &mx, &my, &cs)) { b[0] = mx * W; b[1] = my * H; }
-    else { b[0] = c->ax * W + c->x * H; b[1] = c->y * H; }
-    b[2] = c->w * H * s * cs / 2; b[3] = c->h * H * s * cs / 2;
+    int l, i = ov_index(c, &l); float mm, insets[4], percent, custom[OV_N][3];
+    dm_overlay_metrics(W, H, &mm, insets, &percent);
+    if (i < 0) { b[0] = c->ax * W + c->x * H; b[1] = c->y * H; b[2] = c->w * H * dm_overlay_scale() / 2; b[3] = c->h * H * dm_overlay_scale() / 2; return; }
+    float key[10 + OV_N * 3] = {W, H, mm, dm_overlay_scale(), percent, insets[0], insets[1], insets[2], insets[3], (float)l};
+    for (int j = 0; j < OV_N; j++) {
+        float x = 0, y = 0, s = 1; int placed = dm_overlay_custom(l, j, &x, &y, &s);
+        custom[j][0] = placed ? x : -1; custom[j][1] = placed ? y : -1; custom[j][2] = s;
+    }
+    memcpy(key + 10, custom, sizeof custom);
+    static float old[10 + OV_N * 3], boxes[OV_N][4]; static int ready;
+    if (!ready || memcmp(key, old, sizeof key)) {
+        ov_geometry(OV_LAYOUTS[l], OV_N, l, W, H, mm, key[3], percent, insets, custom, boxes);
+        memcpy(old, key, sizeof key); ready = 1;
+    }
+    if (i >= 0) memcpy(b, boxes[i], sizeof boxes[i]);
 }
 // a dragged control's centre on one axis (half: its half size, extent: the window's): kept on the screen, and with step > 0 on the nearest multiple
 // of step that keeps it there (none may fit an oversized control)
@@ -85,11 +102,11 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
 
 // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
 // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_RESUME, OVM_LAYOUT, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_RESUME, OVM_LAYOUT, OVM_TAB, OVM_SIZE, OVM_N };   // OVM_TAB: the tabs' row;
             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c)
 #define OVM_TABS 2
-#define OVM_PER_TAB 5
-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_LAYOUT}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, -1}};
+#define OVM_PER_TAB 6
+static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_SIZE, OVM_EDIT, OVM_RUMBLE, OVM_LAYOUT}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, -1, -1}};
 static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game"};
 #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
 static inline int ov_menu_item(int tab, int row) { return row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[tab & 1][row - 1] : -1; }

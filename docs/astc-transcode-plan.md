@@ -1662,7 +1662,158 @@ and no merge, push, tag or publication occurs.
 
 ## Mali compatibility findings
 
-### 2026-11-03: black-output matrix and first failing pass (current)
+### Fixes pending device verification
+
+**2026-11-03, APK4: three approved fixes implemented and verified offline.**
+No adb command or device interaction was performed. These are private build
+artifacts for a later device step, not a release or completed phone acceptance.
+RGBA32F blending06041 and RGBA16_UNORM filtering04553 remain deferred: their
+existing runtime/prototype functions and texture code are unchanged. Earlier
+phone results below remain historical evidence, including the unresolved world
+GPU task failures; this batch cannot establish their resolution.
+
+Acceptance scope: owned BotW1.9.0/v1114112+DLC shader bundle, unchanged pack and
+seed; offline production SPIR-V rewrite/validator, threaded mock AAudio,
+production overlay geometry at V2405A2800x1260/560dpi and
+TB323FU3040x1904/440dpi, complete host suite and debug/release compilation.
+No fps, audio audibility or on-device correctness result is claimed.
+
+#### Upstream checks and sources
+
+Fetched both read-only audit clones before designing the fixes. nx2android
+`34333894c5192606d1ac88b10e8e040667d556c8` still has the missing-depth-control
+TODO, callback failure flag/watchdog recovery and height-based phone sizing;
+no complete applicable implementation of these fixes was found there.
+nxnative was fetched to `07ca3efc923b22acd3eb9560fef5f981d8802de1`:
+`dm/gfx/tools/dmsh_build.py:1011-1021` already remaps GL clip depth in its Metal
+`vs_depth` entry, a semantic reference for our new SPIR-V implementation.
+`dm/ios/Sources/front_ios.m:122` uses safe-area insets, but does not solve the
+Android physical-size/overlap requirements. Adapted the statistics-mailbox
+portion of **seedds/nxnative `7ef2aaf54ad63747623ae044f2963e310a031f11`** in
+`dm/host/hle_audio.c`, so callback logging cannot block reconnect evidence.
+The larger upstream asynchronous-start lifecycle change was not ported.
+
+#### Depth clip fallback: offline acceptance passes
+
+Only `clip_neg1 && !has_depth_clip_ctl` selects the FP32 rewrite, in the last
+pre-raster stage: VS without GS, otherwise GS. Both standalone BuiltIn Position
+and gl_PerVertex Position members are handled. Every entry return in VS and
+every EmitVertex/EmitStreamVertex in GS receives `z=(z+w)*0.5`; GS restores the
+original Position after emission so later guest reads are unaffected.
+The module cache, including alternate/bundle-fallback modules, distinguishes
+the clip variant. The existing PPE2 key already includes clip_neg1; its1000B
+ABI is unchanged and is asserted by the existing pipeline tests.
+
+Transform feedback of Position moves capture to a separate output at an unused
+location, storing the original guest value before raster conversion. Other
+block captures retain their offsets. No spare location fails explicitly with
+RED/refused pipeline rather than silently changing captured data. The owned
+bundle contains **0 Position-capture shaders and0 GS**; synthetic block,
+standalone and GS capture tests validate the path and raw captured values.
+Tessellation is outside the current runtime path.
+
+For guest NDC depth d=z/w, the default Vulkan viewport after the remap gives
+`near+(far-near)*(d+1)/2`, the same depth as negativeOneToOne clip control,
+including reversed depth ranges. Clip bounds become0..w from-w..w. Viewport
+near/far and the existing depth-bias state are unchanged; post-viewport depth
+and slopes therefore retain their original meaning. No reduced-precision
+storage, depth-range adjustment or bias scaling is introduced.
+
+`devtools/validate_depth_bundle.py` runs the production base-module cleaning
+and Mali NonWritable path, then the new rewrite and unrelaxed `spirv-val
+--target-env vulkan1.3` (the runtime's requested API). Of **19,592** shaders
+(VS8,931/FS10,560/compute101), **8,931 patched modules pass,0 failures**.
+The disabled gate leaves19,592/19,592 module byte streams identical; capable
+devices retain the old module selection and transformation path. The known
+final-composite VS `e4b5b0967a3cd0b3` passes; independent execution of the
+unit fixture proves z=-1,w=1 becomes z=0. Multiple-return, GS emission/restore,
+XFB, feature gate, module reuse and alternate-module tests pass.
+Bundle SHA-256 remains
+`716c5c607971df8a7f19d23b8e8984ef7e98b2c3dd8d98ef6800e0f7406db1f0`.
+
+#### AAudio reconnect: offline acceptance passes
+
+The error callback publishes atomics and wakes a per-unit worker; a20ms state
+poll also detects a disconnected/closed/stopped stream without an error
+callback. Only that control thread stops/closes/reopens during recovery.
+Control operations serialize with stop/dispose; disposal joins the worker and
+quiesces old callbacks before freeing userdata. Ordinary pause/resume retains
+a healthy mixer track. The existing host watchdog remains a fallback.
+Reopen starts immediately, with failed/early-disconnected attempts backing off
+25,50,100ms up to1000ms. Success is counted after the new stream supplies data,
+not merely after requestStart.
+
+Successful reconnects log WARN with disconnect/recovery/quick counters. Failed
+recovery or a callback gap over **100ms** logs RED. This threshold is20 requested
+5ms callback quanta and half the200ms host watchdog: a conservative error budget
+to flag substantial interruption while allowing a prompt reopen. The measured
+last-to-first callback interval is an upper-bound proxy for a missing-callback
+gap, **not a claim of inaudibility**; actual audible gaps require device testing.
+This follows [Android's AAudio disconnect guidance](https://developer.android.com/ndk/guides/audio/aaudio/aaudio)
+and [Oboe's disconnect note](https://github.com/google/oboe/wiki/TechNote_Disconnect)
+to close/reopen outside callbacks.
+
+Tests run the real adapter against a threaded simulated AAudio: error callback,
+state-only disconnect, repeated recovery, failed opens/backoff, re-disconnect
+before first data,150ms RED, hold/resume and disposal during retry. Mock stream
+APIs assert they never run on a callback; all streams close, with no deadlock.
+The upstream-derived stats mailbox is also tested with a blocked logger:
+callback publication continues and8000 callback counts are conserved.
+
+#### Phone overlay: offline acceptance passes
+
+Phone default dimensions are10mm face buttons,18mm left stick,16mm right
+stick/D-pad,8mm small buttons/menu height and6.5mm shoulder height, using
+Android density converted to the caller's raster. Rounded control footprints
+are separated by1.5mm, inside a2mm margin beyond reported system insets/cutout.
+Existing anchors/custom positions seed a cached spacing resolver; drawing,
+sprites and touch resolution share its boxes. Gamepad / Button size persists
+80-120% (100% default). Insets are updated after layout/rotation through a
+recompiled Java/JNI bridge, without changing game resolution.
+
+Tests cover both cutout sides, top/bottom insets and a smaller phone, each at
+80/90/100/110/120%; no footprint overlaps or inset violations. At the target
+phone size the preview's minimum gap is33.075516px (1.5002mm). Default TB323FU
+boxes compare byte-for-byte with the old formula; themed sprite scaling keeps
+the old operation order. Tablet before/after preview PNGs are also identical
+(minimum existing clearance15.016148px). Tablet retains its legacy spacing.
+These are offline geometric previews, not device screenshots or game renders:
+
+- `BENCH/astc-offline-fixes4/previews/phone.png`
+- `BENCH/astc-offline-fixes4/previews/tablet.png`
+- `BENCH/astc-offline-fixes4/previews/tablet-before.png`
+
+#### Builds, records and device checks
+
+Private records are under `BENCH/astc-offline-fixes4/`: full suite logs,
+`depth-bundle-final/results.json` with every shader row, `previews/previews.json`,
+source hashes, build commands/logs, signature/JNI/DEX audit and `results.json`.
+Environment-only failed attempts are retained: incorrect dependency directories
+(11 import errors), then an unintended MSYS Python3.13 interpreter instead of
+the pinned Python3.12 dependencies (10 import errors). The corrected full run
+after bridge rebuild passes **189 tests,0 skips,113.327s** (114.109s wall).
+Debug and release each compile157
+native sources with0 failures. Java bridge rebuild uses JDK21/SDK36/D8; only
+Java8/deprecation warnings. All APKs verify their signatures, contain the new
+bridge and matching native libraries; only validation4 includes the layer.
+The preliminary old-bridge APK hashes are superseded by these final artifacts:
+
+| APK (under BENCH) | SHA-256 |
+|---|---|
+| astc-sidecar-debug4.apk | `035ab3f95ec7913c8e54b90871937e006e073b11f05a1f16d098ce87bf655bc4` |
+| astc-sidecar-validation4.apk | `b4501e13c207df3ea56ae73b7ff77decb38229b6b616b81dd0805758bf21f25f` |
+| astc-sidecar-release4.apk | `e046c7a925757518793ed685fc152bcf3f7894ae1c5aa5084727e348aeb9a3ea` |
+
+Later device verification must check title/load/world internal captures,
+Mali GPU errors and GL-depth correctness, plus Adreno depth/bias/range
+regression; actual audio disconnect/reconnect latency, repeated route changes,
+audibility and watchdog interaction; and phone cutout/gesture/rotation, themed
+touch hit areas, size-setting persistence and unchanged default tablet layout.
+06041/04553 still require the separately deferred work; complete phone
+validation/performance acceptance and any publication decision remain pending.
+No phone state or the user's600000ms timeout was changed or freshly verified.
+
+### 2026-11-03: black-output matrix and first failing pass (pre-APK4 evidence)
 
 **Confirmed first blocker: missing GL depth-convention conversion on devices
 without `VK_EXT_depth_clip_control`. This is not a complete-game fix.** A private,

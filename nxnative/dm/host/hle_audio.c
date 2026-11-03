@@ -13,6 +13,7 @@
 enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
 enum { BK_NONE, BK_AU, BK_NULL };   // what is consuming an output's queue right now (aout.backend)
 
+typedef struct { uint64_t calls, count, qsum, underruns, zero_bytes; uint32_t fmin, fmax; } audio_stats;
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;     // The first 24 bytes written into the guest AudioOutBuffer
 #define QMAX 64
 #define RELMAX QMAX                    // Released max = number of in-flight buffers (the game must take a buffer back before it can append again), same limit as pending
@@ -37,7 +38,8 @@ typedef struct {
     _Atomic uint64_t under_n, under_b; // underruns: times the pending queue was empty when the callback needed data / zero-filled bytes
     _Atomic uint64_t under_quiet;      // of those, the ones before the game's first non-zero sample: the device started before the game had anything to say, nothing was cut off
     int heard;                         // a non-zero sample has been played (read and written only by the consumer)
-    uint64_t st_calls, st_qsum, st_u0, st_ub0; uint32_t st_fmin, st_fmax;   // sound card callback statistics (read and written only on the callback thread)
+    uint64_t st_calls, st_count, st_qsum, st_u0, st_ub0; uint32_t st_fmin, st_fmax;   // sound card callback statistics (read and written only on the callback thread)
+    audio_stats st_report; _Atomic int st_pending; // snapshot mailbox, callback publishes; watchdog/Close consumes
     _Atomic uint64_t cb_n;             // device callbacks of this output (the watchdog's evidence that the device still plays it)
     uint64_t wd_n, wd_t;               // watchdog: callback count last seen and when it last moved (under g_aos_lock)
     int stalled, retry_ms; uint64_t retry_at;   // the device stopped calling back (or would not start): the silent sink stands in and the watchdog retries the AudioUnit at retry_at, backing off
@@ -154,18 +156,25 @@ static void pull_device(aout *a, uint8_t *dst, uint64_t bytes) {
 
 static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
 uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
+// From seedds/nxnative 7ef2aaf: callbacks never wait for a stdio log lock.
+static void stats_publish(aout *a, uint32_t frames) {
+        // At each 2000-callback checkpoint publish a snapshot for the watchdog: LOG takes a stdio lock and must never run here or in the release-event notifier.
+        // A busy logger leaves its mailbox full; keep accumulating then, rather than waiting, overwriting its snapshot or losing counts.
+        uint32_t qd = atomic_load(&a->q_tail) - atomic_load(&a->q_head);
+        if (!a->st_calls || frames < a->st_fmin) a->st_fmin = frames; if (frames > a->st_fmax) a->st_fmax = frames; a->st_qsum += qd;
+        a->st_count++;
+        if (++a->st_calls % 2000 == 0 && !atomic_load_explicit(&a->st_pending, memory_order_acquire)) {
+            uint64_t un = atomic_load(&a->under_n), ubb = atomic_load(&a->under_b);
+            a->st_report = (audio_stats){a->st_calls, a->st_count, a->st_qsum, un - a->st_u0, ubb - a->st_ub0, a->st_fmin, a->st_fmax};
+            atomic_store_explicit(&a->st_pending, 1, memory_order_release);
+            a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = a->st_count = 0; a->st_u0 = un; a->st_ub0 = ubb;
+        }
+}
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
     (void)f; (void)ts; (void)bus; (void)frames;
     aout *a = ctx;
     atomic_fetch_add_explicit(&g_render_calls, 1, memory_order_relaxed); atomic_fetch_add_explicit(&a->cb_n, 1, memory_order_relaxed);
-    {
-        // Every 2000 callbacks of each output, log one line: frames requested per call, pending blocks at callback start, underruns (check this line on a new device; docs/agents/03-bringup.md "Crackling on iOS only").
-        // Kept per output: with two outputs open, combined numbers mislead (one fully fed and one fed by nobody look like "every other callback underruns")
-        uint32_t qd = atomic_load(&a->q_tail) - atomic_load(&a->q_head);
-        if (!a->st_calls || frames < a->st_fmin) a->st_fmin = frames; if (frames > a->st_fmax) a->st_fmax = frames; a->st_qsum += qd;
-        if (++a->st_calls % 2000 == 0) { uint64_t un = atomic_load(&a->under_n), ubb = atomic_load(&a->under_b);
-            LOG("audio #%d device callbacks %llu: %u–%u frames each, %.1f blocks queued on average at callback; in these 2000, %llu underruns, %.1f ms zero-padded%s", a->id, (unsigned long long)a->st_calls, a->st_fmin, a->st_fmax, a->st_qsum / 2000.0,
-                (unsigned long long)(un - a->st_u0), (ubb - a->st_ub0) / (2.0 * a->ch) / (RATE / 1000.0), un != a->st_u0 && atomic_load(&a->under_quiet) == un ? " (all before the game's first sound: silence, not a gap)" : ""); a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = 0; a->st_u0 = un; a->st_ub0 = ubb; } }
+    stats_publish(a, frames);
     if (a->backend != BK_AU || !pull_begin(a)) { memset(bl->mBuffers[0].mData, 0, bl->mBuffers[0].mDataByteSize); return noErr; }   // a late callback (see pull_begin)
     pull_device(a, bl->mBuffers[0].mData, bl->mBuffers[0].mDataByteSize);
     pull_end(a);
@@ -250,6 +259,27 @@ static void au_go(aout *a, uint64_t now) {
 // The time is read under g_aos_lock: au_go stamps wd_t under it too, and a watchdog time read before the lock was older than the stamp of an AudioUnit the return from the background had just
 // started (DRAGON QUEST VII Reimagined on an iPhone: "has not called back for 18446744073662 ms", a restart of a running AudioUnit)
 enum { WD_TICK_MS = 50, WD_STALL_MS = 200 };
+typedef struct { audio_stats stats; int id, ch; } audio_report;
+// Both consumers hold g_aos_lock. A local copy owns every log argument, so a slow log cannot hold up registry changes or retain a closed output.
+static int stats_take(aout *a, audio_report *r) {
+    if (!atomic_load_explicit(&a->st_pending, memory_order_acquire)) return 0;
+    *r = (audio_report){a->st_report, a->id, a->ch};
+    atomic_store_explicit(&a->st_pending, 0, memory_order_release);
+    return 1;
+}
+static void stats_log(const audio_report *r) {
+    const audio_stats *s = &r->stats;
+    LOG("audio #%d device callbacks %llu: %u–%u frames each, %.1f blocks queued on average at callback; in these %llu, %llu underruns, %.1f ms zero-padded", r->id,
+        (unsigned long long)s->calls, s->fmin, s->fmax, (double)s->qsum / s->count, (unsigned long long)s->count,
+        (unsigned long long)s->underruns, s->zero_bytes / (2.0 * r->ch) / (RATE / 1000.0));
+}
+static void stats_drain(void) {
+    audio_report reports[AOMAX]; int n = 0;
+    pthread_mutex_lock(&g_aos_lock);
+    for (int i = 0; i < AOMAX; i++) if (g_aos[i] && stats_take(g_aos[i], &reports[n])) n++;
+    pthread_mutex_unlock(&g_aos_lock);
+    for (int i = 0; i < n; i++) stats_log(&reports[i]);
+}
 static void *au_watchdog(void *p) {
     (void)p; uint64_t last = now_ns();
     for (;;) {
@@ -273,6 +303,7 @@ static void *au_watchdog(void *p) {
             }
         }
         pthread_mutex_unlock(&g_aos_lock);
+        stats_drain();
     }
     return NULL;
 }
@@ -352,8 +383,10 @@ static void au_close(void *g, void *lr) {
     dispatch_semaphore_signal(a->notify_sem);
     pthread_join(a->notify_th, NULL);
     pthread_mutex_lock(&g_aos_lock);
+    audio_report report; int pending = stats_take(a, &report);
     for (int i = 0; i < AOMAX; i++) if (g_aos[i] == a) g_aos[i] = NULL;
     pthread_mutex_unlock(&g_aos_lock);
+    if (pending) stats_log(&report);
     if (a->au) { AudioUnitUninitialize(a->au); AudioComponentInstanceDispose(a->au); }
     while (atomic_load_explicit(&a->pulling, memory_order_acquire)) sched_yield();   // a late device callback still in pull() (pull_begin)
     dispatch_release(a->notify_sem);

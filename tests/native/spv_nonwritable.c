@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 #include "spv_buffer_writes.h"
 #include "spv_nonwritable.h"
+#include "spv_depth_clip.h"
 /* SHADER TYPES */
 static struct { int vertex_stores, has_xfb, descriptor_buffer; VkDevice dev; VkPhysicalDeviceProperties props; } V;
 static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -100,11 +101,11 @@ int main(int argc,char **argv) {
         assert(decorated(captured,captured_n,10)==(unsigned)patch&&!decorated(captured,captured_n,20));assert(reds==(unsigned)patch);
         if(!patch)assert(captured_n==count&&!memcmp(captured,words,count*4));
         // Actual shader_module path creates and caches variants from the retained base.
-        unsigned created=modules;VkShaderModule m=shader_module(s,1,0,0,0,0);assert(m&&m!=s->mod&&modules==created+1);
+        unsigned created=modules;VkShaderModule m=shader_module(s,1,0,0,0,0,0);assert(m&&m!=s->mod&&modules==created+1);
         assert(decorated(captured,captured_n,10)==(unsigned)patch&&!decorated(captured,captured_n,20));
-        assert(shader_module(s,1,0,0,0,0)==m&&modules==created+1&&reds==(unsigned)patch);
-        shader_module(s,0,0,1,0,0);assert(decorated(captured,captured_n,10)==(unsigned)patch);
-        shader_module(s,0,0,0,0,1);assert(decorated(captured,captured_n,10)==(unsigned)patch);
+        assert(shader_module(s,1,0,0,0,0,0)==m&&modules==created+1&&reds==(unsigned)patch);
+        shader_module(s,0,0,1,0,0,0);assert(decorated(captured,captured_n,10)==(unsigned)patch);
+        shader_module(s,0,0,0,0,1,0);assert(decorated(captured,captured_n,10)==(unsigned)patch);
         free_shader(s);
     }
     // The alternate file may write a buffer that the base only reads. It is
@@ -117,8 +118,8 @@ int main(int argc,char **argv) {
 #else
     setenv("DM_VK_SPV_DIR",argv[1],1);
 #endif
-    shader_module(s,0,0,1u<<31,0,0);assert(decorated(captured,captured_n,10)==1&&!decorated(captured,captured_n,20)&&reds==1);
-    alt_module(s,0);assert(reds==1);remove(path);free_shader(s);
+    shader_module(s,0,0,1u<<31,0,0,0);assert(decorated(captured,captured_n,10)==1&&!decorated(captured,captured_n,20)&&reds==1);
+    alt_module(s,0,0);assert(reds==1);remove(path);free_shader(s);
     // Unknown roots force the existing conservative mask; nothing is asserted read-only.
     init(1,0);OP(55,4,81);OP(62,81,71);assert(vk_spv_buffer_writes(words,count,bindings,storage,3,written)==2);
     assert(vk_spv_nonwritable(words,count,0,0,bindings,storage,written,3,&out,&n)==0&&!out);
