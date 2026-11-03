@@ -1826,6 +1826,15 @@ after both helpers stop. The18:32:46 settled check confirms exact release3,
 app stopped, screen OFF and user's600000ms timeout. No measured disconnect,
 account/system-setting change, merge, push, tag or publication occurs.
 
+After the completed safe end and commit, an optional read-only recheck at
+18:39:09 confirms the app stopped, then loses the same serial during the power
+query. The device does not reappear within the approved600s wait. This is a
+post-cleanup transport loss: no measurement or data transfer is active and no
+run is invalidated. The last complete observed end remains18:32:46 release3,
+seed/data retained, app stopped/OFF/600000ms; the state after disconnect cannot be
+re-observed. All retry/absence/failure timestamps and retained bytes are appended
+to the same BENCH JSON and transport log. No further device action follows.
+
 **Next:** implement and test a device-gated, semantics-preserving FP32 GL depth
 fallback for every relevant final pre-rasterization stage/variant, including
 geometry/tessellation emission and transform-feedback implications, then
