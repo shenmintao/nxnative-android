@@ -4,6 +4,7 @@
 // geometry 2, tessellation 3 / 4; compute 0) by rewriting the DescriptorSet decorations, so a program's stages never collide.
 #include "gfx_vk.h"
 #include "spv_buffer_writes.h"
+#include "spv_nonwritable.h"
 #include "spv_sampler_use.h"
 #include "spv_unused_distances.h"
 #include "spv_vertex_inputs.h"
@@ -226,6 +227,27 @@ static VkDescriptorSetLayout shader_layout(const VkDescriptorSetLayoutBinding *b
     }
     return layout;
 }
+// NonWritable is a declaration of proven read-only access, not a workaround
+// for a real write. Mali exposes VUID-RuntimeSpirv-NonWritable-06341 without
+// vertexPipelineStoresAndAtomics. Retain the patched base for every variant;
+// alternate debug modules must be inspected independently of the base.
+static void shader_nonwritable(vkshader_t *s, uint32_t **w, uint32_t *nw, const uint8_t *written, int inspected) {
+    if (V.vertex_stores || !(s->stage == 0 || (s->stage >= 2 && s->stage <= 4))) return;
+    uint16_t bindings[96]; uint8_t pool[96], storage[96], alternate[96];
+    size_t n = s->nbind <= 0 ? 0 : s->nbind < 96 ? (size_t)s->nbind : 96;
+    if (!n) return;
+    for (size_t i = 0; i < n; i++) { bindings[i] = s->b[i].binding; storage[i] = s->b[i].desc == RD_SSBO; pool[i] = storage[i] || s->b[i].desc == RD_STORAGE_TBUF; }
+    if (!written) { inspected = vk_spv_buffer_writes(*w, *nw, bindings, pool, n, alternate); written = alternate; }
+    if (inspected != 1) return; // unknown provenance never proves read-only access
+    for (size_t i = 0; i < n; i++) if (storage[i] && written[i] && !s->storage_write_reported) {
+        s->storage_write_reported = 1;
+        VKLOG("[RED] shader %016llx (stage %d) writes storage buffer binding %u without vertexPipelineStoresAndAtomics: retaining its writes", (unsigned long long)s->key, s->stage, bindings[i]);
+    }
+    uint32_t *patched = NULL, count = *nw;
+    int status = vk_spv_nonwritable(*w, *nw, V.vertex_stores, s->stage, bindings, storage, written, n, &patched, &count);
+    if (status < 0) VKLOG("[RED] shader %016llx: read-only storage buffers could not be decorated NonWritable", (unsigned long long)s->key);
+    if (patched) { free(*w); *w = patched; *nw = count; }
+}
 vkshader_t *vk_shader(uint64_t key, int stage) {
     bundle_auto();
     struct { uint64_t key; uint64_t stage; } hk = {key, (uint64_t)stage};
@@ -254,6 +276,7 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
     { uint16_t bindings[96]; uint8_t pool[96]; size_t n = s->nbind <= 0 ? 0 : s->nbind < 96 ? (size_t)s->nbind : 96;
       for (size_t i = 0; i < n; i++) { bindings[i] = s->b[i].binding; pool[i] = s->b[i].desc == RD_SSBO || s->b[i].desc == RD_STORAGE_TBUF; }
       int inspected = vk_spv_buffer_writes(w, nw, bindings, pool, n, s->buffer_writes);
+      s->buffer_writes_inspected = inspected;
       if (!inspected) VKLOG("[RED] buffer writes of shader %016llx could not be inspected: all pool bindings are writable", (unsigned long long)key);
       else if (inspected == 2) VKLOG("buffer writes of shader %016llx have unresolved pointer roots: all pool bindings are writable", (unsigned long long)key);
       int sampled = vk_spv_sampler_use(w, nw, bindings, n, s->sample_use);
@@ -294,6 +317,7 @@ vkshader_t *vk_shader(uint64_t key, int stage) {
         }
     }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
+    shader_nonwritable(s, &w, &nw, s->buffer_writes, s->buffer_writes_inspected);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
     vk_spv_uniform_extents(w, nw, s->ub_extent, 96);
@@ -443,6 +467,7 @@ static VkShaderModule alt_module(vkshader_t *s, uint64_t vin) {
     if (vin) { uint32_t *w2 = NULL; int status = vk_spv_vertex_inputs(w, nw, vin, &w2, &nw);
         if (status < 0) { free(w); VKLOG("[RED] shader %016llx: unsupported alternate vertex input interface (%d)", (unsigned long long)s->key, status); return VK_NULL_HANDLE; }
         if (w2) { free(w); w = w2; } }
+    shader_nonwritable(s, &w, &nw, NULL, 0);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) m = vin ? VK_NULL_HANDLE : s->mod;
     else VKLOG("shader %016llx: alternative code%s%s, vertex inputs %#llx", (unsigned long long)s->key, alternative ? " from " : " fallback to bundle", alternative ? path : "", (unsigned long long)vin);
@@ -515,7 +540,8 @@ static VkShaderModule shader_module(vkshader_t *s, uint64_t um, uint64_t im, uin
         if (w2) { free(w); w = w2; nw = n2; }
         else if (!w) { shader_variant_add(s, um, im, xo, fd | dual << 1, vin, m); pthread_mutex_unlock(&g_sh_mu); return m; }
     }
-    if (w) { VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
+    if (w) { shader_nonwritable(s, &w, &nw, s->buffer_writes, s->buffer_writes_inspected);
+        VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m)) { m = vin ? VK_NULL_HANDLE : s->mod; VKLOG("[RED] shader %016llx: its variant was refused (bindings %#llx / %#llx, outputs %#x, fragment depth %d, vertex inputs %#llx)", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, (unsigned long long)vin); }
         else VKLOG("shader %016llx: variant for bindings %#llx (uint texels) %#llx (int texels), outputs added %#x, fragment depth written %d, vertex inputs %#llx", (unsigned long long)s->key, (unsigned long long)um, (unsigned long long)im, xo, fd, (unsigned long long)vin);
         free(w); }

@@ -1273,3 +1273,60 @@ data, setup UI screenshot and final state proof. Publication remains blocked
 by VUID06341 and the unexecuted acceptance tests. A separately scoped
 correctness investigation/fix and new validated APK are needed before testing
 can continue. No merge, push, tag, version bump or publication is performed.
+
+## Step3 continuation: Mali NonWritable correctness fix (2026-11-03)
+
+The supervisor authorizes this general Vulkan compatibility fix and a fresh V
+run with APK3. Earlier failed attempts above remain historical evidence. The
+complete generated pack and sidecar are reused without regeneration or transfer.
+
+`gfx_vk_core.c` copies the queried core features into the enabled feature set,
+disabling robustness and Float64. It therefore enables
+`vertexPipelineStoresAndAtomics` only when available. That enabled value is now
+recorded explicitly. The translator's `DEC_NONWRITABLE` was unused. Targeted
+searches after fetching nx2android34333894 and nxnative d145b956 found no related
+fix to port. Khronos requires read-only storage declarations when the feature
+is absent; the [SPIR-V decoration specification](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html)
+permits NonWritable on the storage-buffer variable, for both StorageBuffer/Block
+and Uniform/BufferBlock representations. See also the
+[core feature definition](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceFeatures.html).
+
+The runtime now inserts variable NonWritable annotations before types only for
+vertex, geometry and tessellation SSBO bindings proven unwritten by the existing
+instruction analysis. Unknown or unreflected bindings receive no assertion.
+Real storage writes remain intact and produce one RED naming the shader. The
+retained base and `shader_module` variants follow this rule; alternate debug
+SPIR-V is analysed independently. Fragment, compute and devices enabling the
+feature retain their original modules.
+
+Offline census of the unchanged owned bundle (SHA716c5c60):
+
+| Item | Count |
+|---|---:|
+| All shaders | 19,592 |
+| Vertex / fragment / compute | 8,931 / 10,560 / 101 |
+| Vertex SSBO shaders requiring NonWritable | 2 |
+| Variable annotations inserted | 2 |
+| Actual SSBO-writing shaders in affected stages | 0 |
+| Unresolved / malformed / reflection overflow / patch failure | 0 / 0 / 0 / 0 |
+| Feature-enabled modules byte-identical | 19,592 / 19,592 |
+
+Native tests execute the actual base, variant and alternate module paths with
+mock Vulkan creation, verify executable-byte preservation, unwritten-only
+annotations, feature/stage gates, per-shader RED de-duplication and release
+compilation. Independent spirv-val validates generated Vulkan1.0 BufferBlock
+and1.1 StorageBuffer cases. Full source suite: **182 PASS,0 skipped,193.009s**.
+Debug and release each compile157 sources with0 failures.
+
+| APK3 | SHA-256 |
+|---|---|
+| debug | `3f02bf73a09ce4d291512ffe1d9c486648951bb1f5c783e1ad5bfc0f21bd42cb` |
+| validation | `d98ee06004fa759d82f7edc6e42b1ad68448b8cb3f16c2a80f4d92678eac2f03` |
+| release | `e85e77ce04aedb012b5e536fec30ed50542d0694e6bea56e66213aebb41234c1` |
+
+Private build commands/library/input hashes and licenses are recorded in
+`BENCH/astc-sidecar-build3.json`; the production notices remain packaged.
+The census and this continuation's evidence live in
+`BENCH/astc-phone-validation/session-20261103-step3-nonwritable/`.
+Host correctness checks alone do not establish phone acceptance; installed-data
+hash audit and the restarted V/remaining protocol are recorded below when run.

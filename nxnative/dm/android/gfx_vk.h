@@ -54,6 +54,7 @@ typedef struct {
     VkPipelineCache pcache;
     int has_bc, has_astc, has_astc_decode, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_format_list, has_timeline;
     int has_depth_range_unrestricted;
+    int vertex_stores;                  // enabled vertexPipelineStoresAndAtomics, not just advertised support
     float max_aniso;
     int descriptor_buffer;
     VkPhysicalDeviceDescriptorBufferPropertiesEXT dbprops;
@@ -197,6 +198,7 @@ typedef struct {
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet
     uint8_t buffer_writes[96];          // actual SPIR-V stores/atomics into pool-backed descriptor bindings
+    int buffer_writes_inspected, storage_write_reported;
     uint8_t sample_use[96];             // actual ordinary/comparison sampling instructions, or unknown
     VkDeviceSize db_size, db_offsets[96]; // native descriptor byte layout, when descriptor_buffer is enabled
 } vkshader_t;
