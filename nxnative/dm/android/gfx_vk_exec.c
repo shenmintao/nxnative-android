@@ -963,6 +963,39 @@ typedef struct {
     uint64_t um[3], im[3];   // each stage's sampled bindings given integer views (vk_shader_module)
     uint64_t vin;           // actual vertex fetch classes, three bits per NVN attribute location
 } pkey;
+#include "fp32_blend_probe.h"
+#ifndef DM_RELEASE
+static inline uint64_t fnv(uint64_t h, const void *p, size_t n);
+static void fp32_probe_pipeline(const pkey *k, VkPipelineColorBlendAttachmentState *blend) {
+    if (!vk_fp32_probe_mode()) return;
+    uint64_t id = fnv(1469598103934665603ull, k, sizeof *k);
+    for (uint32_t i = 0; i < k->ncol; i++) if (blend[i].blendEnable && k->cfmt[i]) {
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, (VkFormat)k->cfmt[i], &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) {
+            VKLOG("fp32 probe pipeline: id=%016llx vs=%016llx fs=%016llx attachment=%u format=%u mrt=%u depth=%u samples=%u rgb=%u/%u/%u alpha=%u/%u/%u mask=%#x mode=%d",
+                (unsigned long long)id, (unsigned long long)k->key[0], (unsigned long long)k->key[1], i, k->cfmt[i], k->ncol, k->dfmt, k->samples,
+                blend[i].srcColorBlendFactor, blend[i].dstColorBlendFactor, blend[i].colorBlendOp,
+                blend[i].srcAlphaBlendFactor, blend[i].dstAlphaBlendFactor, blend[i].alphaBlendOp, blend[i].colorWriteMask, vk_fp32_probe_mode());
+            for (uint32_t j = 0; j < k->ncol; j++) VKLOG("fp32 probe mrt: id=%016llx attachment=%u format=%u enabled=%u mask=%#x raw_rgb=%u/%u/%u raw_alpha=%u/%u/%u",
+                (unsigned long long)id, j, k->cfmt[j], (k->blend_en >> j) & 1, k->wmask[j], k->bl[j].src, k->bl[j].dst, k->bl[j].eq, k->bl[j].srca, k->bl[j].dsta, k->bl[j].eqa);
+            if (vk_fp32_probe_mode() == 3) blend[i].blendEnable = VK_FALSE;
+        }
+    }
+}
+static void fp32_probe_draw(const pkey *k) {
+    if (!vk_fp32_probe_mode()) return;
+    static uint64_t frame = UINT64_MAX; static unsigned count;
+    if (frame != g_tex_frame) { frame = g_tex_frame; count = 0; }
+    for (uint32_t i = 0; i < k->ncol; i++) if ((k->blend_en >> i & 1) &&
+        (k->cfmt[i] == VK_FORMAT_R32_SFLOAT || k->cfmt[i] == VK_FORMAT_R32G32_SFLOAT || k->cfmt[i] == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+        vkimg_t *im = P_att[i].im;
+        if (count++ < 32) VKLOG("fp32 probe draw: present=%llu pass=%d id=%016llx vs=%016llx fs=%016llx attachment=%u format=%u pass_size=%ux%u image=%ux%u usage=%#x nvn=%#x pool=%llx off=%llx flags=%#x draw=%u",
+            (unsigned long long)frame, g_sub_pass - 1, (unsigned long long)fnv(1469598103934665603ull, k, sizeof *k),
+            (unsigned long long)k->key[0], (unsigned long long)k->key[1], i, k->cfmt[i], S.pass_w, S.pass_h, im ? im->w : 0, im ? im->h : 0,
+            im ? im->usage : 0, im ? im->nvn_format : 0, im ? (unsigned long long)im->pool : 0, im ? (unsigned long long)im->off : 0, im ? im->flags : 0, g_pass_draws);
+    }
+}
+#endif
 static int pipeline_predict_rest(const pkey *current, int budget);
 static nvn_hmap g_pipes = {.klen = sizeof(pkey)}; static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER;   // the replay thread and the prewarm threads
 static nvn_hmap g_cpipes = {.klen = 24};   // {compute shader, unsigned / signed integer-texel bindings}; also under g_pipe_mu
@@ -1204,6 +1237,9 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkPipelineColorBlendAttachmentState cba[8];
     for (uint32_t i = 0; i < k->ncol; i++) cba[i] = (VkPipelineColorBlendAttachmentState){(k->blend_en >> i) & 1, bfac(k->bl[i].src), bfac(k->bl[i].dst), bop(k->bl[i].eq),
         bfac(k->bl[i].srca), bfac(k->bl[i].dsta), bop(k->bl[i].eqa), k->wmask[i]};
+#ifndef DM_RELEASE
+    fp32_probe_pipeline(k, cba);
+#endif
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ncol, cba, {0, 0, 0, 0}};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                             VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_LINE_WIDTH};
@@ -1783,6 +1819,9 @@ rebind_views:;
         for (uint32_t i = 0; i < k.nbind; i++) VKLOG("  binding %u stride %u rate %u divisor %u", k.bind[i].binding, k.bind[i].stride, k.bind[i].rate, k.bind[i].divisor);
     }
     crumb_draw(k.key[0], k.key[1], k.key[2]);
+#ifndef DM_RELEASE
+    fp32_probe_draw(&k);
+#endif
     VkPipeline p = graphics_pipeline(&k, layout);
     uint64_t t1 = tick(); g_vkst.ns_pipe += t1 - t0 - tdesc;
     if (!p) { g_vkst.skip_pipe++; return 0; }

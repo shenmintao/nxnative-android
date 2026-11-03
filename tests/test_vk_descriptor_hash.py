@@ -24,7 +24,7 @@ class DescriptorHash(unittest.TestCase):
         if not headers:
             self.skipTest('NDK Vulkan headers are required')
         src = SOURCE.read_text(encoding='utf-8')
-        helper = src[src.index('static inline uint64_t fnv('):src.index('static void drv_shared(')]
+        helper = src[src.index('static inline uint64_t fnv(uint64_t h, const void *p, size_t n) {'):src.index('static void drv_shared(')]
         harness = r'''
 #include <assert.h>
 #include <stdint.h>

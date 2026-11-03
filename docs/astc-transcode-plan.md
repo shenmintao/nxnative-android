@@ -1502,3 +1502,160 @@ build and182-test result; no rebuild or production export change occurs.
 Publication is blocked by VUID06041 and the unexecuted acceptance. Next is
 supervisor review/correctness work on the unsupported blend format, followed by
 a supervised continuation. No merge, push, tag or publication occurs.
+
+## FP32 blend investigation: partial evidence, no selected fix (2026-11-03)
+
+The user chooses investigation before a fix and permits debug-only env-gated
+prototypes. **No runtime default or production artifact is changed.** The user
+also confirms personally choosing screen timeout600000ms; retain it. This
+confirmation supersedes the earlier unknown attribution without rewriting
+that historical observation. Related upstream searches after fetching
+nx2android34333894 and nxnative fa681f94 find no existing format-blend fix.
+
+### Pipeline identification
+
+The debug probe logs full pipeline-key hashes, VS/FS keys, every MRT format,
+blend factors/equations/masks and, on an actual matching draw, present/pass,
+dimensions, image usage, NVN format/flags and storage identity. It is compiled
+out of release and inactive without `DM_VK_X_FP32_BLEND=log` or `=C`.
+
+The original1209-key PPE2 cache (1000B keys, SHAd6b47da4) contains **3 affected
+pipelines /4 attachment states**. Exact production-hash matches prove all
+three observed invalid creations are cached prewarm keys. This is more
+specific than assuming an observed creation names a current render target.
+
+| Pipeline hash | VS | FS | MRT / blend state |
+|---|---|---|---|
+| `4d97fe7b0d8ee31e` | `b2c0cfbcd9722ace` | `58606cb67cb94e6d` | one RGBA32F: RGB SrcAlpha/One/Add; alpha Zero/OneMinusSrcAlpha/Add |
+| `8c998753f3c99d14` | `b2c0cfbcd9722ace` | `f84705cb4c5a46b8` | same one-target state |
+| `24621523461e6567` | `590001dbe0f4877a` | `2a6b54a6274c39c5` | two RGBA32F: RGB and alpha One/One/Add on both |
+
+All have samples1, depth format undefined and RGBA write masks. The first two
+compute `RGB=S.rgb*S.a+D.rgb`, `alpha=D.a*(1-S.a)`; the third adds source and
+destination. These are pipeline-state equations, not an identified game effect.
+**Zero corresponding actual draw attempts are observed before the loading
+stop.** Physical target size, usage, pass ordinal/name, scene effect and draws
+per gameplay frame remain unknown. The cache lacks image dimensions/usage;
+no target is invented from its format. No R32F/RG32F blended pipeline occurs in
+these1209 inputs or the observed startup; this is not a whole-game census.
+
+### Phone format and extension properties
+
+Optimal-tiling features from the saved phone report:
+
+| Format | Color attachment | Blend | Linear sample filter |
+|---|---|---|---|
+| R16F / RG16F / RGBA16F | yes | yes | yes |
+| R32F / RG32F / RGBA32F | yes | no | yes |
+| RGB32F | no | no | yes |
+| RGBA16_UNORM | yes | yes | **no** |
+
+Other supported color attachments lacking blend are R8/RG8/RGBA8 UINT/SINT,
+A8B8G8R8 UINT/SINT, A2B10G10R10 UINT, R16/RG16/RGBA16 UINT/SINT, RGB16 SINT,
+R32/RG32/RGBA32 UINT/SINT; R8/RG8/RGB8/BGR8 SRGB and A8_UNORM. Together with
+the three float32 color formats, these are30 entries. The exact enum names,
+numeric values and feature masks are in `format-support.json`. The runtime
+already excludes integer formats when constructing blend state.
+
+`VK_EXT_shader_tile_image` is advertised with color/depth/stencil read1 and
+coherent-read-accelerated1. `VK_EXT_rasterization_order_attachment_access`
+reports color/depth/stencil access1; the advertised older ARM alias's saved
+feature bits read0. `VK_KHR_dynamic_rendering_local_read` reports1.
+`VK_EXT_fragment_shader_interlock` is absent. These are saved supported
+features, not features enabled by the existing runtime for software blending.
+
+### A/B/C comparison and limits
+
+| Option | Evidence / precision | Work and risk |
+|---|---|---|
+| A: RGBA16F substitution | Not implemented or run after the new correctness blocker. Range/precision consequences known, actual target values unknown. | Estimate2-4 engineer-days for a coordinated scoped prototype after identifying images; moderate/high risk until aliases and CPU traffic are known. |
+| B: FP32 shader blending | Feasible hardware paths reported; not a small local prototype, not implemented or run. Keeps FP32 storage/arithmetic in principle. | Estimate3-5 engineer-days for constrained implementation/validation; high synchronization, shader-variant and MRT risk. |
+| C: blend disabled | Implemented only in explicit debug mode;06041 disappears. It changes no image/view/copy/sampling formats. No successful scene comparison or performance result. | Reference only, never a fix; can lose destination accumulation/compositing. |
+
+A would store8 rather than16 raw bytes/texel, with11 rather than24 significant
+bits, finite max65504 and smallest subnormal2^-24. Near1, its ULP is2^-10,
+versus2^-23 for FP32. Normal round-to-nearest relative error per store can be
+about2^-11; overflow, underflow and loss of small terms in repeated additive
+blends matter beyond that bound. FP32 shader calculations do not prevent
+FP16 attachment rounding. Actual target range, feedback behavior and CPU use
+were not captured, so no quality or memory/FPS acceptance is claimed.
+
+A correct image prototype must coordinate physical image format and all
+attachment/sampled views, compatible framebuffer lists, aliases, deferred
+replacement and copies. Guest FP32 byte layout stays16B/texel; CPU uploads,
+buffer transfers and readbacks require explicit conversion/row handling.
+Changing only pipeline attachment formats or one view is insufficient. No
+unsafe global format remap or unimplemented A selector is retained.
+
+For B, [tile-image reads](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_shader_tile_image.html)
+can read previous color values in rasterization order but require dynamic
+rendering; this device currently uses classic imageless render passes.
+A prototype needs feature negotiation, a supported dynamic path, and
+[SPIR-V tile-image declarations/read instructions](https://github.khronos.org/SPIRV-Registry/extensions/EXT/SPV_EXT_shader_tile_image.html)
+with blend arithmetic before fragment outputs. Variant/cache keys must account
+for blend state, masks and MRT; depth variants, partial outputs, sample/helper
+behavior and ordering must be checked. An alternative uses
+[raster-order input attachments](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_rasterization_order_attachment_access.html),
+requiring render-pass/input-attachment usage and descriptor changes. Simple
+ordinary sampled reads of the same writable image are not an equivalent
+ordered-blending implementation. The engineering estimates are judgments for
+a constrained prototype, not measured completion times or shipping commitments.
+
+### C run: new blocker and visual evidence
+
+C validation gets past the prior06041 stop and the draw-count title detector.
+The first attempt stops on a private harness PID-path bug; the corrected
+attempt restores a fresh isolated seed. During loading it encounters **3
+`VUID-vkCmdDrawIndexed-magFilter-04553` errors**: bindings1/2
+`fp_t_tcb_8`/`fp_t_tcb_A` use linear sampling of RGBA16_UNORM, which lacks the
+required filter feature. **Four warnings** are retained: three unused fragment
+outputs and one UINT-output/FLOAT-attachment mismatch. Recovered audio events
+and keyguard/focus logs are preserved under the clarified V gate. No further
+device experiment follows this real correctness failure.
+
+All phone `title.png` and `load-0/1/2.png` files are pixel-identical: black
+game area with the controller overlay visible. Manual review therefore rejects
+the detector labels as proof of rendered title/load. The tablet reference
+shows the normal title. A central phone crop, pixels1120,252..1680,819, is
+exact RGB0 throughout. This is evidence of the black capture, **not an FP32
+target readback or proof that disabling blend caused it**.
+
+Private `C-versus-tablet-title.png` places the screenshots side by side without
+enhancement; `C-game-area-crop.png` preserves exact crop pixels. Original sizes
+are2800x1260 phone and3040x1904 tablet. The phone uses handheld/stock DRS
+(main pass not sampled); tablet references are docked/stock DRS, whose earlier
+route sampled1600x900. There are no matched A/C Plateau/end images, measured
+target precision ranges, normal-map acceptance or meaningful performance
+comparison. C does not satisfy the requested zero-new-VUID condition.
+
+### Checks, end state and recommendation
+
+Full suite **183 PASS,0 skipped,143.360s**; debug and release each compile157
+sources with0 failures. Native tests verify default/log state preservation,
+C's unsupported attachment only, unchanged keys and release gate0. An existing
+descriptor-hash fixture is corrected to extract the function definition rather
+than the newly added forward declaration. Only debug diagnostics/C reference
+are committed; the release compile check is not installed or packaged.
+
+Exact release3 e85e77ce is restored with complete data, bank a98538dc,
+manifest50534b64 and17 verified seed files renamed into the ordinary save.
+Prototype builds/files/roots are removed from the phone, app stopped,
+screen OFF, keeper ended. The user's600000ms timeout is retained. The original
+APKs, pack, production selectors and export are unchanged. The measured C
+build precedes removal of an unused/unimplemented A selector; its earlier
+header is reconstructed from the logged edit and archived for provenance.
+C/log/default/release behavior is unchanged by that cleanup.
+
+`BENCH/astc-phone-validation.json` appends this partial investigation, retaining
+all earlier attempts and original release3 acceptance rows. Exact cache rows,
+format/extension masks, shader summary, raw errors, audio/focus records,
+screenshots/crop/comparison and end proof are under
+`astc-phone-validation/session-20261103-fp32-investigation/`.
+
+**Recommendation:** do not select a lossy default format change from prewarm
+records alone. First investigate the separate04553/filterability and black
+game capture, then identify physical FP32 demand targets and resume controlled
+A/C (and B if warranted). The user must choose whether to authorize that
+additional diagnostic scope before choosing FP16 versus FP32 engineering.
+The requested comparison remains incomplete; no fix is selected or shipped,
+and no merge, push, tag or publication occurs.
