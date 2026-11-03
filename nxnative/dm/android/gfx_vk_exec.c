@@ -8,6 +8,7 @@
 #include "spv_sampler_use.h"
 #include "nvn_hmap.h"
 #include "rt_alias.h"
+#include "mali_probe.h"
 #include <math.h>
 #include <errno.h>
 #include <string.h>
@@ -296,6 +297,67 @@ static VkFramebuffer fb_get(const fbkey *k) {
 // the attachments begin_pass found, for the render pass begin: each colour slot's (and the depth's) image, view, view format and layers, size at the view's level
 static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h; VkImageUsageFlags usage; } P_att[9];
 static vk_rt_subresource P_colors[8]; static int P_color_slot[8]; static uint32_t P_dup_colors;
+#ifndef DM_RELEASE
+// A renders only unsupported blended FP32 attachments through FP16 proxies. GPU
+// blits convert in/out at pass boundaries; every sampled/CPU/copy view keeps its
+// canonical FP32 image and guest byte layout. This deliberately rounds to FP16.
+static struct { vkimg_t image, *original; uint32_t level, layer, fmt; VkImageUsageFlags usage; } P_mali_a[8];
+static int mali_a_make(vkimg_t *src, uint32_t level, uint32_t layer, uint32_t layers, int slot) {
+    VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, src->fmt, &fp);
+    if (!vk_mali_a_eligible(vk_mali_a_mode(), src->fmt, fp.optimalTilingFeatures, src->samples, src->d, layers)) return 0;
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) return 0;
+    vkGetPhysicalDeviceFormatProperties(V.pd, VK_FORMAT_R16G16B16A16_SFLOAT, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((fp.optimalTilingFeatures & need) != need) return 0;
+    vkimg_t im = {0}; im.w = src->w >> level ? src->w >> level : 1; im.h = src->h >> level ? src->h >> level : 1;
+    im.d = im.levels = im.layers = im.samples = 1; im.fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
+    im.vtype = VK_IMAGE_VIEW_TYPE_2D; im.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    im.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, im.fmt, {im.w, im.h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+        VK_IMAGE_TILING_OPTIMAL, im.usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(V.dev, &ci, NULL, &im.img)) return 0;
+    VkMemoryRequirements req; vkGetImageMemoryRequirements(V.dev, im.img, &req); VkDeviceSize offset = 0;
+    uint32_t mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    if (mt != UINT32_MAX) im.mem = vk_image_memory(&req, mt, &offset, &im.sub);
+    if (!im.mem) { vkDestroyImage(V.dev, im.img, NULL); return 0; }
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, im.img, VK_IMAGE_VIEW_TYPE_2D, im.fmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    int ok = vkBindImageMemory(V.dev, im.img, im.mem, offset) == VK_SUCCESS && vkCreateImageView(V.dev, &vi, NULL, &im.full) == VK_SUCCESS;
+    if (ok) vk_defer_free_view(im.full);
+    if (im.sub) vk_defer_free_image_sub(im.img, im.sub); else vk_defer_free_image(im.img, im.mem);
+    if (!ok) return 0;
+    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    VkImageMemoryBarrier ib = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, im.img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkImageBlit blit = {{VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1}, {{0, 0, 0}, {(int32_t)im.w, (int32_t)im.h, 1}},
+        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)im.w, (int32_t)im.h, 1}}};
+    vkCmdBlitImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST); vk_img_barrier_all(cb);
+    im.layout = VK_IMAGE_LAYOUT_GENERAL;
+    P_mali_a[slot].image = im; P_mali_a[slot].original = src; P_mali_a[slot].level = level; P_mali_a[slot].layer = layer;
+    static unsigned notes; const char *capture = getenv("DM_VK_X_MALI_CAPTURE");
+    if (notes++ < 64 || (capture && atoi(capture))) VKLOG("mali A attachment: present=%llu slot=%d %ux%u canonical=%p fmt=%d proxy=%p fmt=%d pool=%llx off=%llx vs=%016llx fs=%016llx",
+        (unsigned long long)g_tex_frame, slot, im.w, im.h, (void *)src->img, src->fmt, (void *)im.img, im.fmt, (unsigned long long)src->pool, (unsigned long long)src->off,
+        S.sh[0] ? (unsigned long long)S.sh[0]->key : 0, S.sh[1] ? (unsigned long long)S.sh[1]->key : 0);
+    return 1;
+}
+static void mali_a_finish(void) {
+    for (int i = 0; i < 8; i++) if (P_mali_a[i].original) {
+        vkimg_t *im = &P_mali_a[i].image, *dst = P_mali_a[i].original; VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+        VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)im->w, (int32_t)im->h, 1}},
+            {VK_IMAGE_ASPECT_COLOR_BIT, P_mali_a[i].level, P_mali_a[i].layer, 1}, {{0, 0, 0}, {(int32_t)im->w, (int32_t)im->h, 1}}};
+        vkCmdBlitImage(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST); vk_img_barrier_all(cb);
+        vk_tex_written(dst); P_att[i].im = dst; P_att[i].fmt = P_mali_a[i].fmt; P_att[i].usage = P_mali_a[i].usage; S.cfmt[i] = (VkFormat)P_mali_a[i].fmt;
+        P_mali_a[i].original = NULL;
+    }
+}
+static void mali_a_before_draw(void) {
+    if (!vk_mali_a_mode() || !S.pass_open) return;
+    for (int i = 0; i < S.ncol; i++) if ((S.color.blend_en >> i & 1) && S.cfmt[i] == VK_FORMAT_R32G32B32A32_SFLOAT && !P_mali_a[i].original && P_att[i].im) {
+        vkimg_t *im = P_att[i].im; VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
+        if (vk_mali_a_eligible(1, im->fmt, fp.optimalTilingFeatures, im->samples, im->d, P_att[i].layers)) { vk_end_pass(); break; }
+    }
+}
+#endif
 static vkimg_t P_depth_copy;
 static int P_depth_copied, P_depth_clear, P_depth_tried;
 
@@ -670,6 +732,9 @@ void vk_end_pass(void) {
     if (g_x_listpasses && S.pass_open == 1) { Dl_info di; void *ra = __builtin_return_address(0); uintptr_t base = dladdr((void *)vk_end_pass, &di) ? (uintptr_t)di.dli_fbase : 0; VKLOG("    ended from %#llx (%llu draws)", (unsigned long long)((uintptr_t)ra - base), (unsigned long long)g_pass_draws); }   // (DM_VK_TRACE_PASS=-2: who ends each pass)
     if (S.pass_open == 2 && P_cleared) (void)pass_commit();   // only clears: the pass still runs, for its load ops
     if (S.pass_open == 1) { if (S.rp_pass) vkCmdEndRenderPass(vk_cmd()); else vkCmdEndRendering(vk_cmd()); void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(1, S.pass_w, S.pass_h, (uint32_t)S.cfmt[0], (uint32_t)g_pass_draws | (g_pass_draws ? (uint32_t)((g_pass_bb[2] - g_pass_bb[0]) & 0xffff) << 16 : 0));  pass_dump(); if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) { setenv("DM_VK_TRACE_PASS", "-1", 1); g_x_tracepass = -1; } }
+#ifndef DM_RELEASE
+    mali_a_finish();
+#endif
     depth_clone_finish();
     if (S.pass_open == 1 && g_lin_back && g_pass_draws) lin_back();
     if (S.pass_open == 1) crumb_mark(0);
@@ -684,6 +749,9 @@ static int begin_pass(void) {
     if (S.pass_open) return 1;
     int psplit = g_psplit_now; g_psplit_now = 0;   // a pass split (prepare_draw): taken before any early return, so the flag never forces a later pass's cut
 rebuild_views:;
+#ifndef DM_RELEASE
+    for (int i = 0; i < 8; i++) P_mali_a[i].original = NULL;
+#endif
     uint64_t image_gen = g_vk_image_gen;
     P_depth_copied = P_depth_clear = P_depth_tried = 0;
     VkCommandBuffer cb = vk_cmd();
@@ -717,6 +785,13 @@ rebuild_views:;
         // Imageless attachment descriptions use physical mip dimensions; the
         // render area above uses the view's texel dimensions (blocks for BC).
         P_att[i].w = im->w >> lv ? im->w >> lv : 1; P_att[i].h = im->h >> lv ? im->h >> lv : 1; P_att[i].usage = vk_view_usage;
+#ifndef DM_RELEASE
+        if (vk_mali_a_mode() && (S.color.blend_en >> i & 1) && vk_view_fmt == VK_FORMAT_R32G32B32A32_SFLOAT && mali_a_make(im, lv, ly, P_att[i].layers, i)) {
+            P_mali_a[i].fmt = P_att[i].fmt; P_mali_a[i].usage = P_att[i].usage;
+            vkimg_t *proxy = &P_mali_a[i].image; ca[i].imageView = proxy->full; S.cfmt[i] = proxy->fmt;
+            P_att[i].im = proxy; P_att[i].fmt = proxy->fmt; P_att[i].usage = proxy->usage;
+        }
+#endif
     }
     S.dfmt = VK_FORMAT_UNDEFINED; S.daspect = 0;
     if (S.rt_has_dep) {
@@ -1328,7 +1403,11 @@ static VkSampler samp_for(int st, const dmsv_bind *b, uint64_t texh, int use) { 
 // texture views by ID within a submission: a draw's texture arrays (32 slots) looked every slot up again, each through the registry's and the view table's
 // locks (NEO: about 2 ms a frame). An entry holds while no texture ID is registered again and no view is dropped (g_tex_gen)
 enum { TVC = 4096 };
-static struct { uint64_t epoch, gen; int tid, dim, arr, compare, num; VkImageView v; vkimg_t *im; } g_tvc[TVC];
+static struct { uint64_t epoch, gen; int tid, dim, arr, compare, num; VkImageView v; vkimg_t *im;
+#ifndef DM_RELEASE
+    VkFormat fmt; uint32_t guest_fmt, guest_view_fmt;
+#endif
+} g_tvc[TVC];
 // what a view's texels are, as gfx_vk_shader.c's integer-texel variants need it: 0 float, 1 uint (unsigned integer formats, a stencil), 2 int
 static int view_num(const tex_t *t, const view_t *v) {
     const vkfmt_t *f = vk_fmt(v && v->set_format ? v->format : t->d.format); if (!f) return 0;
@@ -1337,6 +1416,30 @@ static int view_num(const tex_t *t, const view_t *v) {
 }
 static uint64_t g_num_um, g_num_im;   // stage_set: the sampled bindings of the stage being built that got uint / int views (bit = binding index)
 extern uint64_t g_tex_gen;
+#ifndef DM_RELEASE
+static uint64_t g_mali_sample_frame = UINT64_MAX, g_mali_sample_n, g_mali_sample_changed;
+static void mali_sample(int st, const dmsv_bind *b, uint64_t h, int use, VkDescriptorImageInfo *ii, VkFormat fmt, const vkimg_t *im, uint32_t guest, uint32_t view) {
+    if (!vk_mali_u_mode() || fmt != VK_FORMAT_R16G16B16A16_UNORM) return;
+    static int unfilterable = -1;
+    if (unfilterable < 0) { VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp); unfilterable = !(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT); }
+    if (!unfilterable) return;
+    if (g_mali_sample_frame != g_tex_frame) { g_mali_sample_frame = g_tex_frame; g_mali_sample_n = g_mali_sample_changed = 0; }
+    g_mali_sample_n++; VkSampler original = ii->sampler;
+    if (vk_mali_u_mode() == 2) { ii->sampler = samp_for_mode(st, b, h, use, 1); g_mali_sample_changed++; }
+    const char *trace = getenv("DM_VK_X_MALI_CAPTURE");
+    if (trace && atoi(trace) && g_mali_sample_n <= 8) VKLOG("mali U sample: present=%llu pass=%d stage=%d key=%016llx binding=%d handle=%llx view=%p fmt=%d image=%p size=%ux%u usage=%#x nvn=%#x guest_view=%#x pool=%llx off=%llx sampler=%p effective=%p nearest=%d",
+        (unsigned long long)g_tex_frame, g_sub_pass - 1, st, S.sh[st] ? (unsigned long long)S.sh[st]->key : 0, b->binding, (unsigned long long)h,
+        (void *)ii->imageView, fmt, im ? (void *)im->img : NULL, im ? im->w : 0, im ? im->h : 0, im ? im->usage : 0, guest, view,
+        im ? (unsigned long long)im->pool : 0, im ? (unsigned long long)im->off : 0, (void *)original, (void *)ii->sampler, vk_mali_u_mode() == 2);
+}
+void vk_mali_probe_frame(uint64_t present) {
+    if (!vk_mali_u_mode() && !vk_mali_a_mode()) return;
+    VKLOG("mali frame: present=%llu replay_present=%llu total_draws=%llu total_passes=%llu skips=%llu/%llu/%llu UNORM16_descriptor_resolutions=%llu nearest=%llu",
+        (unsigned long long)present, (unsigned long long)g_tex_frame, (unsigned long long)g_vkst.draws, (unsigned long long)g_vkst.passes,
+        (unsigned long long)g_vkst.skip_prog, (unsigned long long)g_vkst.skip_rt, (unsigned long long)g_vkst.skip_pipe,
+        (unsigned long long)(g_mali_sample_frame == g_tex_frame ? g_mali_sample_n : 0), (unsigned long long)(g_mali_sample_frame == g_tex_frame ? g_mali_sample_changed : 0));
+}
+#endif
 static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImageInfo *ii, int storage, VkSampler fixed_sampler, int use) {   // the view's view_num
     int tid = (int)(h & 0xfffff); const view_t *v = NULL; const tex_t *t = NULL;
     int compare = !storage && use == VK_SAMPLE_COMPARE;
@@ -1345,6 +1448,9 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
     unsigned ck = ((unsigned)tid * 2654435761u ^ (unsigned)b->dim * 97u ^ (unsigned)(b->flags & 1) ^ (unsigned)compare * 193u) % TVC;
     if (tid && g_var_now != 3 && !g_tracing && g_tvc[ck].epoch == g_set_epoch && g_tvc[ck].gen == g_tex_gen && g_tvc[ck].tid == tid && g_tvc[ck].dim == b->dim && g_tvc[ck].arr == (b->flags & 1) && g_tvc[ck].compare == compare) {
         ii->imageView = g_tvc[ck].v; if (g_tvc[ck].im) g_tvc[ck].im->last_use = mtl_last_fence() + 1;
+#ifndef DM_RELEASE
+        if (!storage) mali_sample(st, b, h, use, ii, g_tvc[ck].fmt, g_tvc[ck].im, g_tvc[ck].guest_fmt, g_tvc[ck].guest_view_fmt);
+#endif
         if (storage && g_tvc[ck].im) { g_tvc[ck].im->gpu_w = 1; storage_image_note(st, g_tvc[ck].im); } vk_texdump_note(g_tvc[ck].im); if (g_tvc[ck].num && !storage) ii->sampler = samp_for_mode(st, b, h, use, 1); return g_tvc[ck].num;
     }
     int num = 0;
@@ -1356,6 +1462,10 @@ static int tex_desc_for(int st, const dmsv_bind *b, uint64_t h, VkDescriptorImag
         if (im) im->last_use = mtl_last_fence() + 1;
         if (ii->imageView) num = view_num(t, v);
         if (ii->imageView) { g_tvc[ck].epoch = g_set_epoch; g_tvc[ck].gen = g_tex_gen; g_tvc[ck].tid = tid; g_tvc[ck].dim = b->dim; g_tvc[ck].arr = b->flags & 1; g_tvc[ck].compare = compare; g_tvc[ck].v = ii->imageView; g_tvc[ck].im = im; g_tvc[ck].num = num; }
+#ifndef DM_RELEASE
+        if (ii->imageView) { g_tvc[ck].fmt = vk_view_fmt; g_tvc[ck].guest_fmt = t->d.format; g_tvc[ck].guest_view_fmt = v && v->set_format ? v->format : t->d.format;
+            if (!storage) mali_sample(st, b, h, use, ii, vk_view_fmt, im, g_tvc[ck].guest_fmt, g_tvc[ck].guest_view_fmt); }
+#endif
     }
     if (num && !storage) ii->sampler = samp_for_mode(st, b, h, use, 1);
     if (!ii->imageView) {
@@ -1765,6 +1875,9 @@ static int prepare_draw(int prim, int indexed) {
 rebind_views:;
     uint64_t image_gen = g_vk_image_gen;
     depth_clone_before_draw();
+#ifndef DM_RELEASE
+    mali_a_before_draw();
+#endif
     if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
 #ifndef DM_RELEASE
     replay_stall();

@@ -1662,6 +1662,178 @@ and no merge, push, tag or publication occurs.
 
 ## Mali compatibility findings
 
+### 2026-11-03: black-output matrix and first failing pass (current)
+
+**Confirmed first blocker: missing GL depth-convention conversion on devices
+without `VK_EXT_depth_clip_control`. This is not a complete-game fix.** A private,
+hash-verified replacement for the final vertex shader restores the title, load
+menus and gameplay HUD. The Great Plateau world remains almost entirely black,
+with persistent Mali GPU task errors. No default, generated pack or release APK
+changes are made; A/B remain undecided and phone acceptance remains blocked.
+
+The user explicitly directs this investigation and permits recovered audio
+watchdogs plus the approved once/process zero-copy notice. This supersedes the
+previous continuation's strict diagnostic stop only; non-validation acceptance
+still requires RED0 apart from the approved zero-copy notice. Scope remains owned
+BotW1.9.0/v1114112+DLC, vivo V2405A/MT6991/Immortalis-G925, default balanced,
+handheld, stock internal DRS, target60, HOLD off, audio on and a fresh isolated
+copy of the17-file owned Plateau seed for every launch. The observed title main
+pass is1280x720 and guest window1920x1080. No vendor settings are changed. The
+600000ms timeout is the user's earlier change and is retained.
+
+Private evidence is under `BENCH/astc-phone-validation/session-20261103-black-matrix`.
+`parse-summary.json` indexes18 attempts,17 launches,110 internal PPMs, all PNGs,
+per-run counters/REDs/audio/focus/memory/thermal and exact hashes. The appended
+`BENCH/astc-phone-validation.json` preserves both previous investigations and
+all prior acceptance rows. These are correctness diagnostics, not FPS experiments.
+
+#### Format diagnostic matrix
+
+All four completed conditions use the same private debug APK, SHA-256
+`dc243617e7b6c62349f7c0ae4604b468e763e07ff649fa37874c5f249a0d721f`.
+Each has9 PPMs including initial presents and corresponding title, three load
+checkpoints, and seed-gameplay start/still workloads. The scene detector uses
+draw counts; a black image is not positive visual proof of the Plateau view.
+
+| Condition | Private run | Internal result | Last600-frame workload |
+|---|---|---|---|
+| Baseline | BLACK-BASE-R1 | 9/9 RGB exactly0 | 3729 draws/frame |
+| A: unsupported blended RGBA32F through FP16 | BLACK-A-R1 | 9/9 RGB exactly0 | 3738 draws/frame |
+| U: unfilterable RGBA16_UNORM through nearest | BLACK-U | 9/9 RGB exactly0 | 3738 draws/frame |
+| A+U | BLACK-AU | 9/9 RGB exactly0 | 3699 draws/frame,166.20 passes/present |
+
+A is a debug-only, capability-gated FP16 attachment proxy with typed GPU blits
+before/after the pass. Ordinary views, copies and CPU byte layout keep the
+canonical FP32 image. Only the observed single-sample2D/single-layer shape is
+covered. In AU,270 sampled attachment logs identify two8x8 demand targets with
+VS `b2c0cfbcd9722ace` and FS `58606cb67cb94e6d` / `f84705cb4c5a46b8`.
+The third cached/prewarmed pair, VS `590001dbe0f4877a` / FS `2a6b54a6274c39c5`,
+is not observed as a demand draw in these captures. AU logs no remaining demand
+FP32-blend attachments. This does not prove all scenes are covered.
+
+U checks the actual view format on both fresh and cached descriptors. The
+original04553 path is guest format/view `0x2a` -> VkFormat91 RGBA16_UNORM,
+256x256, usage `0x17`, FS `13540660ad78e484`, bindings1/2. Additional vertex-stage
+keys and sizes are in the JSON. AU snapshots resolve37/40 descriptors on the
+unfilterable format and replace37/40 samplers with nearest min/mag/mipmap and
+anisotropy1. Those are descriptor-resolution counts, not GPU texture-fetch counts.
+A loses FP32 range/precision (finite max65504,11 versus24 significant bits,
+rounding on both proxy conversions); U removes interpolation/anisotropy. Neither
+quality tradeoff is approved for production. No new validation-layer run of
+these prototypes is claimed.
+
+#### The first black pass and a causal depth diagnostic
+
+`present_window()` in `gfx_vk_present.c` blits the game image into `g_simg[idx]`
+then calls `ov_render()` into that same swapchain image, using LOAD. Own PPMs
+read the game image before the overlay. The old overlay-visible black captures
+therefore cannot be explained by hiding a separate secure game layer.
+
+| Stage | Image / state | Evidence |
+|---|---|---|
+| Title pass63 | 1280x720 A2B10G10R10_UNORM_PACK32 (64), recognizable complete title/menu | `BLACK-STAGE/passes-0/pass_63.ppm`, lossless `pass_63.png` |
+| Final pass64 | 1920x1080 RGBA8_SRGB view43 of RGBA8_UNORM image37;1280x720 viewport; RGB0 | `BLACK-STAGE/passes-0/pass_64.ppm` |
+| Draw | VS `e4b5b0967a3cd0b3`, FS `ecb4242efaf4042b`; two indexed triangles; blend/depth disabled; source is pass63 texture ID772 | `BLACK-STAGE/final.log` and targeted UBO/bind traces |
+| Clip input | `clip_neg1=1`; source vertices z0, CBUF80B maps all vertices to z=-1,w=1; device lacks depth_clip_control | `clip-cache.txt`, owned shader disassembly and trace |
+| Clean replacement control | Original computation, same capability/output cleanup; final PPM remains RGB0 | `BLACK-CLIP-CONTROL-R2` |
+| Depth replacement | Only final VS changes z to0.5*(z+w), FP32 throughout; pass64 and final title become visible | `BLACK-CLIP-R2/frame_001342.ppm` and `passes-0/pass_64.ppm` |
+
+Vulkan's default clip volume rejects negative z; the optional negativeOneToOne
+state extends it to -w. See the [Khronos clipping specification](https://docs.vulkan.org/spec/latest/chapters/vertexpostproc.html#vertexpostproc-clipping)
+and [depth-clip-control state](https://docs.vulkan.org/refpages/latest/refpages/source/VkPipelineViewportDepthClipControlCreateInfoEXT.html).
+The backend currently leaves GL depth unchanged when the extension is absent
+(`gfx_vk_exec.c`, `set_dynamic()` TODO). Thus the final quad is entirely clipped.
+The same missing fallback exists upstream nx2android
+`34333894c5192606d1ac88b10e8e040667d556c8`, file
+`nxnative/dm/android/gfx_vk_exec.c:1265`. The freshly fetched nxnative
+`b5910377e5bd052a080affaa947ca83c80cf4a8c` already expresses the required
+coordinate conversion in its Metal `vs_depth` design,
+`dm/gfx/tools/dmsh_build.py:1011-1021`. This is the relevant upstream semantic
+reference; no Unreal implementation is used or copied.
+
+Both private SPIR-V modules pass `spirv-val --target-env vulkan1.1`. Their
+internal phone files are read back and hashed, and the runtime explicitly logs
+loading the alternative module. Clean control SHA:
+`7a7693878195cd902b608f8b5924072ae522af6593bcd2562006ad5133404e2e`;
+remap SHA:
+`7f7c2e4846d7cee210be582a85288c035bbd391e69405c1752ab93a81f131701`.
+The initial BLACK-CLIP/CONTROL external binary writes were incomplete and did
+not load; those attempts are inconclusive and preserved. CONTROL-R1 aborted
+before launch on a read/hash assertion (run-as cannot read that external FUSE
+path). Corrected R2 uses binary-safe `exec-in run-as dd` and internal read/hash.
+No runtime or data-pack change was needed for this shader diagnostic.
+
+A fresh-seed AU+depth run, `BLACK-CLIP-GAME`, restores the load menu and three
+red HUD hearts. Its final frame5011 has only0.05917% nonzero RGB across the
+1920x1080 canvas: the world still fails. It records2655 GPU `GROUP_ERROR_FATAL`
+messages, final600-frame GPU time0.00ms,3706 draws/frame and166.14 passes/present,
+with no program/target/pipeline skips. PID remains stable until controller stop.
+These GPU task errors are a rendering blocker, not evidence of an application
+crash or LMK. The one-VS proof does not establish why the remaining world is
+black: other GL-depth stages and the GPU task failure require further isolation.
+No further phone experiment follows that evidence.
+
+#### Other controls, audio, limits and end state
+
+Startup no-cull, encode-thread off, and selected descriptor-cache/dynamic-UBO
+fallback controls all retain the black title. The live no-cull toggle in the
+first pass-dump run was ineffective (startup-cached); the separate startup run
+proves cull0. Disabling AHB import intentionally takes the copied-pool path
+(-4 diagnostic notice) and remains black. A deliberately missing private bank
+selects the existing reject/BC-decode fallback and remains black. Ordinary-bank
+rows show0 lookups/hits/misses/exceptions at title, so the title failure precedes
+any sidecar fetch. This does not exonerate every descriptor or full-game ASTC
+path and does not establish sidecar coverage/fetch timing.
+
+Across17 launches,52 audio watchdogs (200-203ms) have52 successful AudioUnit
+restarts;51 also have subsequent existing2000-callback evidence. All timestamps
+and adjacent host-read bounds are recorded.14 are within5s of first observing
+game focus; the other38 occur without an active focus change. No sampled active
+keyguard/foreground loss occurs. This does not establish audio causation. Recovered audio still fails strict non-validation acceptance; the zero-copy
+notice remains permitted only once per process under its existing exception.
+The diagnostic allowance is not expanded.
+
+The approved pool is `0x79e300a000 +0x123000` (1,191,936B/1.13671875MiB).
+AU existing counters show2301.3-2310.9 printed MB over600 submissions,
+3.84-3.85 per submission (the code divides by1048576: MiB despite its MB label).
+There is no isolated pool-copy timer in these measured APKs; no0ms cost claim.
+Memory/thermal/cap series are preserved in each run's JSON/raw files; no FPS,
+thermal comparison, no-regression result or retained-memory acceptance follows
+from faulty, heavily instrumented rendering. BC5 normals and a matching
+Plateau/route-end image cannot be judged. Tablet title labels/layout are
+recognizable after the remap; slideshow/fade phases differ, with tablet3040x1904
+captures/docked DRS versus phone2800x1260/handheld and1280x720 sampled main pass.
+
+Full host suite: **184 PASS,0 skipped**,170.262s (172.578s wall). Debug and
+release compile157 sources each,0 failures; release library excludes both new
+prototype selectors. Release compile is a host gate check only. The new
+validation companion SHA is
+`e7ac632477b5ee60c0eac039b9c56d4ca8a13149affb7e2c549ec707d886a31b`
+and is not run. No APK3 release or generated data is rebuilt.
+
+End proof: original release3
+`e85e77ce04aedb012b5e536fec30ed50542d0694e6bea56e66213aebb41234c1`
+installed,48,182 installed-file hashes/32 sidecar chunks verified,0 mismatches,
+0 bulk bytes retransferred. The full audit temporarily restores pack env/settings
+while the app is stopped; final requested handheld preferences are then restored.
+17 seed files are hash-verified then restored into
+ordinary save. Internal/external test roots, probes, captures, controls and
+validation/debug build content are removed. Both local helpers stop; a cleanup
+race causes six read retries for an already removed installer XML (not USB
+loss), explicitly recorded with19,232,312,322 retained bytes. A subsequent
+read-only check finds the screen awake, origin unestablished; sleep is repeated
+after both helpers stop. The18:32:46 settled check confirms exact release3,
+app stopped, screen OFF and user's600000ms timeout. No measured disconnect,
+account/system-setting change, merge, push, tag or publication occurs.
+
+**Next:** implement and test a device-gated, semantics-preserving FP32 GL depth
+fallback for every relevant final pre-rasterization stage/variant, including
+geometry/tessellation emission and transform-feedback implications, then
+isolate the remaining world/GPU failure. Correct06041 and04553 independently
+and rerun validation before visual/performance acceptance. The confirmed depth
+bug requires no FP16/nearest quality concession; A/B decisions need working
+scene evidence and explicit approval before any production precision change.
+
 ### 2026-11-03: UE reference, 04553 and capture attempt
 
 **Status: partial investigation, stopped by the existing non-validation audio
