@@ -1,7 +1,7 @@
-# 2026-11-03 TB323FU / Adreno 840: median pacing budget; release 06e382a5 isolated save/load + 30 s smoke passed.
-# User ships despite A criterion2 FAIL: ON/OFF excess 0.609797 > 0.6, miss 3.348 ms; second gaps OFF12/12 -> ON0/12.
-# B single run: second gaps0, late1.361%; no general FPS gain claim. Source162=159 pass/3 optional skips; V reused, 0 errors/3 baseline warnings.
-# 0.3.0rc2 prefetch/prediction remains; no measured benefit.
+# 2026-11-03 TB323FU / Adreno 840: pair warming release728b8a49, default ON; isolated save/reload + 30 s smoke passes, RED0.
+# User ships exact candidate despite criterion4 FAIL: RSS +168.735 MB > 100 MB. Threshold unchanged; rollbacks06e382a5/bcd840c1 retained.
+# Single OFF/ON: heavy23->3, late1.407->0.724%; end views/draws diverge, no general FPS gain claim. Source165=162 pass/3 optional skips; V0 errors/3 baseline warnings.
+# Median pacing remains; earlier A criterion2 FAIL (0.609797>0.6, miss3.348 ms) separately overridden. Prefetch/prediction has no measured benefit.
 # Plan 2 historical baseline follows; it does not measure the first-use follow-up.
 # TB323FU (SM8850P / Adreno 840), Android 16; BotW 1.9.0, 2026-11-02.
 # Balanced mode, owned Great Plateau save; 60 s warmup + 120 s actual-present windows.
@@ -16,7 +16,7 @@
 # Release 44a337e0 save/load smoke passed. Existing lower-leg ground occlusion remains.
 # HOLD off: official-code fixed mean 44.482 versus 29.822 on; private on 33.933.
 status	wip
-tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-03: balanced, docked 1080p output, stock DRS sampled1600x900; median pacing budget release06e382a5 isolated save/load and30 s smoke pass, RED0; A second gaps OFF12/12 to ON0/12, cadence/correctness pass but criterion2 FAIL (excess ratio0.609797>0.6, miss3.348 ms), user explicitly approves shipping override; single120 s B second gaps0, late1.361%, general FPS gain unproven; source162=159 pass/3 optional skips, Vulkan V reused0 errors/3 matched baseline warnings; prefetch/prediction has no measured benefit, first compile stalls remain; real gyro/rumble verified,30-minute soak waived, lower-leg ground occlusion/full gameplay unverified
+tested	1.9.0 TB323FU (SM8850P / Adreno 840), Android 16, 2026-11-03: balanced, docked1080p, stock DRS sampled1600x900; pair-warm release728b8a49 default ON, isolated save/reload+30s smoke pass, RED0; user shipping override of unchanged RSS criterion4 FAIL (+168.735MB>100MB); single OFF/ON heavy23->3, late1.407->0.724%, end-view/draw divergence, no general FPS gain claim; source165=162 pass/3 optional skips, V0 errors/3 baseline warnings; retained pacing has its earlier criterion2 override; line/integer variants, cache/memory and first compiles remain open; gyro/rumble verified,30-minute soak waived, full gameplay/lower-leg ground occlusion unverified
 package	org.nxnative.zelda.botw
 orientation	landscape
 requires	bcn
