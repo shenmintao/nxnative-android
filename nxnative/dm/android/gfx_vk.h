@@ -52,7 +52,7 @@ typedef struct {
     VkInstance inst; VkPhysicalDevice pd; VkDevice dev; VkQueue q; uint32_t qf;
     VkPhysicalDeviceProperties props; VkPhysicalDeviceMemoryProperties mem;
     VkPipelineCache pcache;
-    int has_bc, has_astc, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_format_list, has_timeline;
+    int has_bc, has_astc, has_astc_decode, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_format_list, has_timeline;
     int has_depth_range_unrestricted;
     float max_aniso;
     int descriptor_buffer;
@@ -126,6 +126,9 @@ struct vkimg {
     VkImageLayout layout;           // version 1 keeps every image in GENERAL after its first use
     struct vkcompare *compare;       // a depth-format snapshot for colour comparison sampling
     int packaged;                   // filled from guest memory (deswizzled upload), re-uploaded when its pages change
+    const struct dm_astc_entry *astc; uint8_t *astc_bc, *astc_pending; int sidecar_tracked;
+    // Keep original BC while compressed: an arbitrary later GPU write can safely
+    // demote to the lossless image without reconstructing lossy ASTC on the CPU.
     uint64_t pkg_stamp; const void *pkg_span; uint64_t pkg_seen;
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
@@ -148,6 +151,7 @@ struct vkimg {
     uint64_t wseq, rseen;             // when it was last rendered to (gfx_vk_tex.c g_wseq); the newest overlapping write already reported
 };
 vkimg_t *vk_tex(const tex_t *t);                                 // the image of a texture object (created, uploaded or refreshed as needed)
+vkimg_t *vk_tex_lossless(const tex_t *t);                        // before a transfer/write/reinterpretation of a sidecar image
 void vk_lrz_forget(vkimg_t *im);                                 // an image is being dropped: the pass code forgets it (gfx_vk_exec.c)
 int vk_window_bottom_up(void);                                   // the game draws in lower-left origin mode: its window image is stored bottom-up (gfx_vk_exec.c)
 VkImageView vk_tex_view(const tex_t *t, const view_t *v, int dim, int arrayed, int as_attachment, vkimg_t **img_out);   // a view for sampling / storage / rendering

@@ -2109,7 +2109,7 @@ static VkImageSubresourceLayers sub_of(vkimg_t *im, const view_t *v, int has_v, 
 }
 static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     vk_end_pass_land();
-    vkimg_t *im = vk_tex(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
+    vkimg_t *im = vk_tex_lossless(c->tex); const vkfmt_t *f = vk_fmt(c->tex->d.format);
     if (!im || !f) return;
     VkBuffer b; VkDeviceSize o;
     if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
@@ -2199,7 +2199,7 @@ static int depth_scale(VkCommandBuffer cb, vkimg_t *s, vkimg_t *d, VkImageSubres
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vk_end_pass();
-    vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
+    vkimg_t *s = vk_tex_lossless(c->src), *d = vk_tex_lossless(c->dst);
     if (!s || !d) return;
     vk_watch(s, "copy source"); vk_watch(d, "copy destination");
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, s); vk_tex_prepare(cb, d); vk_img_barrier_all(cb);
@@ -2245,7 +2245,7 @@ static void copy_t2t(const p_copy_t2t *c) {
 }
 static void clear_tex(const p_clear_tex *c) {
     vk_end_pass();
-    vkimg_t *im = vk_tex(c->tex); if (!im) return;
+    vkimg_t *im = vk_tex_lossless(c->tex); if (!im) return;
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb); im->gpu_w = 1;
     VkImageSubresourceLayers l = sub_of(im, &c->view, c->has_view, c->r.zoffset);
     VkImageSubresourceRange rg = {l.aspectMask, l.mipLevel, 1, l.baseArrayLayer, im->layers > 1 ? (uint32_t)(c->r.depth ? c->r.depth : 1) : 1};

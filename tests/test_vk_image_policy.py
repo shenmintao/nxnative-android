@@ -22,7 +22,7 @@ class ImagePolicy(unittest.TestCase):
             self.skipTest('NDK Vulkan headers are required')
         src = (ROOT / 'nxnative/dm/android/gfx_vk_tex.c').read_text(encoding='utf-8')
         start = src.index('static int ubwc_mode(')
-        helper = src[start:src.index('static vkimg_t *img_new(', start)]
+        helper = src[start:src.index('static void vk_tex_view_drop_all(', start)]
         code = r'''
 #include <assert.h>
 #include <stdlib.h>

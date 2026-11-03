@@ -14,7 +14,9 @@
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;
 typedef struct { uint64_t serial; const uint8_t *mem; pool_t *pool; int64_t off; nvn_texdesc d; nvn_texlayout L; int has_layout; } tex_t;
 typedef struct { uint32_t w,h,d,layers,levels; VkImage img; VkImageAspectFlags aspect; VkImageLayout layout;
-    int gpu_w,packaged,pkg_released; uint64_t pkg_stamp,pkg_seen; const void *pkg_span; const uint8_t *pkg_mem; size_t pkg_len; } vkimg_t;
+    int gpu_w,packaged,pkg_released; uint64_t pkg_stamp,pkg_seen; const void *pkg_span; const uint8_t *pkg_mem; size_t pkg_len;
+    const struct dm_astc_entry *astc; uint8_t *astc_bc, *astc_pending; } vkimg_t;
+typedef struct dm_astc_entry { uint64_t source_bytes; } dm_astc_entry;
 typedef struct { int vk; uint32_t bw,bh,bpb; int dec,dbpp; } vkfmt_t;
 static void bc_decode(const vkfmt_t *f,const uint8_t *p,size_t pitch,uint32_t w,uint32_t h,uint32_t z,uint8_t *dst) { (void)f;(void)p;(void)pitch;(void)w;(void)h;(void)z;(void)dst; assert(0 && "BC decoding has its own fixture"); }
 static uint8_t storage[2<<20], arena[2<<20], expected[8][8][65536];
@@ -22,6 +24,10 @@ static size_t used, expected_bytes[8][8];
 static int copies, prepares, protected_ranges, span_reads, flush_calls, was_flushed, errors, write_notices;
 static const char *flush_option;
 static uint64_t g_pkg_n,g_pkg_bytes,g_pkg_ns;
+static uint64_t g_astc_shadow,g_astc_demotions;
+static const dm_astc_entry *astc_fetch(const tex_t *t,const vkfmt_t *f,uint8_t **source,uint8_t **data) { (void)t;(void)f;(void)source;(void)data; assert(0); return NULL; }
+static int image_replace(vkimg_t *im,const tex_t *t,const vkfmt_t *f) { (void)im;(void)t;(void)f; assert(0); return 0; }
+static void astc_upload(vkimg_t *im) { (void)im; assert(0); }
 #define VKLOG(...) ((void)0)
 #define VKRED_ONCE(...) ((void)++errors)
 static const char *mock_getenv(const char *name) { return strcmp(name,"DM_NVN_FLUSH_FILL") ? NULL : flush_option; }

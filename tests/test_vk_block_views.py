@@ -33,7 +33,8 @@ class BlockViews(unittest.TestCase):
 #define VKRED_ONCE(...) (++errors)
 typedef struct { struct {uint32_t flags;} d; } tex_t;
 typedef struct { VkFormat vk; uint32_t bpb,bw,bh; int compressed,depth,dec; } vkfmt_t;
-typedef struct { VkFormat fmt,fmt2; VkImageAspectFlags aspect; uint32_t w,h,nvn_format; VkImageCreateFlags cflags; VkImageUsageFlags usage; int fixed_fmt; } vkimg_t;
+typedef struct { VkFormat fmt,fmt2; VkImageAspectFlags aspect; uint32_t w,h,nvn_format; VkImageCreateFlags cflags; VkImageUsageFlags usage; int fixed_fmt; void *astc; } vkimg_t;
+static vkfmt_t astc_format(const vkfmt_t *f,int source) { (void)source; assert(0); return *f; } // native-BC fixture; sidecar views have their own test
 static struct {VkPhysicalDevice pd;} V;
 static unsigned errors,queries,promotions;
 static int refuse;

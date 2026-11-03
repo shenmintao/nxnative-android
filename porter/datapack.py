@@ -13,7 +13,7 @@ from pathlib import Path
 
 MANIFEST = 'nx2a-data.json'
 KEEP_ON_DEVICE = ('settings.txt',)          # the player's choices win over the pack's defaults
-OWNED = ('mods', 'RomFS', 'aoc')            # folders the pack owns on the device: files there that the pack lacks are stale (an older version's) and removed
+OWNED = ('mods', 'RomFS', 'aoc', 'textures.astc')   # managed content; remove a stale sidecar when switching back to native BC
 
 
 def link_or_copy(src, dst):
@@ -34,7 +34,7 @@ def link_tree(src, dst):   # (files, bytes)
 def files_folder(package): return f'/sdcard/Android/data/{package}/files'
 
 
-def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, progress=None):
+def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, textures=None, progress=None):
     """Write the pack to dst (replacing it). profile: the AndroidProfile; package: the app's, when not the profile's; env: more env.txt rows, after the profile's; settings: settings.txt values over the profile's;
     files: {name in the pack: source} (the 60 fps memory writes, fpslock.tsv; the button-icon font). Returns the manifest"""
     package = package or profile.package
@@ -56,6 +56,13 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
     if sets := {**profile.settings, **(settings or {})}: (tmp / 'settings.txt').write_text(''.join(f'{k}={v}\n' for k, v in sets.items()), encoding='utf-8', newline='\n')
     man = dict(title_id=profile.id, name=profile.name, package=package, version=version, display=display, language=language, requires=profile.requires,
                files=n, bytes=b, dlc=sorted(int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()) if aoc else [], made=time.strftime('%Y-%m-%d %H:%M:%S'))
+    if textures:
+        if textures.get('representation') != 'astc-mixed-zstd-v1' or textures.get('file') != 'textures.astc': raise ValueError('invalid texture representation')
+        from porter.astc_sidecar import info
+        actual = info(tmp / 'textures.astc')
+        if any(textures.get(k) != v for k, v in actual.items()): raise ValueError('ASTC sidecar does not match its manifest')
+        man['textures'] = actual
+        man['requires'] = [r for r in profile.requires if r != 'bcn'] + ['astc-ldr', 'astc-unorm8']
     (tmp / MANIFEST).write_text(json.dumps(man, indent=2), encoding='utf-8')
     if dst.exists(): shutil.rmtree(dst)
     for i in range(20):   # Windows: a folder just removed can stay delete-pending while another process (an indexer, a virus scan) holds it, and the rename is refused meanwhile

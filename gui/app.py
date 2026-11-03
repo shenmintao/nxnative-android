@@ -73,6 +73,11 @@ class PortTab(QWidget):
         self.data_mode = QComboBox()
         self.data_mode.addItem('Single APK (prepares game data on first launch)', 'embedded')
         self.data_mode.addItem('APK + external data (large games)', 'external')
+        self.target_gpu = QComboBox()
+        for label, value in [('Connected device (auto)', 'auto'), ('Adreno / TB323FU (native BC)', 'adreno'), ('Xclipse (native BC)', 'xclipse'),
+                             ('Immortalis / V2405A / Dimensity 9400 (offline ASTC)', 'immortalis'), ('Mali (offline ASTC)', 'mali'), ('PowerVR (offline ASTC)', 'powervr')]:
+            self.target_gpu.addItem(label, value)
+        self.target_gpu.setToolTip('Without a connected device, choose its GPU family. Offline ASTC generation adds PC processing time and a compressed texture sidecar.')
         self.install = QCheckBox('Install on the device when done')
         self.device = QComboBox(); self.device.setMinimumWidth(260)
         refresh = QPushButton('Refresh'); refresh.clicked.connect(self.refresh_devices)
@@ -99,6 +104,7 @@ class PortTab(QWidget):
                              'Raise it (16, 24 …) if the game still runs out. It uses no memory and does not change the speed.')
         f.addRow('App name', self.app_name); f.addRow('Game language', self.language)
         f.addRow('Game data', self.data_mode)
+        f.addRow('Target GPU', self.target_gpu)
         f.addRow('Output folder', path_row(self.out, self.pick_out)); f.addRow('Device', dev); f.addRow('', self.replace_signer)
         f.addRow('Package', self.package); f.addRow('versionCode offset', self.vercode); f.addRow('Extra address space', headroom)
         f.addRow('', self.fps60); f.addRow('', self.touch); f.addRow('', self.debug); f.addRow('', self.experimental)
@@ -190,12 +196,13 @@ class PortTab(QWidget):
         if not cfg.get('keys'):
             QMessageBox.warning(self, 'prod.keys', 'Set the path of your prod.keys on the Setup tab first.'); self.win.tabs.setCurrentIndex(1); return
         args = ['port', self.folder.text().strip(), '--progress', 'json', '--data-mode', self.data_mode.currentData()]
+        args += ['--target-gpu', self.target_gpu.currentData()]
+        if self.device.currentData(): args += ['--device', self.device.currentData()]
         if self.app_name.text().strip(): args += ['--app-name', self.app_name.text().strip()]
         if self.language.currentData(): args += ['--language', self.language.currentData()]
         if self.out.text().strip(): args += ['--out', self.out.text().strip()]
         if self.install.isChecked():
             args.append('--install')
-            if self.device.currentData(): args += ['--device', self.device.currentData()]
             if self.replace_signer.isChecked(): args.append('--replace-signer')
         if self.package.text().strip(): args += ['--package', self.package.text().strip()]
         if self.vercode.value(): args += ['--vercode-offset', str(self.vercode.value())]

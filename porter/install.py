@@ -32,6 +32,18 @@ def install(apk, data, adb_exe, serial=None, replace_signer=False):
             if bc is False: raise BuildError(f'{man["name"]} needs BC-compressed textures, which this device\'s GPU ({adb.gpu()}) cannot read')
             if bc is None: say(f'[RED] {man["name"]} needs BC-compressed textures; whether this GPU ({adb.gpu() or "unknown"}) reads them is not known')
         free = adb.free_bytes()
+        texture_info = man.get('textures')
+        if not texture_info and any(r.startswith('astc-') for r in man.get('requires', [])):
+            raise BuildError('ASTC requirements without a texture representation in the manifest')
+        if texture_info:
+            if texture_info.get('representation') != 'astc-mixed-zstd-v1' or texture_info.get('file') != 'textures.astc': raise BuildError('unsupported texture representation')
+            if adb.astc_textures() is not True: raise BuildError('this pack requires Vulkan ASTC LDR and VK_EXT_astc_decode_mode; device support could not be confirmed')
+            if data is not None:
+                from porter.astc_sidecar import Reader, info
+                try:
+                    if info(data / 'textures.astc') != texture_info: raise ValueError('manifest checksum mismatch')
+                    with Reader(data / 'textures.astc') as bank: bank.verify()
+                except (OSError, ValueError) as e: raise BuildError(f'invalid ASTC sidecar: {e}') from e
         files = datapack.files_folder(man['package'])
         have = adb.remote_sizes(files) if data is not None else {}
         need = man['bytes'] - sum(have.values()) + (apk.stat().st_size if data is None else 0)

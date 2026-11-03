@@ -112,7 +112,8 @@ class AndroidProfiles(unittest.TestCase):
             subprocess.run([sys.executable, str(REPO / 'nxnative/dm/android/apk/mkapk.py'), str(so), str(t / 'a.apk'), str(t / 'k.json'), '--lib', 'dmhost'] + args,
                            check=True, capture_output=True)
             with zipfile.ZipFile(t / 'a.apk') as z:
-                self.assertEqual(sorted(n for n in z.namelist() if n.startswith('assets/')), ['assets/overlay/phone.png', 'assets/overlay/tablet.png', 'assets/overlay/theme.tsv'])
+                self.assertEqual(sorted(n for n in z.namelist() if n.startswith('assets/')), ['assets/nxnative/licenses/zstd.txt', 'assets/overlay/phone.png', 'assets/overlay/tablet.png', 'assets/overlay/theme.tsv'])
+                self.assertEqual(z.read('assets/nxnative/licenses/zstd.txt'), (REPO / 'nxnative/dm/third_party/zstd/LICENSE').read_bytes())
                 self.assertEqual(z.read('assets/overlay/tablet.png'), (pack / 'tablet.png').read_bytes())
         finally:
             shutil.rmtree(t, ignore_errors=True)
@@ -177,7 +178,7 @@ class DataPack(unittest.TestCase):
             font_env = ['DM_SHARED_FONT_EXT=/sdcard/Android/data/org.nx2a.test/files/nintendo_ext.ttf']
             port = SimpleNamespace(aw=t / 'android', game=t / 'game', patched=t / 'patched',
                 ap=profiles.load(NEO), g={'ipa': 'Test.ipa'}, app_name='Test', pkg_ver='v0', display='1.0',
-                aoc=None, lang='en-US', package='org.nx2a.test', dmsv=shaders,
+                aoc=None, lang='en-US', package='org.nx2a.test', dmsv=shaders, texture_target='bc',
                 fps_env=['DM_FPSLOCK=/example/fpslock.tsv'], fps_files={'fpslock.tsv': fps}, result={},
                 button_font=lambda: (font_env, {'nintendo_ext.ttf': font}))
             for mode in ('embedded', 'external'):

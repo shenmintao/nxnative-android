@@ -55,6 +55,7 @@ GFX = srcs('gfx/*.c', 'gfx/nvn/*.c', 'gfx/tex/*.c')
 PORT = [p for p in srcs('android/compat/*.c', 'android/*.c') if not (p.name == 'gfx_null.c' and a.gfx != 'null') and not (p.name.startswith('gfx_vk') and a.gfx != 'vk')]   # one graphics backend
 ASM = srcs('host/entry.S', 'gfx/nvn/nvn_entry.S', 'gfx/nvn/nvn_thunks.S')
 VPX = srcs('third_party/libvpx/**/*.c')
+ZSTD = srcs('third_party/zstd/lib/common/*.c', 'third_party/zstd/lib/decompress/*.c')
 
 INC = ['-include', str(DM / 'android/compat/include/darwin_compat.h'), f'-I{DM / "android/compat/include"}', f'-I{DM / "host"}', f'-I{DM / "gfx/nvn"}', f'-I{DM / "gfx/tex"}', f'-I{DM / "gfx/nvn/include"}',
        f'-I{DM / "third_party/vulkan-headers/include"}', f'-I{gen / a.game}', f'-I{DM / "third_party/libvpx"}', f'-I{DM / "third_party/stb_vorbis"}', f'-I{DM / "android"}']
@@ -99,7 +100,7 @@ def build(files):
             elif err.strip() and '--verbose' in sys.argv: print(err, file=sys.stderr)
     return objs, failed
 
-all_files = HOST + GFX + PORT + ASM
+all_files = HOST + GFX + PORT + ASM + ZSTD
 objs, failed = build(all_files)
 vobjs, vfailed = build(VPX)
 failed += vfailed

@@ -28,6 +28,7 @@ class Options:
     app_name: str = ''                 # the launcher label (default: the game's name in its control data)
     install: bool = False              # install on the device after packing
     device: str = ''                   # adb serial
+    target_gpu: str = 'auto'           # connected device, or an explicit offline model/GPU family
     replace_signer: bool = False       # uninstall an app of the same package signed with another key
     debug: bool = False                # a development build: debug information, debuggable, DM_CTL
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
@@ -169,6 +170,9 @@ class Port:
         o.keys = Path(keys).expanduser().resolve()
         try: self.tools = toolchain.require(self.cfg, str(o.keys), adb=o.install)
         except toolchain.ToolError as e: raise BuildError(str(e)) from e
+        from porter.texture_target import select
+        exe = self.tools.get('adb') or toolchain.find_adb(self.cfg)
+        self.texture_target = select(o.target_gpu, adb=Adb(exe, o.device or self.cfg.get('device')) if exe and o.target_gpu == 'auto' else None)
         o.out = Path(o.out or self.cfg.get('out') or o.folder).expanduser().resolve()
         # the chosen dotnet first on PATH, in this process too: Windows finds a program by the parent's PATH, not the one passed to the child (upstream runs `dotnet` by name)
         os.environ['PATH'] = os.pathsep.join([str(self.tools['dotnet'].parent), os.environ.get('PATH', '')])
@@ -605,10 +609,22 @@ class Port:
     def data(self):
         PROG.stage('data pack', step='button-icon font')
         font_env, font_files = self.button_font()
+        texture_files, texture_info = {}, None
+        if self.texture_target == 'astc':
+            from porter.textures import generate
+            sidecar = self.aw / 'textures.astc'
+            previous = os.environ.get('DM_YAZ0_LIB')
+            try:
+                if decoder := self.env.get('DM_YAZ0_LIB'): os.environ['DM_YAZ0_LIB'] = decoder
+                texture_info = generate(self.game / 'RomFS', self.aoc, sidecar, self.aw / 'texture-cache', self.tools['ndk'], self.o.jobs)
+            finally:
+                if previous is None: os.environ.pop('DM_YAZ0_LIB', None)
+                else: os.environ['DM_YAZ0_LIB'] = previous
+            texture_files['textures.astc'] = sidecar
         dst = self.aw / 'apk-data' if self.o.data_mode == 'embedded' else self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files},
+                             files={**self.fps_files, **font_files, **texture_files}, textures=texture_info,
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst; self.result.update(data=str(dst) if self.o.data_mode == 'external' else None, data_mode=self.o.data_mode)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')

@@ -40,7 +40,7 @@ A profile is offered for Android when it has an `android.tsv`; the profiles with
 | `tested` | `<version> <device>`: the version and device the status was checked on |
 | `package` | The app's package name (default `org.nx2a.t<title ID in lowercase>`) |
 | `orientation` | `landscape` (default) or `any` |
-| `requires` | Device features the game needs, checked by the installer: `bcn` (BC texture compression) |
+| `requires` | Device features the game needs, checked by the installer: `bcn` (BC texture compression). An offline ASTC pack substitutes `astc-ldr` and `astc-unorm8` in its manifest; the profile stays unchanged. |
 | `setting` | `<name>=<value>`: the pause menu's defaults on first launch (`overlay`, `rumble`, `docked`, `fps`: the frame rate counter in the top left corner, off by default; `opacity`: the gamepad's, 20 to 80 percent by 5, 60 by default), written to the data pack's `settings.txt`, where the app also keeps the player's own gamepad layout from the pause menu's layout editor (`ui=` rows) and its Snap to grid (`grid`, off by default) |
 | `env` | `<KEY>=<VALUE>`: a host switch the game needs on Android, written to the data pack's `env.txt` |
 | `overlay` | `<tablet\|phone> <control> <x> <y>`: moves one on-screen control of that layout (`dm/android/overlay_default.tsv`) to x, y as fractions of the window, compiled into `android_profile.h` |
@@ -60,11 +60,65 @@ Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patch
 | rewrite | `patch_nso.py` with `DM_TARGET=android` | `android/patched_<version>/` |
 | shaders | `shader_split.py` (the DLC's own shaders too, `aoc/` given as `DM_SPLIT_AOC`), then `shader_vk.py` (SPIR-V) with the translator built from the repository's source (`dm/gfx/tools/dmsh_xlate` over `dm/third_party/ryujinx`, once per player in their nx2android folder), plus the shaders captured on the device (below) | `shader/pkg`, `android/shaders.dmsv`, `android/captured_shaders/` |
 | host | `dm/android/build.py --release` with the player's NDK (`--debug`: a development build, debug information and `DM_CTL`) | `android/host/libdmhost.so` (`android/host-debug/`) |
-| data | Stage the files the app needs; external mode writes the output directory, embedded mode stages under the build directory | `{mods,RomFS,aoc,shaders.dmsv,nintendo_ext.ttf,env.txt,settings.txt,nx2a-data.json}` (+ `fpslock.tsv` with `--fps60`); the button-icon font is made in `android/font/` |
+| data | Stage the files the app needs; external mode writes the output directory, embedded mode stages under the build directory; non-BC targets precompute and verify the complete mixed ASTC sidecar | `{mods,RomFS,aoc,shaders.dmsv,nintendo_ext.ttf,env.txt,settings.txt,nx2a-data.json}` (+ `fpslock.tsv` with `--fps60`, `textures.astc` for ASTC targets); font in `android/font/`, texture work in `android/texture-cache/` |
 | apk | `dm/android/apk/mkapk.py`, signed with the player's own key and the selected gamepad theme (`assets/overlay/`); embedded mode streams the staged data into the APK | `<out>/<App>.apk` |
 | install | `adb install`, the profile's `requires` checked against the device, the data pack pushed (optional) | |
 
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
+
+### Texture target and offline ASTC data
+
+The GUI's **Target GPU** and CLI `--target-gpu` select the data representation.
+`auto` uses the selected connected device's existing BC capability detection;
+a non-BC device also needs positive Vulkan ASTC LDR and `VK_EXT_astc_decode_mode`
+evidence. Offline GUI/CLI choices are `adreno`, `xclipse` (native BC), or `mali`,
+`immortalis`, `powervr` (offline ASTC); the CLI also accepts `nvidia` for native
+BC. Model aliases are `tb323fu` → Adreno and
+`v2405a`, `pd2405`, `dimensity-9400` → Immortalis. Unknown models require an
+explicit GPU-family choice. Offline selection makes no device calls. BC targets
+retain the original data and manifest requirements.
+
+`porter/textures.py` scans owned BNTX images through the existing SARC/Yaz0 readers
+and runtime Tegra addressing helpers. It precomputes guarded BC1 direct blocks
+and astcenc fallbacks; BC3/unsigned BC5 use thorough encoding with a 38 dB image
+gate (RGB/alpha and meaningful BC5 RG). BC5 angular errors are recorded. Failed
+BC3/BC5 images are whole-image lossless exceptions; BC4/SNORM and unsupported or
+unknown contents retain CPU decoding. The original game files are preserved.
+At most four desktop jobs run; the native helper currently supports Windows and
+Linux x64. Arm astcenc 5.7.0 archives have SHA-256 pins, are downloaded only when
+needed and retain Apache-2.0 and CLI dependency notices. The Windows bundle
+carries the helper sources, NumPy and notices, without the downloaded toolchain
+or any game data. Source/tool/content hashes key the private generation cache.
+Generated APKs carry the zstd decoder's BSD license in their assets.
+
+`textures.astc` version 1 is the **complete** mixed representation: a checked,
+sorted index plus one independent zstd frame per converted image, including all
+layers/mips in that order. Keys hash the original tightly packed BC content and
+format/geometry; each frame has its decoded size and SHA-256. The data manifest
+records representation, bank hash, entry/exception counts and raw bytes. The
+installer checks ASTC LDR plus UNORM8 decode-mode support and verifies external
+banks before installing. A native BC pack still requires `bcn`. Switching back
+to a BC pack removes an obsolete managed sidecar. Large packs use external mode.
+
+Only `!V.has_bc` devices with ASTC decode-mode support open the bank. Before
+image creation, `gfx_vk_tex.c` deswizzles/hashes published 2D/array/cube content
+and looks up the whole image. A verified match fixes physical storage to ASTC
+4x4 UNORM/sRGB; otherwise the original format/decode path remains. The block grid
+is unchanged. Views compose the existing swizzles, force alpha for BC1 RGB and
+map BC5's encoded R/alpha back to RG. UNORM views request UNORM8 decoding, as used
+by the quality checks. No BC-to-ASTC encoder is linked into Android.
+
+CPU re-uploads revalidate the complete content. Unknown replacements, arbitrary
+GPU copies/writes, attachments and incompatible reinterpretations use the legacy
+lossless image. While an image stays ASTC, a retained original BC snapshot allows
+safe demotion before partial writes; it costs extra host memory, reported by the
+periodic sidecar counters. Storage replacement invalidates cached views and the
+descriptor image epoch, deferring old handles until queued work is complete.
+Decompression is synchronous **per image**, bounded to 256 MiB decoded ASTC,
+never the full pack. Source hashing, IO and decompression remain possible load
+hitches; PC timings and the pending phone validation are in
+[the texture report](astc-transcode-plan.md). Native-BC devices, pacing and pair
+warming keep their existing behavior and defaults.
 
 The rewriter's generic spin-wait search includes lock-protected polls: every returning path must balance acquisition/release on the same address, carry no changed live register, and limit stores to invariant addresses and values beside an observed load. Paths that advance a work cursor remain outside the wait. These loops use the existing register-preserving spin gate and host back-off; no game ID or fixed instruction address is required.
 
@@ -132,7 +186,7 @@ Events: with `--progress json`, every line on stdout is one JSON object, the pro
 The player gets the bundle (`dist/nxnative-android-<version>-<os>-<cpu>.zip` from `python packaging/build_bundle.py`, for Windows and macOS): unzip, start `nxnative-android.exe` (`nxnative-android` on a Mac), nothing to install with pip. It does not ship toolchains; the Setup tab (`nx2android.exe -m porter doctor`, or `python -m porter doctor` from the repository) checks them and the free disk space, and its **Download missing tools** button (`porter tools --download`, `porter/fetch.py`) fetches the missing NDK, .NET SDK and platform-tools from Google's SDK repository and Microsoft's release list, checks each archive against the checksum its list gives, and unpacks them into the player's nx2android folder (`toolchains/`), which the finders search:
 - **Android NDK r27c** (`ANDROID_NDK_HOME`, the configured path, or the usual install folders). No Android SDK or JDK: `mkapk.py` writes and signs the APK itself.
 - **.NET SDK 10**: builds `nx_extract` and the shader translator, and runs them.
-- From the repository instead of the bundle: **Python 3.12+** with `requirements.txt` (`lz4`, `capstone`, `pillow`, `fonttools`, and `PySide6` for the GUI): the port runs the engine's own Python tools (the rewriter, the shader split). The bundle carries that Python.
+- From the repository instead of the bundle: **Python 3.12+** with `requirements.txt` (`lz4`, `capstone`, `pillow`, `fonttools`, NumPy for offline ASTC generation, and `PySide6` for the GUI): the port runs the engine's own Python tools (the rewriter, the shader split). The bundle carries that Python.
 - **adb** (platform-tools), only to install from the tool.
 - Their own **prod.keys**. Keys and game files are never copied into the repository or the app.
 

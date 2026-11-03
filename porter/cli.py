@@ -18,6 +18,7 @@ def _parser():
     po.add_argument('--app-name', default='', help='the app\'s name on the device (default: the game\'s name)')
     po.add_argument('--install', action='store_true', help='install on the connected device afterwards')
     po.add_argument('--device', default='', help='adb serial of the device to install on')
+    po.add_argument('--target-gpu', default='auto', help='auto: connected device; offline: adreno, xclipse, mali, immortalis, powervr, or a documented model (tb323fu, v2405a, pd2405, dimensity-9400)')
     po.add_argument('--replace-signer', action='store_true', help='uninstall an app of the same package signed with another key first (deletes its saves)')
     po.add_argument('--debug', action='store_true', help='a development build: debug information, debuggable, DM_CTL key presses')
     po.add_argument('--experimental', action='store_true', help='try a game not ported to Android yet (a profile guessed from a survey of its files; it may not start)')
@@ -38,6 +39,10 @@ def _parser():
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
     ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='a standalone APK, or a data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK for an external data pack (default: <App>.apk beside the pack)')
     ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
+    tx = sub.add_parser('textures', help='precompute the ASTC sidecar from an already extracted owned RomFS (offline)')
+    tx.add_argument('--romfs', required=True); tx.add_argument('--aoc'); tx.add_argument('--out', required=True)
+    tx.add_argument('--work', required=True); tx.add_argument('--ndk', required=True); tx.add_argument('--jobs', type=int, default=4)
+    tx.add_argument('--progress', default='lines', choices=('lines', 'json', 'off'))
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
     t.add_argument('--download', action='store_true', help='download and unpack them into the nx2android folder (you accept their licenses)')
@@ -127,7 +132,7 @@ def cmd_port(a):
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, jobs=a.jobs, data_mode=a.data_mode)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, jobs=a.jobs, data_mode=a.data_mode, target_gpu=a.target_gpu)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -143,6 +148,21 @@ def cmd_install(a):
         PROG.plan(1)
         cfg = config.load()
         install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer)
+    return _with_progress(a.progress, go)
+
+
+def cmd_textures(a):
+    from porter import native_tools
+    from porter.textures import generate
+    from porter.upstream import PROG
+    def go():
+        PROG.plan(1); PROG.stage('offline ASTC textures')
+        logs = Path(a.work) / 'logs'; logs.mkdir(parents=True, exist_ok=True)
+        decoder = native_tools.yaz0(a.ndk, logs, dict(os.environ))
+        if decoder: os.environ['DM_YAZ0_LIB'] = str(decoder)
+        result = generate(a.romfs, a.aoc, a.out, a.work, a.ndk, a.jobs)
+        PROG.end(f'{result["entries"]:,} images, {result["exceptions"]} lossless exceptions, {result["bytes"]:,} bytes')
+        _print_json(result)
     return _with_progress(a.progress, go)
 
 
@@ -217,4 +237,4 @@ def cmd_saves(a):
 def main(argv):
     if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8', errors='replace')   # game names and progress bars on a Windows console
     a = _parser().parse_args(argv)
-    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves}[a.cmd](a)
+    return {'doctor': cmd_doctor, 'profiles': cmd_profiles, 'inspect': cmd_inspect, 'port': cmd_port, 'install': cmd_install, 'devices': cmd_devices, 'tools': cmd_tools, 'config': cmd_config, 'saves': cmd_saves, 'textures': cmd_textures}[a.cmd](a)

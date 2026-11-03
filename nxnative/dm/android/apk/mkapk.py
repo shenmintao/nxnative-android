@@ -220,6 +220,7 @@ def main():
         json.dump({**{a: str(v) for a, v in k.items()}, 'cert': crt.hex()}, open(keyf, 'w'))
         print(f'new signing key {keyf} ({time.time() - t:.1f} s)')
     entries = [Entry('AndroidManifest.xml', axml(MANIFEST)), Entry('classes.dex', Path(__file__).resolve().parent / 'bridge/classes.dex'), Entry(f'lib/{ARGS.abi}/lib{LIB}.so', Path(so), 16384)]
+    entries.append(Entry('assets/nxnative/licenses/zstd.txt', Path(__file__).resolve().parents[2] / 'third_party/zstd/LICENSE'))
     entries += [Entry(f'lib/{ARGS.abi}/{os.path.basename(x)}', Path(x), 16384) for x in ARGS.extra_so]
     entries += [Entry(f'assets/{n}', Path(f)) for n, _, f in (x.partition('=') for x in ARGS.asset)]
     if ARGS.icon: entries += [Entry('resources.arsc', res_table('res/drawable-nodpi-v4/icon.png')), Entry('res/drawable-nodpi-v4/icon.png', Path(ARGS.icon))]

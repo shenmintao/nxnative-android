@@ -23,6 +23,7 @@ def main():
         if not build_bootloader.is_local(): sys.exit('PyInstaller has its prebuilt bootloader, which antivirus engines flag: run python packaging/build_bootloader.py first')
     subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean', '--distpath', str(DIST), '--workpath', str(WORK), str(ROOT / 'packaging/nx2android.spec')], check=True)
     files = tracked('nxnative')   # the committed engine and profiles only: no local builds, keys or game files
+    files += tracked('porter/native') + [p for p in tracked('porter') if Path(p).name.startswith(('texture', 'astc_')) and p.endswith('.py')]
     for f in files:
         d = APP / f; d.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / f, d)
     docs = ['README.md', 'README.zh-CN.md', 'docs/ARCHITECTURE.md', 'docs/DEVELOPMENT_GUIDE.md',

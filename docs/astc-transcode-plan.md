@@ -1,20 +1,24 @@
-# BC to ASTC: offline feasibility, 2026-11-03
+# BC to ASTC: offline evidence and complete sidecar implementation
 
-Step 1 only, based on `b61cdce8`, branch `perf/astc-transcode`. No device commands,
+The original step-1 analysis below is based on `b61cdce8`, branch
+`perf/astc-transcode`. That analysis used no device commands,
 game launches, APKs, runtime/default/profile changes, installation-gate changes,
 production changes, merge or push. The supplied upstream investigation found no
 transcoder to port; the optional repeat search was not needed for these prototypes.
 
 The step-1b comparison appended below supersedes the initial storage recommendation.
 It measures ETC2/EAC and a compact ASTC patch, including complete BC1 image quality.
-Step 2 has not been implemented; runtime and porter defaults remain unchanged.
+The user subsequently chose the complete compressed mixed sidecar, not the patch
+or ETC2-only alternatives. The step-2 implementation and PC-only validation are
+recorded at the end. Phone validation and production changes remain separate.
 
 **Result:** the guarded BC1/BC4 direct paths meet the one-byte error bound in the
 reference-decoder sample. An unconditional eight-weight BC4 path cannot do so for
 some real blocks. ASTC-only re-encoding fails the 38 dB requirement, even at
 thorough: 46 unique payloads fail RGB or alpha, increasing to 50 when BC5's two
 meaningful channels are checked without diluting their error with constant blue.
-No implementation or quality-threshold change is approved by this report.
+That historical result rejected universal ASTC re-encoding. The approved mixed
+implementation retains lossless exceptions and the unchanged 38 dB gate.
 
 ## Inputs, coverage and reproducibility
 
@@ -763,3 +767,278 @@ cases, internal/independent reconstruction, complete BC1/padding coverage and
 all three 13,713-entry bank indexes pass. The unchanged repository source suite
 was rerun: **165 passed, 0 skipped**, 107.681 s, native Yaz0 enabled. Only this
 report and the perf-log entry are committed; no generated game data enters Git.
+
+## Step 2: implemented complete compressed sidecar (2026-11-03)
+
+The user selected the **complete mixed sidecar with per-image zstd frames**, not
+the patch or ETC alternatives. This implementation is an offline build and host
+verification result; Android rendering, memory and frame-time acceptance remain
+for step 3. No device command, installation or production change was performed.
+The earlier upstream search found no BC-to-ASTC implementation to port. Existing
+archive readers, Tegra layout/deswizzle code and `bcdec` are reused unchanged.
+
+### Generation and installation
+
+Both `porter port --target-gpu …` and the GUI's Target GPU control select the
+representation. `auto` uses the selected connected device's BC capability and,
+for a non-BC device, positive Vulkan ASTC LDR/decode-mode evidence. Offline users
+choose Adreno/Xclipse (native BC), or Mali/Immortalis/PowerVR (offline ASTC).
+The small model map is TB323FU -> Adreno and V2405A/PD2405/Dimensity-9400 ->
+Immortalis; unknown models require an explicit GPU family. An explicit target
+does not contact adb. Generation of non-BC data currently requires a Windows or
+Linux x64 PC; the existing native-BC path is unchanged on other desktop hosts.
+
+`porter textures --romfs <owned RomFS> [--aoc <owned aoc>] --out textures.astc
+--work <cache> --ndk <r27c> --jobs 4` also runs the final generator over an already
+extracted game, without connecting a device. The regular data stage invokes the
+same function. It scans BNTX images in loose files and nested SARC/Yaz0 archives,
+uses native deswizzling, and canonicalizes **all layers, then all mips**, omitting
+Tegra padding. Source content, geometry, policy, helper and encoder hashes key
+the reusable output cache. At most four image jobs run; each external encoder is
+single-threaded, with bounded 65,536-block atlases and replicated edge texels.
+
+The policy is unchanged: guarded BC1 direct blocks must decode within one byte
+of `bcdec`; the remaining BC1 blocks are PC-encoded. BC3 and unsigned BC5 use
+`-thorough -decode_unorm8`; BC5 uses the encoder's normal-map RA representation.
+RGB and alpha must each reach 38 dB over valid texels of the complete image;
+BC5 additionally gates meaningful RG at 38 dB and records reconstructed-normal
+median/p95 angular errors. No numerical angular threshold was approved, so none
+is invented: non-finite angular results fail, and finite errors remain evidence
+for step 3. Failed BC3/BC5 images become whole-image lossless exceptions. BC4,
+SNORM and unimplemented source formats retain the existing decode path.
+
+The official Arm astcenc **5.7.0**, commit
+`baff485b0ff36d2f95d28961605106502c653966`, is fetched only for ASTC generation;
+each supported release archive has a pinned SHA256. AVX2 is selected only after
+CPU and OS checks, with SSE2 as the x64 baseline. The experimental encoder from
+steps 1/1b is not silently reused: this final run regenerates and rechecks the
+images with the pinned official tool. Apache-2.0 and the CLI's bundled third-party
+notices are retained in `dm/third_party/astcenc` and copied with the tool and
+desktop bundle. Android includes only the zstd **1.5.7** decoder/common sources
+(upstream `f8745da6ff1ad1e7bab384bd1f9d742439278e99`, BSD-3-Clause option);
+no ASTC encoder or BC-to-ASTC converter is linked into the phone runtime.
+Generated APKs also retain the zstd BSD notice under `assets/nxnative/licenses/`.
+
+Native-BC packs retain the original manifest and data. An ASTC pack adds
+`textures.astc` and a `textures` record identifying `astc-mixed-zstd-v1`, the
+whole-bank SHA256, bytes, entries, exceptions and policy. Its manifest substitutes
+`astc-ldr` plus `astc-unorm8` for `bcn`, leaving the profile itself unchanged.
+The installer requires positive ASTC LDR and `VK_EXT_astc_decode_mode` support,
+and checks the bank hash and every image frame on the PC. A native-BC pack still
+requires `bcn`. Switching data packs removes a stale sidecar as managed content.
+The original owned RomFS and BC bytes remain in the pack; the sidecar is additive.
+
+### Wire format and runtime image decision
+
+Version 1 has a 128-byte `NXASTC01` header, sorted 128-byte index entries and one
+independent zstd-3 frame per accepted whole image. The index key is
+`SHA256(SHA256(tight BC bytes) || LE32(format,width,height,mips,layers,1))`.
+An entry records source format/geometry/block count, source and ASTC byte counts,
+frame offset/length, plaintext SHA256 and an exception flag. Header/index SHA256,
+policy pin, exact geometry/lengths, sorted unique keys and contiguous aligned
+ranges are checked before use; decompression rejects multiple/trailing frames,
+wrong content size and plaintext checksum mismatches. Limits are 262,144 entries
+and **256 MiB decoded ASTC per image**, checked before allocation. The writer
+round-trips every frame, verifies the completed bank and atomically replaces its
+output. There are no generated timestamps in the bank. Byte identity is scoped
+to identical pinned tool/ISA, generator and compression-library inputs.
+
+Before physical `vkCreateImage`, `astc_fetch()` in `gfx_vk_tex.c` deswizzles and
+hashes the published guest BC contents and looks up the complete image. A verified
+hit chooses ASTC 4x4 UNORM/sRGB; an exception, missing/unknown content, unsupported
+target/usage or missing/invalid bank keeps the existing lossless decode. Eligible
+targets are non-sparse, non-linear, single-sampled 2D/array/cube images with
+known pool storage, outside image-store use. An image first encountered without
+published contents or outside a submission remains on the legacy path. On a
+native-BC device the guard returns before opening or hashing the bank.
+
+ASTC upload uses the same 4x4 block grid, including small edge mips and every
+layer. BC1 RGB views force alpha one; BC5 exposes `(R,A,0,1)`; guest/view swizzles
+compose with those mappings. UNORM views request 8-bit ASTC decode so the PC
+one-byte check matches the intended hardware decode; sRGB uses the ASTC sRGB
+format. The shared-exponent feature is not needed for UNORM8 decode.
+See the [Khronos decode-mode definition](https://docs.vulkan.org/refpages/latest/refpages/source/VkImageViewASTCDecodeModeEXT.html).
+
+An ASTC image retains its original tight BC snapshot while live. A known CPU
+re-upload fetches its matching frame. Unknown CPU contents replace storage with
+the legacy decoded image. An arbitrary GPU copy/write, attachment use or
+incompatible format view first restores **all original BC subresources** into
+lossless storage, preserving untouched regions before the write. Replacement
+lands/splits the submission, defers old handles, invalidates cached views and
+advances the image epoch while retaining the logical image pointer. This avoids
+changing an image's Vulkan format in place or reconstructing lossy ASTC texels.
+The snapshot adds host memory beyond the logical texture inventory; its live
+bytes and demotions are reported and require phone measurement.
+
+Only the small index is read at first use. Frames decompress on demand; the
+whole pack is never expanded on replay. This version performs per-image
+deswizzle/hash/lookup and decompression synchronously. The 256 MiB limit bounds
+one decoded allocation, **not** total process or staging memory and **not** a
+frame-time guarantee. The host benchmark below measures the actual production
+`astc_fetch()` and decoder across the generated bank. Its decompress/hash log
+counter excludes the preceding BC deswizzle/source hash; the separate full-fetch
+benchmark includes them. No phone performance is inferred from the PC results.
+
+Every 300 presents, the runtime logs `ASTC sidecar: lookups=… hits=… misses=…
+exceptions=… failures=… demotions=…; … MB uploaded, … MB BC shadow;
+decompress+hash … ms total, … ms max (cumulative)`. A bad index or image frame
+reports a RED diagnostic and falls back to BC decode. A valid exception is
+ordinary fallback, not a RED. Pacing, pair warming, shader code, prediction and
+the PPE2 ABI are unchanged.
+
+### Tests, generated artifacts and remaining validation
+
+The final source suite passes **181 tests, 0 skipped** (180.465 s). New cases
+cover offline/automatic target selection without real adb, CLI and native Qt
+GUI forwarding, capability/manifest gates, deterministic banks and corrupt
+headers/indexes/frames, guarded direct BC1 blocks with the Arm reference decoder,
+encoder fallback and whole-image quality exceptions. Host C tests compile the
+production bank reader and extract the actual runtime image functions, with
+mock Vulkan calls: all mip/layer upload bytes, native BC, ASTC, exceptions/misses,
+known and unknown CPU re-uploads, failed replacement, view swizzles and preservation
+of untouched texels during partial GPU writes are checked. Release source checks
+and real debug/release compilation verify the sidecar path is present in both.
+All tests in this stage are offline; Vulkan mocks are not validation-layer proof.
+
+Debug, validation and release libraries compile all **157 Android sources with
+0 failures**; validation packages the same debug library plus the Khronos layer.
+Existing APKs are retained. The new APKs have no embedded game assets; the large
+external data pack is a separate private output. `BENCH/astc-sidecar-build.json`
+records commands, source/library/APK hashes and protected older APK identities.
+The native Windows Qt four-tab render was inspected; helper sources, NumPy and
+licenses are wired into bundle packaging, but a frozen Windows bundle was not
+built or published in this step.
+
+### Complete generation result
+
+The final tool scans all **48,157 files / 16,519,555,942 source bytes**, finding
+32,250 eligible catalog images / **13,713 unique entries**. A fresh image-cache
+run takes **3,302.485 s (55.04 min)**, including the scan, encoder/reference
+decoder, image gates, compression and verification; the NDK and official encoder
+were already cached. This exceeds the earlier approximately 27-minute encoding
+projection. Verified image outputs are reusable, but subsequent ports still scan
+the inputs and write/verify the bank.
+
+| Source | Unique images | Lossless exceptions | Retained RGB min / p5 / median, dB | Retained alpha min, dB |
+|---|---:|---:|---:|---:|
+| BC1 UNORM | 3,371 | 0 | 40.659 / 55.107 / 57.901 | 58.856 |
+| BC1 sRGB | 7,964 | 0 | 41.132 / 55.023 / 58.738 | 46.011 |
+| BC3 UNORM | 154 | 3 | 45.947 / 48.359 / 51.535 | 38.709 |
+| BC3 sRGB | 621 | 38 | 40.478 / 43.544 / 53.976 | 38.007 |
+| BC5 UNORM | 1,603 | 6 | 40.487 / 44.477 / 54.586 | exact |
+
+All retained images meet the unchanged 38 dB gates. BC5 meaningful RG min / p5 /
+median is **38.726 / 42.716 / 52.825 dB**. Among retained BC5 images, the median
+of per-image median angular errors is 0 degrees; median / p95 / maximum of their
+per-image p95 errors is **0.461 / 2.866 / 9.202 degrees**. These unweighted image
+statistics are not a new angular acceptance threshold. Normal-map appearance,
+including the tail, needs phone review. The **47 unique exceptions / 73 catalog
+aliases** are listed only in private `product/exceptions.csv` and
+`product/cache/generation.json`, with quality metrics and reasons.
+
+All **522,116,788 unique BC1 blocks** are covered: 394,446,904 guarded direct
+blocks have maximum reference-decoded error **1/255**; 127,669,884 blocks
+(24.452%) use PC encoder fallback. Every BC1 image passes its image gate.
+BC4/SNORM continue to use lossless decoding, with no ASTC blocks stored for them.
+
+| Complete sidecar component | Bytes |
+|---|---:|
+| Accepted full ASTC image bytes, before compression | 8,701,292,736 |
+| Header and 13,713-entry index | 1,755,392 |
+| Independent zstd image frames | 2,088,371,892 |
+| Frame alignment padding | 101,772 |
+| **Installed sidecar** | **2,090,229,056** |
+
+Sidecar SHA256:
+`a98538dce504ac769f0a4450734d46b3342216f5b7c3d85a93b352e7b40d1012`.
+Its compressed size matches the earlier experiment; its production wire
+contract/index differs, so the earlier experimental bank is not interchangeable.
+There are 13,666 complete compressed image frames plus 47 exception records.
+The PC's reusable raw BC/ASTC image cache is about **13.23 GB**, in addition to
+the sidecar and metadata; it is not included in the phone data pack.
+
+Logical inventory remains **16,874,636,483 catalog bytes / 10,123,802,415 unique
+bytes**, versus 61,495,964,017 catalog bytes through the current CPU decode.
+These totals exclude GPU allocation padding, staging, live-set selection and
+retained BC snapshots; they are not process RSS or a measured phone saving.
+The largest accepted whole-image ASTC payload is **116,044,624 bytes**.
+
+The final staged external pack is private
+`BENCH/astc-transcode/product/ZeldaBreathOfTheWild-astc-data`: **48,182 files /
+19,232,312,322 bytes**, including its control files. Staging and the complete
+source/frame/file audit take another **392.811 s**. All 48,157 owned source files
+match their source hashes, with zero mismatches; the original data manifest,
+preferences and settings remain unchanged. The new pack's environment/settings
+bytes also match the originals. No primary save is included.
+
+The data manifest SHA256 is
+`50534b643dc658b5e5ae41df6143fccde8109d50489cc7837b69de5d8757d02c`;
+the private complete `product/pack-files.json` file inventory has SHA256
+`bd0238615fb541a082e6c6dafc5af26affe3a7877a2994faf7e5fd9aef852527`.
+Rewriting the entire bank from the verified encoded-image cache takes 448.551 s
+and produces the identical 2,090,229,056-byte bank and whole-file SHA256. This
+checks deterministic assembly/compression with the same pinned inputs; it is
+not a second full scan/encode timing. Step 3 must select the desired APK with
+the installer's explicit `--apk` argument for this privately named data pack.
+
+### Production-code host latency and repeat checks
+
+Two serial C benchmarks verify **all 13,713 entries**, including the 47 ordinary
+exceptions, with zero lookup mismatches or frame verification failures. They
+compile the production bank reader, SHA implementation and zstd decoder at
+`-O2`; the full-fetch benchmark also extracts the actual `astc_fetch()` and uses
+the runtime Tegra layout/deswizzle code with prepared guest pool memory. It
+performs no Vulkan upload. Timings below cover the **13,666 accepted images**,
+one pass in sorted index order, on the i7-13700H Windows host:
+
+| Operation, milliseconds per image | Median | p95 | p99 | Maximum |
+|---|---:|---:|---:|---:|
+| Complete `astc_fetch()` | 1.147 | 26.419 | 119.445 | **1,516.219** |
+| Its frame IO + zstd + plaintext SHA | 0.759 | 18.075 | 82.158 | 1,058.388 |
+| Remaining deswizzle + source SHA + lookup/allocation | 0.381 | 9.685 | 40.115 | 457.830 |
+| Separate reader's index lookup | 0.0036 | 0.0072 | 0.0094 | 0.1606 |
+
+The first three rows are measured within the same full-fetch pass; percentiles
+are independent and cannot be added. The largest 116,044,624-byte accepted image
+is the 1.516 s case. This synchronous path **can hitch**; bounded allocation and
+per-image frames do not establish a useful frame-time bound. The measurements
+retain this risk for review rather than treating the median as an acceptance.
+The built-in runtime log reports only the second row, so it must be considered
+alongside frame/load timing when checking the phone.
+
+The generator and other benchmarks were stopped during each measurement pass.
+There was no affinity/frequency control; the bank had recently been verified,
+but OS cache residency was not controlled. Full-fetch timing excludes loading
+the BC source file and the harness's preparation/swizzle of guest memory;
+that guest source memory is warm. Cold IO, realistic demand order, actual Vulkan
+uploads, Android CPU cost and phone frame times are unmeasured. There is no
+PC-to-phone throughput extrapolation or claim that large textures fit a frame.
+
+Six additional **uncached** codec repeats cover all five stored source formats
+(including BC1 encoder fallbacks) and a quality exception. Encoded SHA256s,
+direct/fallback decisions and quality/exception results match the original run.
+The complete bank repeat checks assembly/compression separately as above.
+Raw CSVs, benchmark sources/build scripts, complete file/source hashes, quality
+exceptions and repeat records remain under `BENCH/astc-transcode/product/`.
+`BENCH/astc-sidecar-validation.json` indexes these results; the corresponding
+`astc-sidecar-build.json` records source-to-library-to-APK identities.
+
+The final APKs include the decoder license. Earlier same-library APKs without
+that asset are retained under their initial names; use these **`*2.apk`** files
+for step 3:
+
+| APK under BENCH | Bytes | SHA256 |
+|---|---:|---|
+| `astc-sidecar-debug2.apk` | 9,754,463 | `ffaaf1ba832f5b1ba1957067119e54ee18899275d9074026a3ea438e9d6be60d` |
+| `astc-sidecar-validation2.apk` | 37,443,707 | `97bbf5fb34e16bf19c11faa020264424ccb5a6bca476964f404413c3ef1c0309` |
+| `astc-sidecar-release2.apk` | 3,209,135 | `0e9d049eaee0d866a46231c9c0c8d6aca5569a772b11679894c2a72bcd443b77` |
+
+Step 3 must validate the real phone install/capability gate, normal rendering
+(especially sRGB, alpha, BC5 normals, mips, cube/array textures), save/load and
+movement with the Vulkan layer; confirm meaningful sidecar hits and expected
+exception/BC4/SNORM fallback with no new RED; and measure load time, large-image
+fetch/upload stalls, re-upload/demotion correctness, live BC-shadow/RSS/PSS and
+frame-time tails. The saved phone JSON is evidence of capabilities, not an
+installation or rendering test. The existing lossless path's raw compressed
+readback/reinterpretation limitations are not solved by this sidecar. No device
+acceptance or production promotion follows from these host results.

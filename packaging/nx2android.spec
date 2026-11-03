@@ -12,7 +12,7 @@ for m in sorted(sys.stdlib_module_names - NOT_STDLIB):
     if m.startswith('_') and m not in ('__future__',): hidden.append(m); continue
     hidden += collect_submodules(m, filter=lambda n: not any(p in NOT_STDLIB or p in ('tests', 'test') for p in n.split('.'))) or [m]
 datas, binaries = [], []
-for pkg in ('capstone', 'lz4', 'PIL', 'yaml', 'fontTools', 'Crypto') + (('backports.zstd',) if sys.version_info < (3, 14) else ()):
+for pkg in ('capstone', 'lz4', 'PIL', 'yaml', 'fontTools', 'Crypto', 'numpy') + (('backports.zstd',) if sys.version_info < (3, 14) else ()):
     d, b, h = collect_all(pkg); datas += d; binaries += b; hidden += h
 datas.append((str(ROOT / 'gui/icon.png'), 'gui'))   # the window icon
 

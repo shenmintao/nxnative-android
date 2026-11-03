@@ -9,6 +9,8 @@
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
+#include "astc_bank.h"
+#include <CommonCrypto/CommonDigest.h>
 #include <string.h>
 #define BCDEC_STATIC
 #define BCDEC_BC4BC5_PRECISE
@@ -19,6 +21,7 @@ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_
 const void *nvn_dirty_span(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len); void nvn_dirty_release(const void *addr, size_t len); uint64_t nvn_dirty_released(void); int nvn_dirty_runs(void);
 uint64_t nvn_dirty_now(void);
+int nvn_flushed(const void *p, uint64_t n);
 
 // ---------------- formats ----------------
 enum { K_NONE, K_FLOAT, K_INT, K_SINT };
@@ -166,6 +169,7 @@ static VkFormat srgb_twin(VkFormat f) {
     case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
     case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
     case VK_FORMAT_A8B8G8R8_UNORM_PACK32: return VK_FORMAT_A8B8G8R8_SRGB_PACK32; case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    case VK_FORMAT_ASTC_4x4_UNORM_BLOCK: return VK_FORMAT_ASTC_4x4_SRGB_BLOCK; case VK_FORMAT_ASTC_4x4_SRGB_BLOCK: return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -189,6 +193,58 @@ static int image_format_policy(VkImageCreateInfo *ci, int compressed, int color,
     // Preserve any other creation chain; narrowed colour declares its exact list.
     if (color) { list->pNext = ci->pNext; ci->pNext = list; }
     return 1;
+}
+static void vk_tex_view_drop_all(vkimg_t *im);
+static void compare_drop(vkimg_t *im);
+static dm_astc_bank *g_astc_bank;
+static pthread_once_t g_astc_once = PTHREAD_ONCE_INIT;
+static uint64_t g_astc_lookups, g_astc_hits, g_astc_misses, g_astc_exceptions, g_astc_failures, g_astc_demotions, g_astc_bytes, g_astc_shadow;
+static double g_astc_ms, g_astc_max_ms;
+static void astc_init(void) {
+    const char *path = getenv("DM_VK_ASTC_BANK"); if (!path || V.has_bc || !V.has_astc || !V.has_astc_decode) return;
+    char error[128]; g_astc_bank = dm_astc_open(path, error, sizeof error);
+    if (!g_astc_bank) { VKLOG("[RED] ASTC sidecar rejected: %s; using BC decode", error); return; }
+    VKLOG("ASTC sidecar: complete mixed v1, per-texture zstd, UNORM8 decode; no on-device transcoding");
+}
+static vkfmt_t astc_format(const vkfmt_t *f, int source) {
+    vkfmt_t a = *f; a.vk = source == 0x45 || source == 0x46 || source == 0x48 ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    a.compressed = 1; a.dec = a.dbpp = 0; a.bw = a.bh = 4; a.bpb = 16;
+    if (source == 0x4b) a.swz = (VkComponentMapping){VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
+    else if (source == 0x41 || source == 0x45) a.swz.a = VK_COMPONENT_SWIZZLE_ONE;
+    return a;
+}
+// Resolve all layers/mips before vkCreateImage. A whole-image exception or an
+// unknown/dynamic image keeps the existing lossless format. Source order is
+// layer then mip, exactly as the desktop reader, independent of Tegra padding.
+static const dm_astc_entry *astc_fetch(const tex_t *t, const vkfmt_t *f, uint8_t **bc, uint8_t **data) {
+    *bc = *data = NULL;
+    if (V.has_bc || !V.has_astc_decode || !f->dec || !dm_astc_source_format(t->d.format) || !vk_sub_open()) return NULL;
+    pthread_once(&g_astc_once, astc_init); if (!g_astc_bank) return NULL;
+    uint32_t levels = t->d.levels ? t->d.levels : 1, layers = layers_of(&t->d);
+    uint64_t n = dm_astc_blocks(t->d.width, t->d.height, levels, layers);
+    if (!n || (t->d.target != NVN_TEXTURE_TARGET_2D && t->d.target != NVN_TEXTURE_TARGET_2D_ARRAY &&
+        t->d.target != NVN_TEXTURE_TARGET_CUBEMAP && t->d.target != NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) || t->d.samples > 1 ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_IMAGE)) ||
+        !t->pool || !t->pool->mem || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || !t->mem || t->off < 0 || (uint64_t)t->off > t->pool->size || !t->L.size || t->L.size > t->pool->size - (uint64_t)t->off ||
+        t->mem != t->pool->mem + t->off) return NULL;
+    if (!t->has_layout && !(t->pool->flags & (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED)) && !nvn_flushed(t->mem, t->L.size)) return NULL;
+    size_t size = (size_t)n * f->bpb; uint8_t *source = malloc(size); if (!source) return NULL;
+    size_t offset = 0;
+    for (uint32_t ly = 0; ly < layers; ly++) for (uint32_t lv = 0; lv < levels; lv++) {
+        uint32_t w = t->d.width >> lv, h = t->d.height >> lv; if (!w) w = 1; if (!h) h = 1;
+        size_t pitch = (size_t)((w + 3) / 4) * f->bpb;
+        if (nvn_deswizzle(&t->d, lv, ly, t->mem, source + offset, pitch)) { free(source); return NULL; }
+        offset += pitch * ((h + 3) / 4);
+    }
+    uint8_t sha[32]; CC_SHA256(source, (CC_LONG)size, sha); g_astc_lookups++;
+    const dm_astc_entry *e = dm_astc_find(g_astc_bank, sha, dm_astc_source_format(t->d.format), t->d.width, t->d.height, levels, layers);
+    if (!e || !e->flag) { if (e) g_astc_exceptions++; else g_astc_misses++; free(source); return NULL; }
+    uint8_t *output = malloc((size_t)e->bytes); struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+    int ok = output && dm_astc_read(g_astc_bank, e, output, (size_t)e->bytes);
+    clock_gettime(CLOCK_MONOTONIC, &b); double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+    g_astc_ms += ms; if (ms > g_astc_max_ms) g_astc_max_ms = ms;
+    if (!ok) { g_astc_failures++; VKRED_ONCE(98, "ASTC texture frame failed size/checksum verification; using BC decode"); free(source); free(output); return NULL; }
+    g_astc_hits++; g_astc_bytes += e->bytes; *bc = source; *data = output; return e;
 }
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     vkimg_t *im = calloc(1, sizeof *im);
@@ -239,6 +295,30 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
     return im;
 }
+// Keep the logical image stable while replacing its storage. Previously issued
+// descriptors retain deferred old handles; unissued bindings see the new epoch.
+static int image_replace(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
+    vkimg_t *next = img_new(t, f); if (!next) return 0;
+    vk_end_pass_land(); vk_sub_restart();
+    extern pthread_mutex_t g_present_mu; pthread_mutex_lock(&g_present_mu);
+    vk_lrz_forget(im); compare_drop(im); vk_tex_view_drop_all(im);
+    if (im->full) vk_defer_free_view(im->full);
+    if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem);
+    im->img = next->img; im->mem = next->mem; im->sub = next->sub; im->fmt = next->fmt; im->full = VK_NULL_HANDLE;
+    im->layout = next->layout; im->usage = next->usage; im->cflags = next->cflags; im->fixed_fmt = next->fixed_fmt; im->fmt2 = next->fmt2;
+    im->wide_fail_frame = 0; g_vk_image_gen++; pthread_mutex_unlock(&g_present_mu); free(next); return 1;
+}
+static void astc_upload(vkimg_t *im) {
+    VkCommandBuffer cb = vk_upload_cmd(); vk_tex_prepare(cb, im); size_t offset = 0;
+    for (uint32_t ly = 0; ly < im->layers; ly++) for (uint32_t lv = 0; lv < im->levels; lv++) {
+        uint32_t w = im->w >> lv, h = im->h >> lv; if (!w) w = 1; if (!h) h = 1;
+        size_t bytes = (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16; VkBuffer sb; VkDeviceSize so;
+        memcpy(vk_scratch(bytes, 16, &sb, &so), im->astc_pending + offset, bytes); offset += bytes;
+        VkBufferImageCopy r = {so, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, 1}};
+        vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    }
+    free(im->astc_pending); im->astc_pending = NULL; vk_tex_written(im);
+}
 void vk_tex_prepare(VkCommandBuffer cb, vkimg_t *im) {
     if (im->layout == VK_IMAGE_LAYOUT_GENERAL) return;
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, 0, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
@@ -256,6 +336,12 @@ static int pkg_upload(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracked
     return ok;
 }
 static int pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracked) {
+    if (im->astc && !im->astc_pending) {
+        uint8_t *source, *data; const dm_astc_entry *e = astc_fetch(t, f, &source, &data);
+        if (!e && !image_replace(im, t, f)) return 0;
+        g_astc_shadow -= im->astc->source_bytes; free(im->astc_bc); im->astc_bc = source; im->astc_pending = data; im->astc = e;
+        if (e) g_astc_shadow += e->source_bytes; else g_astc_demotions++;
+    }
     { static int n; const char *e = getenv("DM_VK_LOG_UPLOADS"); if (e && atoi(e) && n < 60) { n++;   // which packaged textures are (re-)uploaded
         VKLOG("upload: serial %llu %ux%ux%u nvn format %#x (vk %d) target %d levels %u layers %u flags %#x stride %u size %llu mem %p, tileH*100+pkg_block_h %d%s",
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
@@ -268,6 +354,7 @@ static int pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f, int tracke
         im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
         im->pkg_mem = t->mem; im->pkg_len = t->L.size; im->pkg_released = 0;
     }
+    if (im->astc) { astc_upload(im); return 1; }
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1, bpb = f->bpb;
     if (!bpb) { VKRED_ONCE(12, "packaged texture format %#x has no block size", t->d.format); return 0; }
@@ -353,7 +440,7 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); compare_drop(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); compare_drop(im); if (im->astc) g_astc_shadow -= im->astc->source_bytes; free(im->astc_bc); free(im->astc_pending); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     akey ks[64]; int n = 0;
     for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
@@ -382,7 +469,10 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     int fresh = 0;
     if (!im) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
-        im = img_new(t, f); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
+        uint8_t *source, *data; const dm_astc_entry *e = astc_fetch(t, f, &source, &data); vkfmt_t a;
+        if (e) a = astc_format(f, t->d.format);
+        im = img_new(t, e ? &a : f); if (!im) { free(source); free(data); pthread_mutex_unlock(&g_img_mu); return NULL; }
+        if (e) { im->astc = e; im->astc_bc = source; im->astc_pending = data; im->sidecar_tracked = 1; g_astc_shadow += e->source_bytes; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size;
         if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
         fresh = 1;
@@ -391,7 +481,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     pthread_mutex_unlock(&g_img_mu);
     if (!vk_sub_open()) return fresh ? NULL : im;   // looked up outside a submission (present): nothing can be recorded, a new image has no contents yet
     if (t->mem && lin_copy(im, t, f)) {}
-    else if (t->mem && packaged_tex(t)) {
+    else if (t->mem && (packaged_tex(t) || im->sidecar_tracked)) {
         im->pkg_used = g_tex_frame;
         if (!im->packaged) { im->packaged = 1; pkg_upload(im, t, f, 1); }
         else {
@@ -401,6 +491,25 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         }
     } else if (im->layout != VK_IMAGE_LAYOUT_GENERAL && !initial_content(im, t, f)) vk_tex_prepare(vk_upload_cmd(), im);
     return im;
+}
+// Before an arbitrary GPU write, restore all original BC texels into the legacy
+// lossless image, then issue that write normally. This handles partial copies
+// and format reinterpretations without ever attempting phone-side encoding.
+vkimg_t *vk_tex_lossless(const tex_t *t) {
+    vkimg_t *im = vk_tex(t); if (!im || !im->astc) return im;
+    const vkfmt_t *f = vk_fmt(t->d.format);
+    if (!vk_sub_open() || !f || !image_replace(im, t, f)) return NULL;
+    VkCommandBuffer cb = vk_upload_cmd(); vk_tex_prepare(cb, im); size_t offset = 0;
+    for (uint32_t ly = 0; ly < im->layers; ly++) for (uint32_t lv = 0; lv < im->levels; lv++) {
+        uint32_t w = im->w >> lv, h = im->h >> lv; if (!w) w = 1; if (!h) h = 1;
+        size_t pitch = (size_t)((w + 3) / 4) * f->bpb; VkBuffer sb; VkDeviceSize so;
+        uint8_t *dst = vk_scratch((size_t)w * h * f->dbpp, 16, &sb, &so);
+        bc_decode(f, im->astc_bc + offset, pitch, w, h, 1, dst); offset += pitch * ((h + 3) / 4);
+        VkBufferImageCopy r = {so, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, lv, ly, 1}, {0, 0, 0}, {w, h, 1}};
+        vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    }
+    g_astc_shadow -= im->astc->source_bytes; free(im->astc_bc); free(im->astc_pending);
+    im->astc_bc = im->astc_pending = NULL; im->astc = NULL; g_astc_demotions++; vk_tex_written(im); return im;
 }
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the
 // least recently drawn ones beyond that while the protected runs, each splitting its pool's mapping, are more than PKG_RUNS (textures stay protected until the game writes them).
@@ -413,6 +522,9 @@ typedef struct { uint64_t used; vkimg_t *im; } pkg_age;
 static int pkg_age_cmp(const void *a, const void *b) { uint64_t x = ((const pkg_age *)a)->used, y = ((const pkg_age *)b)->used; return x < y ? -1 : x > y; }
 void vk_tex_sweep(void) {
     if (++g_tex_frame % 300) return;
+    if (g_astc_bank) VKLOG("ASTC sidecar: lookups=%llu hits=%llu misses=%llu exceptions=%llu failures=%llu demotions=%llu; %.2f MB uploaded, %.2f MB BC shadow; decompress+hash %.2f ms total, %.2f ms max (cumulative)",
+        (unsigned long long)g_astc_lookups, (unsigned long long)g_astc_hits, (unsigned long long)g_astc_misses, (unsigned long long)g_astc_exceptions, (unsigned long long)g_astc_failures, (unsigned long long)g_astc_demotions,
+        g_astc_bytes / 1048576.0, g_astc_shadow / 1048576.0, g_astc_ms, g_astc_max_ms);
     compare_report();
     uint64_t idle = 0, lru = 0, before = nvn_dirty_released();
     pthread_mutex_lock(&g_img_mu);
@@ -640,12 +752,15 @@ static VkImageUsageFlags image_view_usage(const tex_t *t, VkFormat fmt, int atta
     return usage;
 }
 VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, int as_attachment, vkimg_t **img_out) {
-    vkimg_t *im = vk_tex(t); if (img_out) *img_out = im;
+    vkimg_t *im = vk_tex(t);
+    if (im && im->astc && (as_attachment || (dm_astc_source_format(vw && vw->set_format ? vw->format : t->d.format) >> 8) != (dm_astc_source_format(t->d.format) >> 8))) im = vk_tex_lossless(t);
+    if (img_out) *img_out = im;
     if (!im) return VK_NULL_HANDLE;
     if (as_attachment) { im->wseq = ++g_wseq; im->gpu_w = 1; } else if (im->novl) alias_check(im);
     vk_watch(im, as_attachment ? "attachment" : "sampled or image");
     if (!as_attachment) { void vk_texdump_note(vkimg_t *im); vk_texdump_note(im); }
     const vkfmt_t *f = vk_fmt(vw && vw->set_format ? vw->format : t->d.format); if (!f) f = vk_fmt(t->d.format);
+    vkfmt_t af; if (im->astc) { af = astc_format(f, vw && vw->set_format ? vw->format : t->d.format); f = &af; }
     uint32_t lv0 = vw && vw->set_levels ? vw->base_level : 0, nlv = vw && vw->set_levels ? vw->nlevels : im->levels - lv0;
     if (lv0 >= im->levels) lv0 = im->levels - 1; if (!nlv || lv0 + nlv > im->levels) nlv = im->levels - lv0;
     // a 3D image drawn into: the view's layers are depth slices of its level (the image is 2D-array compatible). Xenoblade Chronicles 3 renders its 16x16x16 colour grading
@@ -680,6 +795,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     } else swz = (VkComponentMapping){0};
     VkFormat fmt = f->vk;
     const vkfmt_t *base = vk_fmt(im->nvn_format);
+    vkfmt_t ab; if (im->astc) { ab = astc_format(base, im->nvn_format); base = &ab; }
     const VkImageCreateFlags block_flags = VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     int block_view = base && base->compressed && !f->compressed && !f->depth && f->bpb == base->bpb &&
         (im->cflags & block_flags) == block_flags && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT;
@@ -708,6 +824,8 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL,
         block_view ? block_usage : image_view_usage(t, fmt, as_attachment)};
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
+    VkImageViewASTCDecodeModeEXT decode = {VK_STRUCTURE_TYPE_IMAGE_VIEW_ASTC_DECODE_MODE_EXT, NULL, VK_FORMAT_R8G8B8A8_UNORM};
+    if (im->astc) uci.pNext = &decode;
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }
     vview *nv = calloc(1, sizeof *nv); *nv = (vview){view, type, fmt, lv0, nlv, ly0, nly, swz, aspect, as_attachment != 0, uci.usage, head};

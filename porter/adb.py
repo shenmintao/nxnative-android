@@ -2,7 +2,7 @@
 # devices (a 6 GB RomFS), so small files go in batches and big files in 64 MB pieces that the device joins; a rerun resumes (files already at their size are skipped,
 # pieces already in place are kept). The port's own outputs are also compared by MD5: a rewriter cut changes a module without changing its size, and Unpacking's sdk cuts never
 # reached the device until they were. Pushes use -Z: compressing them took adbd down.
-import contextlib, hashlib, os, re, shlex, shutil, subprocess, tempfile, time
+import contextlib, hashlib, json, os, re, shlex, shutil, subprocess, tempfile, time
 from pathlib import Path
 
 
@@ -88,6 +88,16 @@ class Adb:
     def free_bytes(self, path='/sdcard'):
         out = self.shell(f'df -k {shlex.quote(path)} | tail -1', check=False).split()
         return int(out[3]) * 1024 if len(out) >= 4 and out[3].isdigit() else None
+
+    def astc_textures(self):
+        """Positive Vulkan feature/extension evidence for the offline sidecar policy."""
+        try:
+            report = json.loads(self.shell('cmd gpu vkjson', check=False))
+            devices = report.get('devices', [])
+            if not devices: return None
+            d = devices[0]
+            return bool(d.get('features', {}).get('textureCompressionASTC_LDR')) and 'VK_EXT_astc_decode_mode' in {e.get('extensionName') for e in d.get('extensions', [])}
+        except (ValueError, TypeError, AttributeError, AdbError): return None
 
     def installed(self, package):
         return f'package:{package}' in self.shell(f'pm list packages {shlex.quote(package)}', check=False).split()

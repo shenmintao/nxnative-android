@@ -1031,6 +1031,8 @@ static void *host_thread(void *a) {
     char p[PATH_MAX];
     snprintf(p, sizeof p, "%s/RomFS", g_data_root); setenv("DM_ROMFS", p, 1);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_data_root); setenv("DM_VK_SHADERS", p, 1);
+    snprintf(p, sizeof p, "%s/textures.astc", g_data_root);
+    if (!access(p, R_OK)) setenv("DM_VK_ASTC_BANK", p, 1); else unsetenv("DM_VK_ASTC_BANK");
     snprintf(p, sizeof p, "%s/nintendo_ext.ttf", g_data_root);
     if (!access(p, R_OK)) setenv("DM_FONT_DIR", g_data_root, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_data_root); env_file(p);
