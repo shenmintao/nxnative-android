@@ -1109,3 +1109,82 @@ partial-file inventory and final package/power checks are under
 **not evaluated**, and publication is blocked pending a new supervised session
 that completes installation and the approved protocol. No merge, push, tag,
 version bump or pre-release publication was performed.
+
+## Step 3 continued: transfer verified; startup RED gate, 2026-11-03
+
+The supervisor explicitly resumed the approved protocol after the transient
+transport stop above. Original artifacts, device, balanced settings, handheld
+stock DRS/target60/HOLD off/audio on, and acceptance thresholds are unchanged.
+Installation/file-transfer reads now allow120s, backoff/reconnection to the same
+serial for up to600s, and at most10 consecutive operation failures; harmless
+wake events run about every10s. A measurement disconnect may invalidate/restart
+its run once; no measurement disconnect occurred in this continuation.
+
+**The normal porter installation and complete integrity audit now pass.**
+The retained17,813,171,626 bytes were kept. All10 existing64MiB sidecar pieces
+passed SHA256 and were reused;22 pieces were added. All32 pieces were verified
+before assembly and again from the assembled file. The final bank SHA remains
+`a98538dce504ac769f0a4450734d46b3342216f5b7c3d85a93b352e7b40d1012`.
+On-phone SHA256 checks match **all48,182 pack files,0 mismatches**, including
+the final manifest (`50534b64...`). The release APK on-phone hash matches
+`0e9d049e...`. Resume plus audit takes446.063s; two adb failures during the
+read-only file audit recover under the approved tolerance. No10-failure or
+600s-absence limit is reached. Raw retry/reconnect records retain their byte
+observations; a separate normalized log attaches the latest committed transfer
+total to observations from the independent keepawake process.
+
+**V starts with the exact validation APK97bbf5fb, then the strict RED gate stops
+it before the title detector.** The layer is on. The retained log contains
+0 Vulkan validation errors and0 validation warnings up to that point, plus
+this one nonvalidation runtime line:
+
+```text
+[RED] memory pool <address> +0x123000 could not be zero-copy (-1): a GPU copy is refreshed before each submission (slow)
+```
+
+This comes from `gfx_vk_core.c:397`, `pool_add_one`, which selects the existing
+copied-pool fallback. It is present in the unchanged release path too. The
+zero-copy rejection's cause and the fallback's frame-time/memory cost are not
+diagnosed. It does not establish a crash or Vulkan validation failure. The
+controller's health check deliberately stops the process on this raw RED;
+the smoke requires RED0, and no exception for this nonvalidation line was
+applied. No debug/performance run, logging suppression, runtime fix, setting
+change or additional game experiment follows this stop.
+
+| Approved item | Continuation evidence / status |
+|---|---|
+| Complete non-BC install | PASS:48,182 file hashes;32/32 sidecar chunks; release/bank/manifest identities match |
+| Vulkan validation | PARTIAL: layer on,0 errors/0 validation warnings observed;1 runtime RED; V not completed |
+| Title/load/Plateau/route-end, BC5 normals | Not reached; no phone game screenshots or side-by-side comparison |
+| Sidecar coverage/fetch distribution/long-frame overlap | Not measured; no600-present sidecar counters, native benchmark not pushed/executed |
+| Save/reload +30s, RED0 and stable PID | Not run; startup raw RED1 exceeds0; final seed integrity is not a gameplay smoke |
+| 120s moving route +60s warmup,600s continuous run | Not run; fps, >17.5ms%, p99, >50/>100 and max remain unknown |
+| Same-debug OFF/ON comparison | Neither run; all regression limits remain unevaluated |
+
+There is one startup sample for PID31586: RSS1,481,208KiB
+(1,516,756,992 bytes), PSS1,326,189KiB (1,358,017,536 bytes).
+Current HAL CPU/GPU73.007C, skin35.819C, battery33.6C, severity0;
+CPU-policy maximums0/4/7 are2.1/3.0/2.7GHz. These are observations, not an
+attribution of caps or a measured gameplay series. Standard devfreq exposes no
+GPU cap sample. BC-shadow residency remains unknown and must not be confused
+with the copied memory pools. Game Mode remains `standard`. Pair warming logs
+enabled/four workers, but no completed counters; Google display timing remains
+advertised with runtime presentation samples unmeasured.
+
+**The requested complete end state is now met:** release2 hash0e9d049e,
+complete pack/bank and manifest retained, ordinary save restored from the owned
+seed copy with all17 file hashes matching. Validation/debug APKs and all private
+test roots/temporary UI, trace and probe files are removed. App stopped,
+screen OFF,30s timeout and system performance settings unchanged. Final bank
+and manifest hashes are checked again. The tablet, PC production export and
+production registry remain untouched.
+
+`BENCH/astc-phone-validation.json` appends this continuation and preserves the
+initial blocker snapshot/commit6d009761; new raw evidence is under
+`BENCH/astc-phone-validation/session-20261103-step3-resume/`.24 runtime/porter
+source hashes and all three APK hashes still match the build. The prior
+181/181 source checks with0 skips are retained, not rerun for these records.
+Publication remains blocked by the raw RED gate and incomplete device
+acceptance. Further testing needs supervisor review of that baseline line or
+a separately approved compatibility investigation; no criterion is relaxed.
+No merge, push, tag, version bump or publication is performed.
