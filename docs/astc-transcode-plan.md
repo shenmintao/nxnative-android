@@ -1188,3 +1188,88 @@ Publication remains blocked by the raw RED gate and incomplete device
 acceptance. Further testing needs supervisor review of that baseline line or
 a separately approved compatibility investigation; no criterion is relaxed.
 No merge, push, tag, version bump or publication is performed.
+
+## Step 3 baseline classification and V failure, 2026-11-03
+
+The supervisor explicitly classifies the one `pool_add_one` zero-copy(-1)
+message as a device-capability baseline notice: AHardwareBuffer import fails
+on this vivo/Mali device and the pre-existing runtime selects its copied-pool
+fallback. It is independent of ASTC and is not a correctness failure. The
+private health check now permits **exactly one matching line per process**;
+any other RED or repetition still fails. Raw log counts are preserved, with
+approved baseline and unexpected RED counts reported separately. This approval
+supersedes the prior strict-startup-RED blocker without changing APKs or code.
+
+V restarts with the exact validation2 APK97bbf5fb, the owned isolated seed,
+handheld/stock DRS/target60/HOLD off/audio on, and unchanged balanced settings.
+The plain vivo risk acknowledgement/Continue installation is confirmed through
+its observed UI; no setting/account change is required. The baseline line is
+accepted once and does not recur. Existing `DM_VK_PROF_SLOW=1` is enabled in V
+only to observe pool-sync cost; no measured APK is modified. OFF/ON profiling
+would remain off, but those runs are not reached.
+
+**V fails with one genuine Vulkan validation error**, after the baseline line:
+
+```text
+VUID-RuntimeSpirv-NonWritable-06341
+vkCreateGraphicsPipelines(): vertex shader descriptor Set0/Binding2,
+variable "vp_s0", VK_DESCRIPTOR_TYPE_STORAGE_BUFFER lacks NonWritable,
+but vertexPipelineStoresAndAtomics was not enabled.
+```
+
+The layer is on. The retained log has **raw RED2 = approved baseline1 +
+unexpected validation error1**,0 validation warnings. Required validation
+errors0, observed1: criterion1 FAILS by1. The process is deliberately stopped
+by the harness; a game crash or memory kill is not established. No shader or
+feature fix, APK rebuild, threshold change, extra run or experiment follows.
+
+### Recorded fallback cost, limited to startup
+
+- Notice pool: address`0x7a2300a000`, size`0x123000` = **1,191,936B /1.13671875MiB**.
+- The first24 allocation logs show zero-copy0.0MiB and cumulative copied
+  allocation162.6MiB. These capped startup allocation messages are not live
+  residency or bytes copied per submission.
+- No600-submission `copied pools` window is reached, so MiB/submission remains
+  **unmeasured**. The existing incremental sync may copy only dirty64KiB blocks;
+  the notice pool's full size must not be multiplied by submission count.
+- Existing slow-replay diagnostics for presents0/1 report75.8/216.0ms total
+  replay and0.0/0.0ms pool-sync, rounded to0.1ms. These two startup samples do
+  not quantify steady copying cost. Pool-sync timing includes tracking and
+  locks and is aggregate across copied pools, not isolated memcpy for one pool.
+
+Startup PID23418 has RSS1,434,524KiB (1,468,952,576B) and PSS1,287,677KiB
+(1,318,581,248B). Current HAL CPU/GPU69.614C, skin34.848C, battery33.3C,
+severity0; CPU policy0/4/7 maximums2.1/2.7/2.9GHz, Game Mode`standard`.
+No GPU devfreq cap sample is exposed. These are one startup observation,
+not a gameplay memory/thermal series or attribution of caps. BC-shadow
+residency remains unknown. Initial1280x720 target/crop and2800x1260 swapchain
+are logged, but main-pass DRS sampling and title detection are not reached.
+One display-timing refresh16.605ms is logged; actual presentation feedback is
+unmeasured. Pair warming announces four workers without completed counters.
+
+| Remaining approved item | Result |
+|---|---|
+| V validation | FAIL:1 error versus required0; baseline notice separately accepted once |
+| Title/load/Plateau/end visual and BC5 normal checks | Not reached |
+| Sidecar coverage, phone fetch distribution, long-frame correlation | Not run; no sidecar counters; native probe never pushed/executed |
+| Isolated save/reload +30s gameplay | Not run after V failure |
+| 120s route/60s warmup and600s continuous run, all frame/memory tails | Not run |
+| Same-debug OFF/ON no-regression | Neither run; all thresholds unevaluated |
+
+Required safe end state is restored again: exact release2/full data, final
+bank SHA a98538dc and manifest50534b64 verified, all17 owned-seed file hashes
+matched before atomic rename into the ordinary save while stopped. All
+validation/debug builds and private test roots/probe/trace/UI files are removed;
+app stopped, screen OFF,30s timeout and device performance settings unchanged.
+The tablet and PC production registry/export remain untouched.24 runtime/porter
+source hashes and all three APK hashes still match; the prior181/181 source
+checks with0 skips remain applicable and are not rerun for record-only edits.
+
+`BENCH/astc-phone-validation.json` appends this attempt and preserves both
+earlier blockers. Evidence and exact baseline matcher/copy-cost limits are in
+`BENCH/astc-phone-validation/session-20261103-step3-baseline/`, including
+`baseline-classification.json`, `V/failure.log`, raw profiler/memory/thermal
+data, setup UI screenshot and final state proof. Publication remains blocked
+by VUID06341 and the unexecuted acceptance tests. A separately scoped
+correctness investigation/fix and new validated APK are needed before testing
+can continue. No merge, push, tag, version bump or publication is performed.
