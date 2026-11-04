@@ -2237,3 +2237,10 @@ Readable vendor thermal/performance configurations are archived with source path
 - The game's own dynamic resolution has already dropped to 1024x576. ~168 passes a frame. Top pass means: the main 3,030-draw pass 2.7-3.2 ms, then 0-draw 1024x576 passes at 1.2-2.0 ms each (clear/load/store only), the rest small: per-pass load/store on a tiler looks like the main GPU cost.
 - Status vs acceptance: 22-25 fps against 55 (frame ~42 ms vs 18.2 ms). Kept today: robust default, continuation sync fix (+6.0 fps), gyro rotation. Rejected: pin big (+0.48), non-coherent zero-copy (-0.66). Remaining: fewer/lighter render passes on Mali (load/store ops, pass merging; days, artifact risk), scoping robustness to the faulting reads (pipeline robustness; source unknown), or trade-offs (30 fps cap/HOLD, resolution). User decision needed; 55 fps is not reachable on present evidence.
 - Evidence: BENCH/astc-phone-validation/session-20261104-gpu. Phone restored: release3 e85e77ce, 17 seed files, roots removed, stopped/OFF.
+
+### Clear-only passes keep only cleared attachments (rejected), 2026-11-04
+
+- Hypothesis: the 0-draw 1024x576 passes at 1.2-2.0 ms each (GPU attribution above) are folded-clear passes that still load and store every attachment through tile memory; seedds/nxnative attaches only the cleared ones (nvn_mtl.m `rp_begin_ex` clear_only).
+- Change (not kept): at `vk_end_pass`, a pass with only folded clears drops its uncleared colours and an uncleared depth-stencil (kept whole if either aspect clears); `DM_VK_CLEAR_TRIM=0` restored the old pass. 193 tests passed.
+- A/B (cleartrim-debug 7d27a924, AU selectors, prime pin, pin A/B cache, OFF = `DM_VK_CLEAR_TRIM=0`): OFF 22.98 / 21.79, ON 22.92 / 22.63 fps (+0.39, invalid: ON1 < OFF1). ON trimmed 13 passes and 15 attachments a frame; GPU busy 31.5 / 33.1 vs 31.8 / 32.0 ms; replay ~17.5 ms.
+- Conclusion: those passes do not cost their attachments' load/store; the per-pass times likely include the full pass-start barrier drain. Source reverted; diff and test kept in BENCH/astc-phone-validation/session-20261104-cleartrim.
