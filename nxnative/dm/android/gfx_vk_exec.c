@@ -162,6 +162,12 @@ static void replay_stall_read(void) {
     char *end; long ms = strtol(e, &end, 10); if (!*end && ms >= 1 && ms <= 1000) g_x_stall_ms = ms;
 }
 #endif
+// Qualcomm (Adreno: stock driver or Turnip) keeps a low-resolution depth buffer (LRZ) that goes stale across command buffers, so there
+// cuts happen only before a pass with a depth buffer new to the submission, depth passes are split only where a transfer touch can
+// drop the LRZ, and those touches run. Other GPUs have no LRZ: any pass boundary is a cut and depth passes split like colour ones,
+// so the first part reaches the GPU early. V2405A (Mali-G925), BotW fixed view: 22.70 / 21.31 -> 27.07 / 26.78 fps; the GPU had
+// idled ~11.5 ms a frame waiting for the first part. DM_VK_X_CUTANY, DM_VK_PASS_SPLIT_DEPTH and DM_VK_LRZ_TOUCH (live) override.
+static int lrz_vendor(void) { return V.props.vendorID == 0x5143; }
 static void x_read(int continuation) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = c ? atoi(c) : 128; if (!continuation) g_sub_pass = 0;
 #ifndef DM_RELEASE
     replay_stall_read();
@@ -184,15 +190,15 @@ static void x_read(int continuation) { const char *c = getenv("DM_VK_CB_DRAWS");
     { const char *tz = getenv("DM_VK_TRACE_SIZE"); snprintf(g_x_tracesize, sizeof g_x_tracesize, "%s", tz ? tz : ""); } const char *e; g_x_nobar = (e = getenv("DM_VK_X_NOBAR")) && atoi(e); g_x_depth = (e = getenv("DM_VK_X_DEPTH")) && atoi(e); g_x_color = (e = getenv("DM_VK_X_COLOR")) && atoi(e);
     g_x_nodepth = (e = getenv("DM_VK_X_NODEPTH")) && atoi(e);   // debugging: distinguish depth rejection from missing fragment outputs
     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
-    g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
-    g_lrz_touch = !((e = getenv("DM_VK_LRZ_TOUCH")) && !atoi(e)); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
+    g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) ? atoi(e) != 0 : !lrz_vendor(); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
+    g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) != 0 : lrz_vendor(); g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_depth_clone = depth_clone_mode();
     { const char *e = getenv("DM_VK_PIPELINE_PREDICT"); g_pipe_predict_on = !e || atoi(e); }
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 128;
     g_tail_draws = (e = getenv("DM_VK_TAIL_DRAWS")) ? atoi(e) : 0;
     if (g_tail_draws < 32 || g_tail_draws > 512) g_tail_draws = 0;
     g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e);
-    g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) ? atoi(e) : -1;   // auto; 0 keeps depth passes whole, 1 forces the diagnostic path
+    g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) ? atoi(e) : -1;   // auto (other GPUs than Adreno: always); 0 keeps depth passes whole, 1 forces the diagnostic path
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
     g_cmp_constant_on = (e = getenv("DM_VK_CMP_CONSTANT")) && atoi(e);
     g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = (e = getenv("DM_VK_ASYNC_PIPE")) && atoi(e); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } }
@@ -1864,7 +1870,7 @@ static int prepare_draw(int prim, int indexed) {
     // a depth buffer begun in an earlier command buffer can meet Adreno's stale LRZ (begin_pass). DM_VK_PASS_SPLIT_DEPTH=0 keeps them whole; =1 forces the diagnostic path, with begin_pass's
     // write-back of a depth texel (lrz_touch) before the second part. The pipeline, dynamic state, sets and buffers are bound again (vk_end_pass, g_cmd_gen); deferred
     // uniform updates stay deferred (the draws read their shadows), as at any cut. Only while vk_cmd_split can still begin a part: otherwise the pass would be cut for nothing
-    int depth_split_ok = !S.daspect || g_psplit_depth > 0 || (g_psplit_depth < 0 && S.pass_open == 1 && pass_split_depth_auto());
+    int depth_split_ok = !S.daspect || g_psplit_depth > 0 || (g_psplit_depth < 0 && (!lrz_vendor() || (S.pass_open == 1 && pass_split_depth_auto())));
     if (g_psplit > 0 && g_x_cbdraws > 0 && S.pass_open == 1 && g_pass_draws >= (uint64_t)draw_batch_limit(g_psplit) && !S.rast_discard && !g_tf_on && depth_split_ok) {
         // Reserve room for all remaining ordinary cuts. Additional pass cuts
         // must not exhaust slots that the old between-pass path could use.
