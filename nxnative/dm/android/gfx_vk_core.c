@@ -216,9 +216,10 @@ void vk_init(void) {
     V.max_aniso = V.props.limits.maxSamplerAnisotropy;
     // enable: everything the shaders may use that the device has
     VkPhysicalDeviceFeatures en = ff.features; en.robustBufferAccess = 0; en.shaderFloat64 = 0;
-    en.robustBufferAccess = vk_mali_robust(V.props.vendorID, ff.features.robustBufferAccess) ? VK_TRUE : VK_FALSE;   // (debug probe, mali_probe.h)
+    en.robustBufferAccess = vk_mali_robust(V.props.vendorID, ff.features.robustBufferAccess) ? VK_TRUE : VK_FALSE;   // Mali only (mali_probe.h)
+    if (en.robustBufferAccess) VKLOG("robustBufferAccess on (Mali: out-of-range buffer reads fault without it)");
 #ifndef DM_RELEASE
-    if (getenv("DM_VK_X_ROBUST")) VKLOG("DM_VK_X_ROBUST: robustBufferAccess %s", en.robustBufferAccess ? "on (Mali probe)" : "off (not Mali, or not reported)");
+    else if (getenv("DM_VK_X_ROBUST")) VKLOG("DM_VK_X_ROBUST: robustBufferAccess off");
 #endif
     V.vertex_stores = en.vertexPipelineStoresAndAtomics;
     f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0;

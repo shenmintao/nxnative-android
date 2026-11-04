@@ -43,9 +43,9 @@ int main(int argc,char **argv) {
     int mode=vk_mali_a_mode();
     assert(!vk_mali_robust(0x5143,1)&&!vk_mali_robust(0x13B5,0));   // never on Adreno, never unreported
 #ifdef DM_RELEASE
-    assert(!mode&&!vk_mali_u_mode()&&!vk_mali_robust(0x13B5,1));(void)V;(void)S;(void)P_att;(void)g_tex_frame;(void)ended;return 0;
+    assert(!mode&&!vk_mali_u_mode()&&vk_mali_robust(0x13B5,1));(void)V;(void)S;(void)P_att;(void)g_tex_frame;(void)ended;return 0;   // release: robustBufferAccess on Mali, no selector
 #else
-    assert(mode==(!strcmp(argv[1],"1")));assert(vk_mali_robust(0x13B5,1)==(!strcmp(argv[1],"1")));assert(vk_mali_u_mode()==(!strcmp(argv[2],"nearest")?2:!strcmp(argv[2],"log")?1:0));
+    assert(mode==(!strcmp(argv[1],"1")));assert(vk_mali_robust(0x13B5,1)==(strcmp(argv[1],"0")!=0));assert(vk_mali_u_mode()==(!strcmp(argv[2],"nearest")?2:!strcmp(argv[2],"log")?1:0));
     assert(!vk_mali_a_eligible(0,109,0,1,1,1));assert(!vk_mali_a_eligible(1,97,0,1,1,1));assert(!vk_mali_a_eligible(1,109,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT,1,1,1));
     assert(!vk_mali_a_eligible(1,109,0,4,1,1));assert(!vk_mali_a_eligible(1,109,0,1,2,1));assert(!vk_mali_a_eligible(1,109,0,1,1,2));assert(vk_mali_a_eligible(1,109,0,1,1,1));
     vkimg_t src={.w=16,.h=8,.d=1,.samples=1,.fmt=VK_FORMAT_R32G32B32A32_SFLOAT,.img=(VkImage)(uintptr_t)1};
