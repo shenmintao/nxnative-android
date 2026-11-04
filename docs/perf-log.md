@@ -2210,3 +2210,13 @@ Readable vendor thermal/performance configurations are archived with source path
 - GPU segments a frame: 26.1 ms covered, 7.9 ms between parts, 34.2 ms envelope (6.7 parts in 2.0 submissions). CPU feed: setup + slot wait 10.6 ms a submission.
 - Upstream nx2android d47cb00 keeps the same copied-pool drain in `mtl_sub_begin` and has no compare snapshot; nothing to port.
 - Next: no wait/sync at continuations (A/B with `DM_VK_X_RESTART_SYNC`). Evidence: BENCH/astc-phone-validation/session-20261104-diag. Phone: release3 reinstalled, seed restored and roots removed before USB dropped at screen-off; the final readback is pending.
+
+### No copied-pool sync at submission continuations, 2026-11-04
+
+- Hypothesis: the depth-compare snapshot's `vk_sub_restart` is a continuation of the same NVN submission; its GPU wait + copy-back + pool sync (needed only where every pool is copied, i.e. Mali) is the ~19.5 ms a frame the diag trace attributed to the replay thread.
+- Change: `sub_begin(1)` no longer waits or syncs copied pools; full submissions unchanged. `DM_VK_X_RESTART_SYNC=1` (debug) restores the old behavior. Upstream nx2android d47cb00 has the same unconditional wait and no compare snapshot; nothing to port.
+- Protocol: restart-sync-debug.apk 2bb07831 (ecbd4cc3 + change; robust now default), the pin A/B protocol and phone cache, prime pin as shipped, OFF (=1) / ON / ON / OFF.
+- Result: 16.64 / 23.00 / 23.37 / 17.65 fps (+6.04, valid). Replay 39.6 / 38.5 -> 17.4 / 17.3 ms a frame (descriptor sets 28.5 -> 7.9); GPU envelope 37.2 / 33.9 -> 31.3 / 30.7 ms; 1% low 8.80 / 9.08 -> 10.17 / 10.22; >50 ms 1055 / 943 -> 397 / 385; >100 ms 15 / 10 -> 1 / 3.
+- Checks: "CPU reads racing a GPU write" 0 in all four runs; only the approved zero-copy RED; same scene in all start/end shots (lighting moves with game time). 189 tests pass, debug/release 157 sources each.
+- Thermal: sensors 64.6 C; caps at window ends 0.8-2.7 GHz, not controlled.
+- Conclusion: kept (perf(vk) commit). ~23 fps vs the 55 fps target. Next: the full-submission drain + pool sync (zero-copy with explicit cache maintenance: fd 1, non-coherent HOST_CACHED import). Evidence: BENCH/astc-phone-validation/session-20261104-restart; phone restored to release3, 17 seed files, roots removed, stopped/OFF.
