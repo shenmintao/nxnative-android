@@ -71,8 +71,11 @@ static VkBuffer make_pool(int method, uint8_t *ga) {
         printf("    fd %d mapped at %p\n", used, m);
         VkAndroidHardwareBufferPropertiesANDROID ap = {VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
         if ((r = vkGetAndroidHardwareBufferPropertiesANDROID(dev, ahb, &ap))) { printf("    AHB properties = %d\n", r); return VK_NULL_HANDLE; }
+        printf("    AHB allocation %llu bytes, memory types %#x\n", (unsigned long long)ap.allocationSize, ap.memoryTypeBits);
         VkBuffer b = new_buf(VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID); if (!b) return b;
-        VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, NULL, ahb};
+        // as the Android host's pool_zero_copy: Mali (Immortalis-G925, 2026-11-04) refuses the import without a dedicated allocation (-1)
+        VkMemoryDedicatedAllocateInfo ded = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, b};
+        VkImportAndroidHardwareBufferInfoANDROID imp = {VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, &ded, ahb};
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &imp, ap.allocationSize, pick_type(ap.memoryTypeBits, 0)};
         if ((r = vkAllocateMemory(dev, &ai, NULL, &mem))) { printf("    import AHB = %d\n", r); return VK_NULL_HANDLE; }
         printf("    imported as memory type %u (%#x)\n", ai.memoryTypeIndex, mp.memoryTypes[ai.memoryTypeIndex].propertyFlags);
