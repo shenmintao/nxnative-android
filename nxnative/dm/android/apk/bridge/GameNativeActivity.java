@@ -3,10 +3,12 @@ package org.nxnative;
 import android.app.AlertDialog;
 import android.app.NativeActivity;
 import android.content.pm.PackageManager;
+import android.hardware.display.DisplayManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Bundle;
 import android.os.Build;
+import android.view.Display;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.DisplayCutout;
@@ -23,6 +25,14 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Native game surface plus the device's normal, Unicode-capable screen keyboard. */
 public final class GameNativeActivity extends NativeActivity {
     private native void setOverlayInsets(int left, int top, int right, int bottom, int width, int height, int dpi);
+    private native void setDisplayRotation(int rotation);
+    // A turn between landscape and reverse landscape (sensorLandscape) recreates nothing and resumes nothing: only the display changes.
+    // The device-motion axes follow Display.getRotation(), so the native side hears of every change (V2405A, 2026-11-04: the gyro stayed mirrored)
+    private DisplayManager.DisplayListener displayListener;
+    private void reportRotation() {
+        Display display = Build.VERSION.SDK_INT >= 30 ? getDisplay() : getWindowManager().getDefaultDisplay();
+        if (display != null) setDisplayRotation(display.getRotation());
+    }
 
     @Override public void onCreate(Bundle saved) {
         // A native method resolves only in a library loaded through System.loadLibrary: NativeActivity's own load in super.onCreate does not
@@ -63,6 +73,17 @@ public final class GameNativeActivity extends NativeActivity {
             if (r - l != or - ol || b - t != ob - ot) v.requestApplyInsets();
         });
         decor.post(() -> decor.requestApplyInsets());
+        displayListener = new DisplayManager.DisplayListener() {
+            @Override public void onDisplayAdded(int id) { }
+            @Override public void onDisplayRemoved(int id) { }
+            @Override public void onDisplayChanged(int id) { reportRotation(); }
+        };
+        ((DisplayManager) getSystemService(DISPLAY_SERVICE)).registerDisplayListener(displayListener, new Handler(Looper.getMainLooper()));
+    }
+    @Override protected void onDestroy() {
+        if (displayListener != null) ((DisplayManager) getSystemService(DISPLAY_SERVICE)).unregisterDisplayListener(displayListener);
+        displayListener = null;
+        super.onDestroy();
     }
     // Called on the guest thread, which waits while the UI thread owns the dialog/IME.
     public byte[] requestText(byte[] title, byte[] initial, int maximum) {

@@ -906,6 +906,14 @@ static int g_sensor_on, g_motion_device, g_have_acc, g_sensor_rotation;
 static float g_sensor_acc[3];
 static double g_shake_gx, g_shake_gy, g_shake_gz; static int g_shake_init;
 static int64_t g_shake_last = -1;
+static void motion_rotation_set(int rotation) {   // the axes the next samples map through (motion_android.h); the fused pose starts again
+    if (rotation < 0 || rotation > 3) return;
+    pthread_mutex_lock(&g_sensor_mu);
+    int changed = g_sensor_rotation != rotation;
+    if (changed) { g_sensor_rotation = rotation; dm_motion_clear_switch(); }
+    pthread_mutex_unlock(&g_sensor_mu);
+    if (changed && g_sq) LOG("front end: display rotation %d: device motion axes follow it", rotation);
+}
 static void motion_rotation_update(void) {
     if (!g_act) return;
     JNIEnv *e = NULL; int detach = 0, rotation = -1;
@@ -928,11 +936,11 @@ static void motion_rotation_update(void) {
     if (wc) (*e)->DeleteLocalRef(e, wc); if (wm) (*e)->DeleteLocalRef(e, wm);
     if (ac) (*e)->DeleteLocalRef(e, ac);
     if (detach) (*g_act->vm)->DetachCurrentThread(g_act->vm);
-    if (rotation >= 0 && rotation <= 3) {
-        pthread_mutex_lock(&g_sensor_mu);
-        if (g_sensor_rotation != rotation) { g_sensor_rotation = rotation; dm_motion_clear_switch(); }
-        pthread_mutex_unlock(&g_sensor_mu);
-    }
+    motion_rotation_set(rotation);
+}
+// GameNativeActivity's display listener: a turn between landscape and reverse landscape changes the rotation with no new window and no resume
+JNIEXPORT void JNICALL Java_org_nxnative_GameNativeActivity_setDisplayRotation(JNIEnv *env, jobject self, jint rotation) {
+    (void)env; (void)self; motion_rotation_set(rotation);
 }
 static void shake_sensor(int on) {
     pthread_mutex_lock(&g_sensor_mu);
