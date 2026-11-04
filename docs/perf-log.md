@@ -2244,3 +2244,28 @@ Readable vendor thermal/performance configurations are archived with source path
 - Change (not kept): at `vk_end_pass`, a pass with only folded clears drops its uncleared colours and an uncleared depth-stencil (kept whole if either aspect clears); `DM_VK_CLEAR_TRIM=0` restored the old pass. 193 tests passed.
 - A/B (cleartrim-debug 7d27a924, AU selectors, prime pin, pin A/B cache, OFF = `DM_VK_CLEAR_TRIM=0`): OFF 22.98 / 21.79, ON 22.92 / 22.63 fps (+0.39, invalid: ON1 < OFF1). ON trimmed 13 passes and 15 attachments a frame; GPU busy 31.5 / 33.1 vs 31.8 / 32.0 ms; replay ~17.5 ms.
 - Conclusion: those passes do not cost their attachments' load/store; the per-pass times likely include the full pass-start barrier drain. Source reverted; diff and test kept in BENCH/astc-phone-validation/session-20261104-cleartrim.
+
+### Adreno LRZ workarounds off on Mali (rejected), 2026-11-04
+
+- Hypothesis: Adreno-only workarounds also run on Mali and cost GPU time: the one-texel depth copy-out/back with full barriers before passes that go on with a depth buffer (`lrz_touch`), and fragment-depth variants (`fdz`: gl_FragDepth = FragCoord.z, which turns off early depth on Mali) with their D16 depth clones.
+- A/B, env only (OFF = shipped, ON = `DM_VK_LRZ_TOUCH=0` + `DM_VK_FDZ=0`): the first attempt (cleartrim-debug 7d27a924) stopped after OFF1 19.12 / ON1 20.70 (throttled phone; the app was then closed by hand). Rerun on cmptier-debug 2ea62709: OFF 23.27 / 21.98, ON 23.04 / 22.98 fps (+0.39, invalid: ON1 < OFF1).
+- GPU busy 31.5 / 33.2 vs 29.6 / 31.3 ms; replay ~17 ms; CPU reads racing GPU writes 0; only the approved zero-copy RED (plus the audio watchdog notice in every arm); world rendered.
+- Conclusion: no full-frame gain; the workarounds stay as they are. Evidence: BENCH/astc-phone-validation/session-20261104-adrenowa{,2}.
+
+### Pass-start barrier upper bound on Mali (diagnostic), 2026-11-04
+
+- Question: does the ALL_COMMANDS -> ALL_COMMANDS barrier before each of ~168 render passes a frame serialize Mali's vertex and fragment work enough to explain the ~32 ms GPU envelope?
+- One process (cmptier-debug 2ea62709, `DM_VK_SEGMENT_TIMES=1`), 60 s windows: A default 20.26 fps (envelope 36.6 ms), B `DM_VK_X_NOBAR=1` (live) 18.98 (39.2 ms), C default 18.16 (40.9 ms). B is no better than the A/C mean (19.2); the phone was hot and declining throughout. No GPU fault.
+- Conclusion: the pass-start barriers do not limit the frame; no barrier-refinement work. Evidence: BENCH/astc-phone-validation/session-20261104-nobar.
+
+### Colour-view depth comparison tiers, 2026-11-04
+
+- Problem: without VK_EXT_depth_range_unrestricted (V2405A Mali r49p1, Turnip), a content-dependent R32_SFLOAT comparison failed closed (dummy view). nx2android 70c8cb8 and BOTWRecompAndroid 06111e4 bind the colour view with a comparison sampler on every device (undefined by Vulkan, works in practice).
+- Change: (1) a driver declaring SAMPLED_IMAGE_DEPTH_COMPARISON on R32_SFLOAT / R16_UNORM (VkFormatProperties3) samples the colour view; (2) otherwise the D16 / D32 snapshots where the copy is defined, as before; (3) otherwise R32_SFLOAT through its colour view, logged once. `DM_VK_CMP_COLOR=0` restores the failure. The init log reports the capability.
+- V2405A declares neither format and lacks the extension: the Plateau path is unchanged (one R16 -> D16 snapshot a frame, the R32F ALWAYS surrogate, 0 failures, tier 3 not reached). The tablet's 10-30 validation errors (06479) imply no declaration; its init log will confirm. Not a performance change; 195 tests pass.
+
+### Status, 2026-11-04 (blocked)
+
+- Three consecutive experiments below the noise gate: non-coherent zero-copy (-0.66), clear-only pass trim (+0.39), Adreno workarounds off (+0.39); the barrier diagnostic shows no headroom either. V2405A: 22-23 fps cool, 18-20 hot, against the 55 fps target (GPU busy ~30-33 ms a frame, replay ~17 ms).
+- Excluded today: replay pin, pass split, zero-copy, clear-only attachments, LRZ workarounds, pass-start barriers. Unmeasured: robustBufferAccess GPU cost (off faults), Mali GPU counters (fragment/vertex/texture split), AFBC (`DM_VK_UBWC`) policy.
+- Next: the user's choice (see the session report); no further experiments until then.
