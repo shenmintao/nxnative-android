@@ -22,7 +22,7 @@
 // ---- Vulkan entry points (loaded from libvulkan.so) ----
 #define VK_FNS(X) \
     X(vkCreateInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) \
-    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
+    X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceFormatProperties2) X(vkCreateDevice) X(vkGetDeviceProcAddr) \
     X(vkEnumerateDeviceExtensionProperties) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR) \
     X(vkCreateAndroidSurfaceKHR) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceSupportKHR)
 #define VK_DEV_FNS(X) \
@@ -54,6 +54,7 @@ typedef struct {
     VkPipelineCache pcache;
     int has_bc, has_astc, has_astc_decode, has_gs, has_depth_clip_ctl, has_custom_border, has_robust2, has_xfb, has_imageless, has_dtiming, has_dynrender, has_format_list, has_timeline;
     int has_depth_range_unrestricted;
+    int cmp_color[2];                   // the driver declares depth comparison on R32_SFLOAT / R16_UNORM colour views (VkFormatProperties3; gfx_vk_tex.c vk_tex_compare_view_mode)
     int vertex_stores;                  // enabled vertexPipelineStoresAndAtomics, not just advertised support
     float max_aniso;
     int descriptor_buffer;

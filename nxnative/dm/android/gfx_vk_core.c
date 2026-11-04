@@ -128,6 +128,17 @@ void vk_init(void) {
     // A Vulkan 1.1 or 1.2 device (Legion Y700 2023, Adreno 730: its stock driver reports 1.1) has what the replay uses from 1.2 / 1.3 as extensions: they are enabled
     // when present, so the features chained below and the functions loaded by their KHR names are valid there. A 1.3 device needs none of them
     int v12 = V.props.apiVersion >= VK_API_VERSION_1_2, v13 = V.props.apiVersion >= VK_API_VERSION_1_3; uint32_t npromo = 0;
+    // depth comparison on colour views (BotW's R32_SFLOAT / R16_UNORM shadow lookups): a driver may declare it, which makes binding the colour view legal
+    if ((v13 || has_ext(ex, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2) {
+        static const VkFormat cmpf[2] = {VK_FORMAT_R32_SFLOAT, VK_FORMAT_R16_UNORM};
+        for (int i = 0; i < 2; i++) {
+            VkFormatProperties3 p3 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3}; VkFormatProperties2 p2 = {VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &p3};
+            vkGetPhysicalDeviceFormatProperties2(V.pd, cmpf[i], &p2);
+            V.cmp_color[i] = (p3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT) != 0;
+        }
+    }
+    VKLOG("depth comparison declared on colour views: R32_SFLOAT %s, R16_UNORM %s; VK_EXT_depth_range_unrestricted %s", V.cmp_color[0] ? "yes" : "no",
+          V.cmp_color[1] ? "yes" : "no", V.has_depth_range_unrestricted ? "yes" : "no");
     static const char *promo12[] = {"VK_KHR_create_renderpass2", "VK_KHR_imageless_framebuffer", "VK_KHR_image_format_list", "VK_KHR_depth_stencil_resolve", "VK_KHR_timeline_semaphore",
         "VK_KHR_shader_float16_int8", "VK_KHR_8bit_storage", "VK_EXT_descriptor_indexing", "VK_EXT_scalar_block_layout", "VK_KHR_uniform_buffer_standard_layout",
         "VK_KHR_shader_float_controls", "VK_KHR_spirv_1_4", "VK_KHR_vulkan_memory_model", "VK_KHR_separate_depth_stencil_layouts", "VK_EXT_host_query_reset",

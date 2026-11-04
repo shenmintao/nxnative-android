@@ -842,7 +842,10 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
 struct vkcompare { vkimg_t depth; VkBuffer buffer; VkDeviceMemory memory; VkDeviceSize size; int valid, constant_only; };
 uint64_t g_compare_copies, g_compare_bytes, g_compare_hits, g_compare_failures;
 static uint64_t g_const_compare_created, g_const_compare_reads, g_const_compare_clears;
+static uint64_t g_compare_direct, g_compare_colour;   // comparison lookups through the colour view: declared by the driver / undeclared fallback
 static void compare_report(void) {
+    if (g_compare_direct || g_compare_colour) VKLOG("comparison through colour views (cumulative): %llu declared by the driver, %llu undeclared fallbacks",
+        (unsigned long long)g_compare_direct, (unsigned long long)g_compare_colour);
     if (g_const_compare_reads) VKLOG("constant comparison depth (cumulative): %llu created, %llu reads, %llu clears",
         (unsigned long long)g_const_compare_created, (unsigned long long)g_const_compare_reads, (unsigned long long)g_const_compare_clears);
     if (g_compare_copies || g_compare_failures) VKLOG("comparison snapshots at present %llu: %llu copies, %.2f MB copied, %llu reuse checks, %llu failures (cumulative)",
@@ -966,14 +969,27 @@ static vkimg_t *compare_depth(vkimg_t *src, VkFormat format, unsigned bpp, int c
     return &c->depth;
 }
 
+// Comparison lookups on colour views, in order:
+// 1. a driver that declares depth comparison on the view's colour format (VkFormatProperties3, V.cmp_color) samples the colour view as it is;
+// 2. otherwise a depth snapshot where its copy is defined: R16_UNORM -> D16_UNORM always, R32_SFLOAT -> D32_SFLOAT with VK_EXT_depth_range_unrestricted
+//    (finite values outside [0,1] stay legal) or for NEVER/ALWAYS surrogates;
+// 3. otherwise R32_SFLOAT through its colour view and the comparison sampler, which Vulkan leaves undefined: what nx2android (70c8cb8) and
+//    BOTWRecompAndroid (06111e4) do on every device. V2405A's Mali driver and Turnip have neither 1 nor the extension; failing closed there sampled
+//    a dummy view instead, and the shadows it compares against were lost. Reported once; DM_VK_CMP_COLOR=0 (start-up) keeps 2 with the old failure
+static int cmp_color_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_CMP_COLOR"); v = !(e && !atoi(e)); } return v; }
 VkImageView vk_tex_compare_view_mode(const tex_t *t, const view_t *vw, int dim, int arrayed, vkimg_t **out, int constant) {
     vkimg_t *src = NULL; VkImageView ordinary = vk_tex_view(t, vw, dim, arrayed, 0, &src);
     if (out) *out = src;
     if (!ordinary || !src || src->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return ordinary;
+    if (cmp_color_on() && ((vk_view_fmt == VK_FORMAT_R32_SFLOAT && V.cmp_color[0]) || (vk_view_fmt == VK_FORMAT_R16_UNORM && V.cmp_color[1]))) { g_compare_direct++; return ordinary; }
     VkFormat format = vk_view_fmt == VK_FORMAT_R16_UNORM ? VK_FORMAT_D16_UNORM :
                       vk_view_fmt == VK_FORMAT_R32_SFLOAT && (constant || V.has_depth_range_unrestricted) ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_UNDEFINED;
     const vkfmt_t *base = vk_fmt(src->nvn_format);
     unsigned bpp = format == VK_FORMAT_D16_UNORM ? 2 : 4;
+    if (!format && vk_view_fmt == VK_FORMAT_R32_SFLOAT && cmp_color_on()) {
+        static int said; if (!said++) VKLOG("comparison sampling of R32_SFLOAT through its colour view: the driver declares no depth comparison for it and has no VK_EXT_depth_range_unrestricted (undefined by Vulkan; as nx2android and BOTWRecompAndroid sample it)");
+        g_compare_colour++; return ordinary;
+    }
     if (!format || !base || base->compressed || base->bpb != bpp || src->d != 1 || src->samples != 1 || src->vtype == VK_IMAGE_VIEW_TYPE_3D) {
         VKRED_ONCE(97, "comparison sampling has no compatible depth representation: view format %d, parent %d", vk_view_fmt, src->fmt);
         g_compare_failures++; return VK_NULL_HANDLE;
