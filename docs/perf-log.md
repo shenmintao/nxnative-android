@@ -2229,3 +2229,11 @@ Readable vendor thermal/performance configurations are archived with source path
 - A/B (zerocopy-debug 83a664b5, OFF = `DM_VK_NO_ZEROCOPY=1`): OFF 24.83 / 23.40, ON 23.45 / 23.46 fps (-0.66, invalid). GPU envelope 29.1 / 30.9 vs 31.6 / 31.8 ms; replay 16.0 / 17.5 vs 17.6 / 17.8; ~4.9 MB cleaned + ~1.1 MB invalidated a submission; CPU reads racing GPU writes 0, world rendered.
 - Conclusion: the serial pool wait no longer limits the frame; the GPU (~30 ms envelope) does. Source reverted; the diff, header and test are kept in BENCH/astc-phone-validation/session-20261104-zerocopy. The vkzc `ahbcm` mode stays as a probe.
 - Finalize hit a transient seed readback mismatch (exec-in returned before the remote tar finished; complete on re-read); the harness now re-reads. release3 reinstall pending a vivo installer tap.
+
+### Dimensity GPU attribution and pass-split control, 2026-11-04
+
+- Diagnostic only (user-approved): gyro-debug 294dae4b (= ea76e131), acceptance configuration, `DM_VK_PASS_TIMES=1` + `DM_VK_SEGMENT_TIMES=1`, one process, 60 s windows A default / B `DM_VK_PASS_SPLIT=0` (live) / C default.
+- fps 22.39 / 22.36 / 21.99 (timestamps on): pass split has no effect, and no pass is split in the world (0 split lines). GPU covered 26.3-26.7 ms + 5.4-6.2 ms between parts = 31.9-32.7 ms envelope; 6.7 parts in 2.0 submissions a frame. Replay 17.9-18.0 ms.
+- The game's own dynamic resolution has already dropped to 1024x576. ~168 passes a frame. Top pass means: the main 3,030-draw pass 2.7-3.2 ms, then 0-draw 1024x576 passes at 1.2-2.0 ms each (clear/load/store only), the rest small: per-pass load/store on a tiler looks like the main GPU cost.
+- Status vs acceptance: 22-25 fps against 55 (frame ~42 ms vs 18.2 ms). Kept today: robust default, continuation sync fix (+6.0 fps), gyro rotation. Rejected: pin big (+0.48), non-coherent zero-copy (-0.66). Remaining: fewer/lighter render passes on Mali (load/store ops, pass merging; days, artifact risk), scoping robustness to the faulting reads (pipeline robustness; source unknown), or trade-offs (30 fps cap/HOLD, resolution). User decision needed; 55 fps is not reachable on present evidence.
+- Evidence: BENCH/astc-phone-validation/session-20261104-gpu. Phone restored: release3 e85e77ce, 17 seed files, roots removed, stopped/OFF.
