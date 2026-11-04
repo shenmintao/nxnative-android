@@ -2,6 +2,7 @@ package org.nxnative;
 
 import android.app.AlertDialog;
 import android.app.NativeActivity;
+import android.content.pm.PackageManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Bundle;
@@ -24,7 +25,14 @@ public final class GameNativeActivity extends NativeActivity {
     private native void setOverlayInsets(int left, int top, int right, int bottom, int width, int height, int dpi);
 
     @Override public void onCreate(Bundle saved) {
-        super.onCreate(saved); // loads the NativeActivity library before the JNI calls below
+        // A native method resolves only in a library loaded through System.loadLibrary: NativeActivity's own load in super.onCreate does not
+        // register it with JNI (V2405A, 2026-11-04: UnsatisfiedLinkError for setOverlayInsets at the first insets dispatch). An external-data APK
+        // starts here; with embedded data GameActivity has loaded it already, and loading it again is a no-op.
+        String library = "dmhost";
+        try { library = getPackageManager().getActivityInfo(getComponentName(), PackageManager.GET_META_DATA).metaData.getString("android.app.lib_name", library); }
+        catch (PackageManager.NameNotFoundException ignored) { }
+        System.loadLibrary(library);
+        super.onCreate(saved);
         View decor = getWindow().getDecorView();
         decor.setOnApplyWindowInsetsListener((view, insets) -> {
             int left, top, right, bottom;
