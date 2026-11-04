@@ -15,6 +15,7 @@
 #include "gpu_segments.h"
 #include "vk_pace_budget.h"
 #include "pool_write_ranges.h"
+#include "mali_probe.h"
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -215,6 +216,10 @@ void vk_init(void) {
     V.max_aniso = V.props.limits.maxSamplerAnisotropy;
     // enable: everything the shaders may use that the device has
     VkPhysicalDeviceFeatures en = ff.features; en.robustBufferAccess = 0; en.shaderFloat64 = 0;
+    en.robustBufferAccess = vk_mali_robust(V.props.vendorID, ff.features.robustBufferAccess) ? VK_TRUE : VK_FALSE;   // (debug probe, mali_probe.h)
+#ifndef DM_RELEASE
+    if (getenv("DM_VK_X_ROBUST")) VKLOG("DM_VK_X_ROBUST: robustBufferAccess %s", en.robustBufferAccess ? "on (Mali probe)" : "off (not Mali, or not reported)");
+#endif
     V.vertex_stores = en.vertexPipelineStoresAndAtomics;
     f12.bufferDeviceAddressCaptureReplay = 0; f12.bufferDeviceAddressMultiDevice = 0;
     featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[1] = featx(xf, nxf, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES)[2] = 0;   // (its extension's: the same two)
