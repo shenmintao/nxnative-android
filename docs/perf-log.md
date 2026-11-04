@@ -2183,3 +2183,20 @@ Readable vendor thermal/performance configurations are archived with source path
 - ON frame rate in the world ~18 fps (17-20 fps per 5 s window, title 44-60); long-frame GPU median 47.5 ms. Debug build with AU/captures; CPU caps fell to 0.6-1.0/1.3-1.9/1.0-2.0 GHz (max 2.4/3.3/3.6), CPU/GPU 64.6 C, severity 0. Not a performance result.
 - Conclusion: robustBufferAccess is the decisive switch for the world's GPU failure on Mali; the out-of-range read source itself is not identified. Phone restored: release3 e85e77ce, 48,182 files + 32 chunks 0 mismatches, 17 seed files, roots removed, stopped/OFF, 600000 ms kept.
 - Next (user decision): enable on Mali by default or find the out-of-range read; 06041/04553 still need non-debug handling (AU stays debug-only); Dimensity performance. Evidence: BENCH/astc-phone-validation/session-20261103-mali-robust.
+
+### Dimensity performance acceptance (user-confirmed), 2026-11-04
+
+- Scope: performance first; robustBufferAccess on by default on Mali; 06041/04553 deferred (measurements keep the debug AU selectors). Release-default rendering follows later.
+- Acceptance: BotW 1.9.0 v1114112 + DLC1/2 (ASTC sidecar pack), V2405A handheld, stock DRS (<= 1280x720), 60 fps target, HOLD off, audio on, balanced unchanged; owned Plateau seed, fixed view, 60 s warmup + 120 s x2: mean >= 55 fps (1% low and >50 ms recorded). A/B as OFF/ON/ON/OFF, >= 1 fps and both ON above both OFF. Correctness gate: world renders, no GPU fault, no new RED beyond the approved baseline.
+- Start: ~16-18 fps (debug probe, robust + AU). User was told 55 fps is likely out of reach under the balanced-mode caps.
+
+### Dimensity replay pinning A/B, 2026-11-04
+
+- Hypothesis: `DM_PIN_REPLAY=prime` picks only cpu7 (the single X925) on V2405A, so the replay thread and encode worker share one core; `big` (cpu4-7: 3x X4 + X925) lets them run in parallel.
+- Protocol: probe APK f5eb8584 (robust + AU by env), the acceptance configuration above; one driver-cache run, then OFF/ON/ON/OFF from fresh roots with the same cache, 60 s warmup + 120 s SurfaceFlinger present-fence window, 120 s cooldown between runs.
+- Result: prime 16.34 / 16.08 fps, big 16.74 / 16.65 (+0.48 fps; both ON above both OFF but below the 1 fps gate: not kept). 1% low 8.43 / 8.37 vs 8.73 / 8.55; p99 116 / 116 vs 100 / 116 ms.
+- Placement: the single-CPU prime mask does not survive on this phone (all 97-98 threads 0-7 at window start in both OFF runs; cause not investigated). big holds 4-7 for the replay, encode and present threads.
+- big makes the encode worker faster (12.5-12.9 to 8.6-8.7 ms a frame, drain waits 1.9-2.1 to 0.8 ms) but the replay barely moves (41.1-41.6 to 40.3-40.4 ms a frame; descriptor sets 29 to 28.5).
+- Replay thread CPU is ~49 s per 120 s window (~25 ms a frame) in every arm, against ~40 ms of measured replay wall time: ~15 ms a frame of the replay is off-CPU, mostly inside the descriptor-set timer. Core speed and placement are not the limit; a wait is.
+- Thermal: CPU/GPU sensors 64.6 C throughout; instantaneous clocks at window ends as low as 0.4/0.8/0.8 GHz.
+- Conclusion/next: no profile change. Off-CPU callchains and scheduler states of the replay thread, and the zero-copy failure. Evidence: BENCH/astc-phone-validation/session-20261104-pin-ab. Phone restored: release3 e85e77ce, 17 seed files, test roots removed, stopped/OFF, 600000 ms kept.
