@@ -1093,6 +1093,13 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l) {
 static void post(post_op o) { vksub_t *s = cur(); if (s->npost == s->cappost) { s->cappost = s->cappost ? 2 * s->cappost : 64; s->post = realloc(s->post, s->cappost * sizeof *s->post); } s->post[s->npost++] = o; }
 void mtl_init(void) { vk_init(); }
 static int g_shadow_pools;
+static int restart_sync(void) {
+#ifdef DM_RELEASE
+    return 0;
+#else
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_X_RESTART_SYNC"); v = e && atoi(e) == 1; if (v) VKLOG("DM_VK_X_RESTART_SYNC: copied pools sync at submission continuations too"); } return v;
+#endif
+}
 static void sub_begin(int continuation) {
     vk_init();
     uint64_t cpu_begin = g_segment_q ? ucopy_now() : 0;
@@ -1112,7 +1119,11 @@ static void sub_begin(int continuation) {
     // parts early; synced at the commit, those parts read the copy as the last submission left it), and only once no earlier submission still reads it
     pthread_rwlock_rdlock(&g_pool_mu); int shadow = 0; for (int i = 0; i < g_npool; i++) shadow |= g_pool[i]->shadow != NULL; pthread_rwlock_unlock(&g_pool_mu);
     g_shadow_pools = shadow;
-    if (shadow) { mtl_wait(g_fence, ~0ull); vk_pools_sync(NULL); }   // (after the completion thread's copy-back of the last submission, not only its GPU work)
+    // A continuation (vk_sub_restart: one NVN submission split, as a depth-compare snapshot does) syncs nothing: its commands were submitted by the game
+    // before the sync that began the first part, and the GPU copy already holds the first part's own writes, in queue order. Waiting there for the first part
+    // and its copy-back serialized the frame where every pool is copied: Mali, V2405A, ~19.5 ms a frame in the BotW world inside one compare snapshot.
+    // DM_VK_X_RESTART_SYNC=1 (start-up, debug builds): sync at continuations too, as before
+    if (shadow && (!continuation || restart_sync())) { mtl_wait(g_fence, ~0ull); vk_pools_sync(NULL); }   // (after the completion thread's copy-back of the last submission, not only its GPU work)
     if (g_tsq) { vkCmdResetQueryPool(s->main, g_tsq, 2 * (uint32_t)g_cur, 2); vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur); }
     if (g_segment_q) { vkCmdResetQueryPool(s->main, g_segment_q, (uint32_t)(g_cur * MAIN_CBS * 2), MAIN_CBS * 2); segment_mark(s, 0); }
     if (g_cq) vkCmdResetQueryPool(s->main, g_cq, (uint32_t)g_cur * CQ, CQ);
