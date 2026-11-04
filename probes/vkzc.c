@@ -30,8 +30,20 @@ VKF(vkCmdPipelineBarrier); VKF(vkMapMemory); VKF(vkGetMemoryFdKHR); VKF(vkGetAnd
 
 static VkDevice dev; static VkQueue q; static VkCommandBuffer cb; static VkPhysicalDeviceMemoryProperties mp;
 static const size_t POOL = 64UL << 20;
-enum { M_REMAP, M_FD, M_AHB };
-static const char *MNAME[] = {"remap", "fd", "ahb"};
+enum { M_REMAP, M_FD, M_AHB, M_AHBCM };
+static const char *MNAME[] = {"remap", "fd", "ahb", "ahbcm"};
+// ahbcm: the ahb pool with explicit CPU cache maintenance by VA, for a non-coherent import (Mali, V2405A: HOST_CACHED without HOST_COHERENT).
+// CPU writes are cleaned to the point of coherency before the GPU reads them; GPU-written ranges are cleaned+invalidated before the CPU reads them.
+// EL0 may use DC CVAC / DC CIVAC: Linux sets SCTLR_EL1.UCI (and traps and emulates them on cores with an erratum)
+static int g_cm;
+static double g_cm_ms;
+static size_t dline(void) { uint64_t ctr; __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr)); return (size_t)4 << ((ctr >> 16) & 0xf); }
+static void dc_range(const void *p, size_t n, int invalidate) {
+    size_t line = dline(); uintptr_t a = (uintptr_t)p & ~(uintptr_t)(line - 1), e = (uintptr_t)p + n;
+    if (invalidate) for (; a < e; a += line) __asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
+    else for (; a < e; a += line) __asm__ volatile("dc cvac, %0" :: "r"(a) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+}
 
 static uint32_t pick_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t t = 0; t < mp.memoryTypeCount; t++) if ((bits >> t & 1) && (mp.memoryTypes[t].propertyFlags & want) == want) return t;
@@ -108,6 +120,9 @@ static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &
 static size_t gpu_copy_check(VkBuffer s, VkBuffer d, uint32_t *S, uint32_t *D, uint32_t seed, double *ms) {
     for (size_t i = 0; i < POOL / 4; i++) S[i] = (uint32_t)(i * 2654435761u) ^ seed;   // plain CPU stores, no flush: what a game does
     memset(D, 0, POOL);
+    double cm0 = now_ms();
+    if (g_cm) { dc_range(S, POOL, 0); dc_range(D, POOL, 0); }   // CPU writes reach memory before the GPU reads (D's zeros too: a later eviction must not overwrite the copy)
+    g_cm_ms = now_ms() - cm0;
     vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; vkBeginCommandBuffer(cb, &bbi);
     VkBufferCopy reg = {0, 0, POOL}; vkCmdCopyBuffer(cb, s, d, 1, &reg);
@@ -116,6 +131,7 @@ static size_t gpu_copy_check(VkBuffer s, VkBuffer d, uint32_t *S, uint32_t *D, u
     vkEndCommandBuffer(cb);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &cb, 0, NULL};
     double t0 = now_ms(); vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE); vkQueueWaitIdle(q); *ms = now_ms() - t0;
+    if (g_cm) { double c0 = now_ms(); dc_range(D, POOL, 1); g_cm_ms += now_ms() - c0; }   // stale CPU lines of what the GPU wrote go before the CPU reads it
     size_t bad = 0; for (size_t i = 0; i < POOL / 4; i++) bad += D[i] != ((uint32_t)(i * 2654435761u) ^ seed);
     return bad;
 }
@@ -154,16 +170,20 @@ int main(int argc, char **argv) {
         c0 = now_ms(); for (size_t i = 0; i < POOL / 8; i++) ((volatile uint64_t *)a)[i] = i; double cw = now_ms() - c0;
         printf("baseline anon memory: read 64 MB %.1f ms, write %.1f ms\n", cr, cw);
     }
-    for (int m = 0; m < 3; m++) {
+    printf("data cache line %zu bytes\n", dline());
+    for (int m = 0; m < 4; m++) {
         if (argc > 1 && strcmp(argv[1], MNAME[m])) continue;
         uint8_t *S = as + (1UL << 30) * (m + 1), *D = S + POOL + 0x10000;   // 4 KB-aligned, not size-aligned, like a game's heap allocation
         printf("== %s (guest pools at %p and %p)\n", MNAME[m], S, D);
-        VkBuffer bs = make_pool(m, S), bd = bs ? make_pool(m, D) : VK_NULL_HANDLE;
+        g_cm = m == M_AHBCM; int how = m == M_AHBCM ? M_AHB : m;
+        VkBuffer bs = make_pool(how, S), bd = bs ? make_pool(how, D) : VK_NULL_HANDLE;
         if (!bd) { printf("RESULT %s: FAILED to set up\n", MNAME[m]); continue; }
         double t1, t2; size_t bad1 = gpu_copy_check(bs, bd, (uint32_t *)S, (uint32_t *)D, 0, &t1), bad2 = gpu_copy_check(bs, bd, (uint32_t *)S, (uint32_t *)D, 0xa5a5a5a5, &t2);
         double c0 = now_ms(); volatile uint64_t sum = 0; for (size_t i = 0; i < POOL / 8; i++) sum += ((uint64_t *)S)[i]; double cr = now_ms() - c0;
         c0 = now_ms(); for (size_t i = 0; i < POOL / 8; i++) ((volatile uint64_t *)S)[i] = i; double cw = now_ms() - c0;
         printf("    pass 1: %zu wrong words, GPU copy %.2f ms; pass 2 (rewrite, no flush): %zu wrong; pool mapping: read 64 MB %.1f ms, write %.1f ms\n", bad1, t1, bad2, cr, cw);
+        if (g_cm) { double c0 = now_ms(); dc_range(S, POOL, 0); double clean = now_ms() - c0; c0 = now_ms(); dc_range(S, POOL, 1); double civac = now_ms() - c0;
+            printf("    cache maintenance: last pass %.2f ms (clean 2 x 64 MB + clean/invalidate 64 MB); 64 MB after writes: clean %.2f ms, clean/invalidate %.2f ms\n", g_cm_ms, clean, civac); }
         printf("RESULT %s: %s\n", MNAME[m], bad1 || bad2 ? "data mismatch" : "WORKS - the guest pointer is GPU memory, zero copy");
     }
     return 0;

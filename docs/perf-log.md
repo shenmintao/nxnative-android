@@ -2220,3 +2220,12 @@ Readable vendor thermal/performance configurations are archived with source path
 - Checks: "CPU reads racing a GPU write" 0 in all four runs; only the approved zero-copy RED; same scene in all start/end shots (lighting moves with game time). 189 tests pass, debug/release 157 sources each.
 - Thermal: sensors 64.6 C; caps at window ends 0.8-2.7 GHz, not controlled.
 - Conclusion: kept (perf(vk) commit). ~23 fps vs the 55 fps target. Next: the full-submission drain + pool sync (zero-copy with explicit cache maintenance: fd 1, non-coherent HOST_CACHED import). Evidence: BENCH/astc-phone-validation/session-20261104-restart; phone restored to release3, 17 seed files, roots removed, stopped/OFF.
+
+### Mali non-coherent zero-copy pools (rejected), 2026-11-04
+
+- Hypothesis: with the continuation fix in place, the remaining full-submission GPU wait + pool sync (copied pools, ~2 a frame) is the next serial cost; zero-copy removes it.
+- Probe first: vkzc `ahbcm` (MediaTek handle fd 1, dedicated import, type 0xb) with DC CVAC before GPU reads and DC CIVAC after GPU writes: 0 wrong words in both 64 MB passes; 64 MB clean 1.15 ms, clean+invalidate 0.94 ms (without maintenance 388,464 / 670,480 wrong).
+- Change (not kept): map the first handle fd that maps; non-coherent imports clean the dirty-tracked blocks at each full submission (no GPU wait) and clean+invalidate recorded GPU write spans at completion before the guest sees the fence. All pools zero-copy on V2405A; 191 tests passed.
+- A/B (zerocopy-debug 83a664b5, OFF = `DM_VK_NO_ZEROCOPY=1`): OFF 24.83 / 23.40, ON 23.45 / 23.46 fps (-0.66, invalid). GPU envelope 29.1 / 30.9 vs 31.6 / 31.8 ms; replay 16.0 / 17.5 vs 17.6 / 17.8; ~4.9 MB cleaned + ~1.1 MB invalidated a submission; CPU reads racing GPU writes 0, world rendered.
+- Conclusion: the serial pool wait no longer limits the frame; the GPU (~30 ms envelope) does. Source reverted; the diff, header and test are kept in BENCH/astc-phone-validation/session-20261104-zerocopy. The vkzc `ahbcm` mode stays as a probe.
+- Finalize hit a transient seed readback mismatch (exec-in returned before the remote tar finished; complete on re-read); the harness now re-reads. release3 reinstall pending a vivo installer tap.
