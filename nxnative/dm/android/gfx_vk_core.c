@@ -532,9 +532,24 @@ static uint64_t g_sync_bytes, g_sync_full;   // copied pools: bytes copied by th
 static void vk_pools_sync_(VkCommandBuffer cb);
 void vk_pools_sync(VkCommandBuffer cb) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
     vk_pools_sync_(cb); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[2] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } }
+#ifndef DM_RELEASE
+// Measurement only (debug builds): where a sync's time goes, how its dirty blocks cluster, and how much of what it copies is the completion thread's own
+// copy-back of GPU writes coming round again (those pages are dirty by our write, while the GPU copy already holds the bytes)
+static struct { uint64_t syncs, blocks, runs, rt_blocks, protect_ns, copy_ns, check_ns, cb_calls, cb_spans, cb_bytes, cb_faults, cb_ns, rt_lost, scan_ns, scans; } g_dm;
+static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER; enum { RT_MAX = 8192 };
+static struct { uint64_t lo, hi; } g_rt[RT_MAX]; static int g_nrt, g_rt_over;   // copy-back spans since the last sync
+static uint64_t dm_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; }
+static int rt_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+#endif
 static void vk_pools_sync_(VkCommandBuffer cb) {
     (void)cb;
     enum { BLK = 64 << 10 };
+#ifndef DM_RELEASE
+    static struct { uint64_t lo, hi; } rt[RT_MAX]; int nrt;
+    pthread_mutex_lock(&g_rt_mu); nrt = g_nrt; memcpy(rt, g_rt, sizeof *rt * (size_t)nrt); if (g_rt_over) g_dm.rt_lost++; g_nrt = 0; g_rt_over = 0; pthread_mutex_unlock(&g_rt_mu);
+    qsort(rt, (size_t)nrt, sizeof *rt, rt_cmp);
+    g_dm.syncs++;
+#endif
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) {
         vkpool_t *p = g_pool[i]; if (!p->shadow) continue;
@@ -545,15 +560,44 @@ static void vk_pools_sync_(VkCommandBuffer cb) {
             memcpy(p->shadow, lo, size); g_sync_bytes += size; g_sync_full++; p->synced = 1; p->stamp0 = p->stamp = st; continue; }
         // judged against the sync before the last: a write whose fault took its generation before the last sync's stamp but stored it after that sync looked
         // at its block would otherwise never count (its page is writable from then on, and clean by every later stamp). A dirty block is copied twice
+#ifndef DM_RELEASE
+        int prev = 0; uint64_t loop0 = dm_ns(), spent0 = g_dm.protect_ns + g_dm.copy_ns;
+#endif
         for (uint64_t off = 0; off < size; off += BLK) {
             uint64_t n = size - off < BLK ? size - off : BLK;
+#ifndef DM_RELEASE
+            int dirty = nvn_dirty_since_span(p->span, lo + off, n, p->stamp0);
+            if (!dirty) { prev = 0; continue; }
+            uint64_t t1 = dm_ns();
+            g_dm.blocks++; if (!prev) g_dm.runs++; prev = 1;
+            if (!(g_dm.blocks & 15)) { uint64_t s0 = dm_ns(); (void)nvn_dirty_tracked(lo + off, n); g_dm.scan_ns += dm_ns() - s0; g_dm.scans++; t1 = dm_ns(); }   // a sample of the range lookup every protect and fault does
+            { uint64_t a = p->lo + off, b = a + n; int k = 0, hi = nrt;   // the first copy-back span ending after a
+              while (k < hi) { int m = (k + hi) / 2; if (rt[m].lo < b) k = m + 1; else hi = m; }
+              for (int j = k - 1; j >= 0 && j >= k - 64; j--) if (rt[j].hi > a && rt[j].lo < b) { g_dm.rt_blocks++; break; } }
+            nvn_dirty_protect(lo + off, n); uint64_t t2 = dm_ns(); memcpy(p->shadow + off, lo + off, n); uint64_t t3 = dm_ns();
+            g_dm.protect_ns += t2 - t1; g_dm.copy_ns += t3 - t2; g_sync_bytes += n;
+#else
             if (!nvn_dirty_since_span(p->span, lo + off, n, p->stamp0)) continue;
             nvn_dirty_protect(lo + off, n); memcpy(p->shadow + off, lo + off, n); g_sync_bytes += n;
+#endif
         }
+#ifndef DM_RELEASE
+        g_dm.check_ns += dm_ns() - loop0 - (g_dm.protect_ns + g_dm.copy_ns - spent0);   // the dirty checks and loop, without the protects and copies
+#endif
         p->stamp0 = p->stamp; p->stamp = st;
     }
     pthread_rwlock_unlock(&g_pool_mu);
-    static uint64_t n, last; if (++n % 600 == 0) { VKLOG("copied pools: %.1f MB synced in the last 600 submissions (%.2f MB each), %llu full copies so far", (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 600.0 / 1048576.0, (unsigned long long)g_sync_full); last = g_sync_bytes; }
+    static uint64_t n, last; if (++n % 600 == 0) { VKLOG("copied pools: %.1f MB synced in the last 600 submissions (%.2f MB each), %llu full copies so far", (g_sync_bytes - last) / 1048576.0, (g_sync_bytes - last) / 600.0 / 1048576.0, (unsigned long long)g_sync_full); last = g_sync_bytes;
+#ifndef DM_RELEASE
+        { int live, used; uint64_t adds; nvn_dirty_slot_stats(&live, &used, &adds); uint64_t s = g_dm.syncs ? g_dm.syncs : 1, c = g_dm.cb_calls ? g_dm.cb_calls : 1;
+          VKLOG("copied pools per sync (last %llu): %.1f dirty blocks in %.1f runs, %.1f of them overlapping our copy-back since the last sync%s; protect %.3f ms, copy %.3f ms, checks %.3f ms; "
+                "copy-back per completion (%llu): %.1f spans, %.3f MB, %.1f write faults, %.3f ms; %d tracked ranges (%d slots), one range lookup %.1f us",
+                (unsigned long long)g_dm.syncs, g_dm.blocks / (double)s, g_dm.runs / (double)s, g_dm.rt_blocks / (double)s, g_dm.rt_lost ? " (span list overflowed)" : "",
+                g_dm.protect_ns / 1e6 / s, g_dm.copy_ns / 1e6 / s, g_dm.check_ns / 1e6 / s, (unsigned long long)g_dm.cb_calls, g_dm.cb_spans / (double)c,
+                g_dm.cb_bytes / 1048576.0 / c, g_dm.cb_faults / (double)c, g_dm.cb_ns / 1e6 / c, live, used, g_dm.scans ? g_dm.scan_ns / 1e3 / g_dm.scans : 0.0);
+          pthread_mutex_lock(&g_rt_mu); memset(&g_dm, 0, sizeof g_dm); pthread_mutex_unlock(&g_rt_mu); }
+#endif
+    }
 }
 // Copied pools after a submission: only recorded GPU write spans return to the guest.
 // A whole cached pool, or a gap between writes, can contain CPU changes made after
@@ -607,10 +651,21 @@ struct vksub {
 };
 static vksub_t g_slot[NSLOT]; static int g_cur = -1; uint64_t g_cmd_gen;   // g_cmd_gen: main command buffers begun (gfx_vk_exec.c bind cache)
 static void pools_copy_back(const struct vksub *s) {
+#ifndef DM_RELEASE
+    uint64_t t0 = dm_ns(), f0, p0; nvn_dirty_stats(&f0, &p0);
+#endif
     pthread_rwlock_rdlock(&g_pool_mu);
     for (int i = 0; i < g_npool; i++) { vkpool_t *p = g_pool[i]; if (!p->shadow || !p->synced) continue;
         vk_pool_writes_copy_back((uint8_t *)(uintptr_t)p->lo, p->shadow, p->lo, p->hi, &s->writes); }
     pthread_rwlock_unlock(&g_pool_mu);
+#ifndef DM_RELEASE
+    uint64_t f1, p1, bytes = 0; nvn_dirty_stats(&f1, &p1);
+    for (size_t i = 0; i < s->writes.count; i++) bytes += s->writes.spans[i].hi - s->writes.spans[i].lo;
+    pthread_mutex_lock(&g_rt_mu);
+    for (size_t i = 0; i < s->writes.count; i++) { if (g_nrt == RT_MAX) { g_rt_over = 1; break; } g_rt[g_nrt].lo = s->writes.spans[i].lo; g_rt[g_nrt].hi = s->writes.spans[i].hi; g_nrt++; }
+    g_dm.cb_calls++; g_dm.cb_spans += s->writes.count; g_dm.cb_bytes += bytes; g_dm.cb_faults += f1 - f0; g_dm.cb_ns += dm_ns() - t0;   // (faults: every thread's in that time)
+    pthread_mutex_unlock(&g_rt_mu);
+#endif
 }
 static VkCommandBuffer g_slot_main_cb(void) { return g_slot[g_cur].main; }
 static void segment_mark(vksub_t *s, int end) {

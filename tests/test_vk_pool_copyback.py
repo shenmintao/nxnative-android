@@ -17,6 +17,7 @@ class PoolCopyback(unittest.TestCase):
         start = source.index('static void pools_copy_back(const struct vksub *s) {')
         body = source[start:source.index('\n}', start) + 3]
         prefix = r'''
+#define DM_RELEASE 1   /* the debug builds' measurement counters around the copy-back are not part of this contract */
 #include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
