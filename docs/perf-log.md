@@ -2320,3 +2320,14 @@ Readable vendor thermal/performance configurations are archived with source path
 - Hypothesis: with the early first part, the 3,032-draw main pass is cut into 12 parts of 256 draws (`DM_VK_TAIL_DRAWS=256`), each storing and reloading 1152x648 attachments on a tiler; 512 halves that.
 - A/B, env only (dirtystats-debug ed8d81f7, acceptance env; ON = `DM_VK_TAIL_DRAWS=512`): OFF 33.73 / 26.36, ON 27.37 / 26.26 fps (invalid). ON2 vs OFF2 -0.10; GPU busy 28.5-29.3 ms in ON1/ON2/OFF2.
 - OFF1 was an outlier of the device, not of the code: same build and environment as OFF2, GPU busy 22.5 ms (all other runs today 28.5-29.3), 1% low 15.6, 30 intervals > 50 ms. Throttling note: this morning's runs had the prime core at 798 MHz and policy4 at 1.5 GHz throughout; the GPU clock is not readable without root. Profile unchanged. Evidence: BENCH/astc-phone-validation/session-20261105-tail512.
+
+### Cheaper copy-back and sync protection (rejected), 2026-11-05
+
+- Change (not kept): copy-back spans made writable with `dm_guest_write_prepare` before they are written (`DM_VK_COPYBACK_PREP`); a sync protects runs of adjacent dirty blocks in one call through the pool's kept range handle, the 64 KB block still the release unit (`nvn_dirty_protect_span`, `DM_VK_SYNC_RUNS`). Host tests passed (199).
+- A/B (dirtyfix-debug e98519d6, OFF = both 0): OFF1 26.00, ON1 26.76 fps; the run stopped before ON2 (a cache-file readback mismatch in prepare). Counters: sync protection 2.07 -> 1.53 ms; copy-back faults 159 -> 1 a completion but its time 1.14 -> 1.45 ms (each prepare scans all ~4,000 tracked ranges and stamps every page). Net on the chain < 0.5 ms: below the gate, not rerun.
+- Source reverted; diff and test in BENCH/astc-phone-validation/session-20261105-dirtyfix.
+
+### Status, 2026-11-05 (blocked)
+
+- Three experiments in a row below the gate since the early first part (+4.92): pool sync worker (-1.28), tail draws 512 (invalid), cheaper copy-back/protection (incomplete, < 0.5 ms by counters). V2405A: 26-27 fps typical, one 33.7 fps run with identical code (GPU busy 22.5 vs ~29 ms), against the 55 fps target.
+- Remaining: stop write-protecting blocks dirtied every frame (copy them every sync; ~2 days, shared with packaged-texture tracking), GPU front-end cost per pass/draw (Mali job overhead; no cheap lever found), or a trade-off (target, resolution cap, quality).
