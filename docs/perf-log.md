@@ -2314,3 +2314,9 @@ Readable vendor thermal/performance configurations are archived with source path
 - Copy-back per completion (two a frame): 37 spans, 0.53 MB, ~150 write-protect faults in that time, 1.73 ms, so mostly fault handling, not copying. All threads: ~1,265 write-protect faults a frame.
 - One frame (DM_VK_TRACE_PASS=-2, DRS at 1152x648): 174 passes, 23 dispatches, 172 barriers, 4,732 draws, ~49,800 32x32 tiles. The 3,032-draw main pass is now 12 parts of 256 draws (5db26c41 + `DM_VK_TAIL_DRAWS=256`); 1152x648 passes hold 41 % of the tiles; ~20 passes without draws hold ~20 % (5 of them clear 1152x648 targets back to back, one is 2400x1140); 132 passes draw at most twice.
 - Reading: on the render thread the sync's protection is the largest CPU piece; on the GPU, tiles alone do not explain the time (removing attachments from clear-only passes changed nothing, 2026-11-04). Evidence: BENCH/astc-phone-validation/session-20261105-dirtystats.
+
+### Fewer splits of big passes after the first part (rejected), 2026-11-05
+
+- Hypothesis: with the early first part, the 3,032-draw main pass is cut into 12 parts of 256 draws (`DM_VK_TAIL_DRAWS=256`), each storing and reloading 1152x648 attachments on a tiler; 512 halves that.
+- A/B, env only (dirtystats-debug ed8d81f7, acceptance env; ON = `DM_VK_TAIL_DRAWS=512`): OFF 33.73 / 26.36, ON 27.37 / 26.26 fps (invalid). ON2 vs OFF2 -0.10; GPU busy 28.5-29.3 ms in ON1/ON2/OFF2.
+- OFF1 was an outlier of the device, not of the code: same build and environment as OFF2, GPU busy 22.5 ms (all other runs today 28.5-29.3), 1% low 15.6, 30 intervals > 50 ms. Throttling note: this morning's runs had the prime core at 798 MHz and policy4 at 1.5 GHz throughout; the GPU clock is not readable without root. Profile unchanged. Evidence: BENCH/astc-phone-validation/session-20261105-tail512.
